@@ -122,6 +122,26 @@ def get_training_precision(cfg_exp, is_cluster_run: bool) -> str:
     return precision
 
 
+def _resolve_datamodule_config(cfg_data):
+    """Resolve Lightning datamodule config, merging unified base with overrides.
+
+    CPSea and other unified dataset configs place the full datamodule under
+    ``dataset.unified.datamodule`` while training configs override a subset at
+    ``dataset.datamodule``.  Hydra keeps those as siblings; this helper merges
+    them so ``_target_`` and transforms are not lost.
+    """
+    override_cfg = cfg_data.get("datamodule")
+    unified_cfg = cfg_data.get("unified", {}).get("datamodule") if hasattr(cfg_data, "get") else None
+
+    if override_cfg is None and unified_cfg is None:
+        return None
+    if override_cfg is None:
+        return unified_cfg
+    if unified_cfg is not None and override_cfg.get("_target_") is None:
+        return OmegaConf.merge(unified_cfg, override_cfg)
+    return override_cfg
+
+
 def load_data_module(cfg_exp, is_cluster_run: bool) -> tuple:
     """Loads data config and creates corresponding datamodule.
 
@@ -133,15 +153,17 @@ def load_data_module(cfg_exp, is_cluster_run: bool) -> tuple:
     log_info(f"Number of CPUs per task used (will be used for number dataloader number of workers): {num_cpus}")
     cfg_data = cfg_exp.dataset
 
+    dm_cfg = _resolve_datamodule_config(cfg_data)
+
     # Check for unified/Lightning datamodule pattern
-    if hasattr(cfg_data, "datamodule"):
+    if dm_cfg is not None:
         # Overwrite number of workers
-        if hasattr(cfg_data.datamodule, "num_workers"):
-            cfg_data.datamodule.num_workers = num_cpus
+        if hasattr(dm_cfg, "num_workers"):
+            dm_cfg.num_workers = num_cpus
         log_info(f"Data config {cfg_data}")
 
         # Instantiate the datamodule
-        datamodule = hydra.utils.instantiate(cfg_data.datamodule)
+        datamodule = hydra.utils.instantiate(dm_cfg)
 
         # Add validation loader if supported
         if hasattr(datamodule, "add_validation_dataloader") and hasattr(cfg_exp, "generation"):

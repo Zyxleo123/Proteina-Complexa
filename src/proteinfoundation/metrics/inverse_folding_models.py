@@ -9,6 +9,57 @@ from loguru import logger
 
 from proteinfoundation.utils.pdb_utils import pdb_name_from_path
 
+_REPO_ROOT: str | None = None
+
+
+def _get_repo_root() -> str:
+    """Repo root (directory containing community_models/). Hydra changes cwd during eval."""
+    global _REPO_ROOT
+    if _REPO_ROOT is not None:
+        return _REPO_ROOT
+
+    for candidate in (
+        os.environ.get("LOCAL_CODE_PATH"),
+        os.environ.get("COMPLEXA_ROOT"),
+    ):
+        if candidate:
+            root = os.path.abspath(candidate)
+            if os.path.isdir(os.path.join(root, "community_models")):
+                _REPO_ROOT = root
+                return root
+
+    path = os.path.dirname(os.path.abspath(__file__))
+    for _ in range(8):
+        if os.path.isdir(os.path.join(path, "community_models")):
+            _REPO_ROOT = path
+            return path
+        parent = os.path.dirname(path)
+        if parent == path:
+            break
+        path = parent
+
+    raise RuntimeError(
+        "Could not locate Proteina-Complexa repo root (community_models/). "
+        "Set LOCAL_CODE_PATH in .env or source env.sh."
+    )
+
+
+def _run_mpnn_shell(command: str) -> None:
+    repo_root = _get_repo_root()
+    try:
+        result = subprocess.run(
+            command,
+            shell=True,
+            check=True,
+            capture_output=True,
+            text=True,
+            cwd=repo_root,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(result.stderr)
+    except subprocess.CalledProcessError as e:
+        raise RuntimeError(e.stderr) from e
+
 
 # ProteinMPNN
 ## ## ## ## ## ## ## ## ## ## ## ##
@@ -176,9 +227,11 @@ def run_proteinmpnn(
     """
     name = pdb_name_from_path(pdb_file_path)
     python_exec = os.environ.get("PYTHON_EXEC", "python")
+    repo_root = _get_repo_root()
+    mpnn_run = os.path.join(repo_root, "community_models", "ProteinMPNN", "protein_mpnn_run.py")
     # Base command without optional parameters
     base_command = f"""
-    {python_exec} ./community_models/ProteinMPNN/protein_mpnn_run.py \
+    {python_exec} {mpnn_run} \
         --pdb_path {pdb_file_path} \
         --pdb_path_chains '{" ".join(pdb_path_chains)}' \
         --out_folder {out_dir_root} \
@@ -203,16 +256,13 @@ def run_proteinmpnn(
         command = base_command
 
     try:
-        result = subprocess.run(command, shell=True, check=True, capture_output=True, text=True)
-        if result.returncode != 0:
-            logger.error(f"ProteinMPNN command failed with error: {result.stderr}")
-            raise RuntimeError(f"ProteinMPNN command failed: {result.stderr}")
-    except subprocess.CalledProcessError as e:
-        logger.error(f"ProteinMPNN command failed with error: {e.stderr}")
-        raise RuntimeError(f"ProteinMPNN command failed: {e.stderr}")
+        _run_mpnn_shell(command)
+    except RuntimeError as e:
+        logger.error(f"ProteinMPNN command failed with error: {e}")
+        raise RuntimeError(f"ProteinMPNN command failed: {e}") from e
     except Exception as e:
         logger.error(f"Unexpected error running ProteinMPNN: {e!s}")
-        raise RuntimeError(f"Unexpected error running ProteinMPNN: {e!s}")
+        raise RuntimeError(f"Unexpected error running ProteinMPNN: {e!s}") from e
 
     redesigned_seqs_info = extract_gen_seqs_proteinmpnn(os.path.join(out_dir_root, "seqs", name + ".fa"))
 
@@ -266,11 +316,16 @@ def run_ligandmpnn(
     """
     name = pdb_name_from_path(pdb_file_path)
     python_exec = os.environ.get("PYTHON_EXEC", "python")
+    repo_root = _get_repo_root()
+    ligand_run = os.path.join(repo_root, "community_models", "LigandMPNN", "run.py")
+    ligand_ckpt = os.path.join(
+        repo_root, "community_models", "LigandMPNN", "model_params", "ligandmpnn_v_32_010_25.pt"
+    )
     chain_specificifaction = (
         f" --chains_to_design {','.join(pdb_path_chains)}"  # f" --parse_these_chains_only {pdb_path_chains}"
     )
     base_command = f"""
-    {python_exec} ./community_models/LigandMPNN/run.py \
+    {python_exec} {ligand_run} \
         --pdb_path {pdb_file_path} \
         --out_folder {out_dir_root} \
         --temperature {sampling_temp} \
@@ -279,7 +334,7 @@ def run_ligandmpnn(
         --number_of_batches {num_seq_per_target} \
         {chain_specificifaction} \
         --model_type ligand_mpnn \
-        --checkpoint_ligand_mpnn "./community_models/LigandMPNN/model_params/ligandmpnn_v_32_010_25.pt" \
+        --checkpoint_ligand_mpnn "{ligand_ckpt}" \
         --ligand_mpnn_use_atom_context 1 \
         --ligand_mpnn_cutoff_for_score 8.0 \
         --ligand_mpnn_use_side_chain_context 0 \
@@ -297,16 +352,13 @@ def run_ligandmpnn(
         base_command += " > /dev/null 2>&1"
 
     try:
-        result = subprocess.run(command, shell=True, check=True, capture_output=True, text=True)
-        if result.returncode != 0:
-            logger.error(f"LigandMPNN command failed with error: {result.stderr}")
-            raise RuntimeError(f"LigandMPNN command failed: {result.stderr}")
-    except subprocess.CalledProcessError as e:
-        logger.error(f"LigandMPNN command failed with error: {e.stderr}")
-        raise RuntimeError(f"LigandMPNN command failed: {e.stderr}")
+        _run_mpnn_shell(command)
+    except RuntimeError as e:
+        logger.error(f"LigandMPNN command failed with error: {e}")
+        raise RuntimeError(f"LigandMPNN command failed: {e}") from e
     except Exception as e:
         logger.error(f"Unexpected error running LigandMPNN: {e!s}")
-        raise RuntimeError(f"Unexpected error running LigandMPNN: {e!s}")
+        raise RuntimeError(f"Unexpected error running LigandMPNN: {e!s}") from e
 
     # Maybe not need this?
     backbone_name = os.path.join(out_dir_root, "backbones", name + "_1.pdb")
@@ -373,11 +425,16 @@ def run_solublempnn(
     """
     name = pdb_name_from_path(pdb_file_path)
     python_exec = os.environ.get("PYTHON_EXEC", "python")
+    repo_root = _get_repo_root()
+    ligand_run = os.path.join(repo_root, "community_models", "LigandMPNN", "run.py")
+    soluble_ckpt = os.path.join(
+        repo_root, "community_models", "LigandMPNN", "model_params", "solublempnn_v_48_020.pt"
+    )
     chain_specificifaction = (
         f" --chains_to_design {','.join(pdb_path_chains)}"  # f" --parse_these_chains_only {pdb_path_chains}"
     )
     base_command = f"""
-    {python_exec} ./community_models/LigandMPNN/run.py \
+    {python_exec} {ligand_run} \
         --pdb_path {pdb_file_path} \
         --out_folder {out_dir_root} \
         --temperature {sampling_temp} \
@@ -386,7 +443,7 @@ def run_solublempnn(
         --number_of_batches {num_seq_per_target} \
         {chain_specificifaction} \
         --model_type soluble_mpnn \
-        --checkpoint_soluble_mpnn "./community_models/LigandMPNN/model_params/solublempnn_v_48_020.pt" \
+        --checkpoint_soluble_mpnn "{soluble_ckpt}" \
         --verbose {0 if verbose else 1} \
     """
     if fix_pos:
@@ -401,16 +458,13 @@ def run_solublempnn(
         base_command += " > /dev/null 2>&1"
 
     try:
-        result = subprocess.run(command, shell=True, check=True, capture_output=True, text=True)
-        if result.returncode != 0:
-            logger.error(f"SolubleMPNN command failed with error: {result.stderr}")
-            raise RuntimeError(f"SolubleMPNN command failed: {result.stderr}")
-    except subprocess.CalledProcessError as e:
-        logger.error(f"SolubleMPNN command failed with error: {e.stderr}")
-        raise RuntimeError(f"SolubleMPNN command failed: {e.stderr}")
+        _run_mpnn_shell(command)
+    except RuntimeError as e:
+        logger.error(f"SolubleMPNN command failed with error: {e}")
+        raise RuntimeError(f"SolubleMPNN command failed: {e}") from e
     except Exception as e:
         logger.error(f"Unexpected error running SolubleMPNN: {e!s}")
-        raise RuntimeError(f"Unexpected error running SolubleMPNN: {e!s}")
+        raise RuntimeError(f"Unexpected error running SolubleMPNN: {e!s}") from e
 
     # Extract redesigned sequences from SolubleMPNN output
     backbone_name = os.path.join(out_dir_root, "backbones", name + "_1.pdb")

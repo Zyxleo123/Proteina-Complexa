@@ -33,9 +33,9 @@ env_vars:
 run_name: search_motif_local
 
 # --- Set these to your local checkpoint paths ---
-ckpt_path: ./ckpts
+ckpt_path: ${oc.env:CKPT_PATH}
 ckpt_name: complexa_ame.ckpt
-autoencoder_ckpt_path: ./ckpts/complexa_ame_ae.ckpt
+autoencoder_ckpt_path: ${oc.env:CKPT_PATH}/complexa_ame_ae.ckpt
 
 # =============================================================================
 # LoRA (required for the motif/AME model checkpoint)

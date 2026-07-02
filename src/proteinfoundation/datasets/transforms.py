@@ -532,33 +532,44 @@ class CroppingTransform2(BaseTransform):
 
         # get interface residues, and residue-wise distances: (n_res, n_res)
         interface_residues, min_dist_per_res = self._get_interface_residues(graph)
-        # filter out interface residues that are from too short chains
-        chain_of_interface_residues = asym_id[interface_residues]
-        binder_candidate_seed_residues = interface_residues[
-            chain_lens[chain_of_interface_residues] >= self.binder_min_length
-        ]
 
-        if len(binder_candidate_seed_residues) == 0:
-            # Select the top k residues in min_dist_per_res and generate the chain_of_interface_residues
-            k = min(10, min_dist_per_res.shape[0])  # or another value for k as appropriate
-            # Get the indices of the k smallest min_dist_per_res values (i.e., closest interface residues)
-            topk_vals, topk_indices = torch.topk(min_dist_per_res, k, largest=False)
-            interface_residues = topk_indices
+        if hasattr(graph, "binder_chain_id"):
+            binder_chain_id = ord(graph.binder_chain_id) - ord("A")
+            binder_chain_mask = asym_id == binder_chain_id
+            binder_interface = interface_residues[torch.isin(interface_residues, residues_idxs[binder_chain_mask])]
+            if len(binder_interface) > 0:
+                binder_seed_residue = random.choice(binder_interface.tolist())
+            else:
+                binder_residues = residues_idxs[binder_chain_mask]
+                binder_seed_residue = int(random.choice(binder_residues.tolist()))
+        else:
+            # filter out interface residues that are from too short chains
             chain_of_interface_residues = asym_id[interface_residues]
             binder_candidate_seed_residues = interface_residues[
                 chain_lens[chain_of_interface_residues] >= self.binder_min_length
             ]
-            # raise ValueError(f"No binder candidate seed residues found for pdb: {graph.id}")
-            logger.warning(
-                f"No binder candidate seed residues found for pdb: {graph.id}, using top {k} interface residues as binder candidate seed residues, with min interface distance: {topk_vals.min().item():.2f}A"
-            )
 
-        # randomly select a binder seed residue from interface residues
-        try:
-            binder_seed_residue = random.choice(binder_candidate_seed_residues)
-        except Exception:
-            raise ValueError(f"No binder candidate seed residues found for pdb: {graph.pdb_id}")
-        binder_chain_id = int(asym_id[binder_seed_residue])
+            if len(binder_candidate_seed_residues) == 0:
+                # Select the top k residues in min_dist_per_res and generate the chain_of_interface_residues
+                k = min(10, min_dist_per_res.shape[0])  # or another value for k as appropriate
+                # Get the indices of the k smallest min_dist_per_res values (i.e., closest interface residues)
+                topk_vals, topk_indices = torch.topk(min_dist_per_res, k, largest=False)
+                interface_residues = topk_indices
+                chain_of_interface_residues = asym_id[interface_residues]
+                binder_candidate_seed_residues = interface_residues[
+                    chain_lens[chain_of_interface_residues] >= self.binder_min_length
+                ]
+                # raise ValueError(f"No binder candidate seed residues found for pdb: {graph.id}")
+                logger.warning(
+                    f"No binder candidate seed residues found for pdb: {graph.id}, using top {k} interface residues as binder candidate seed residues, with min interface distance: {topk_vals.min().item():.2f}A"
+                )
+
+            # randomly select a binder seed residue from interface residues
+            try:
+                binder_seed_residue = random.choice(binder_candidate_seed_residues)
+            except Exception:
+                raise ValueError(f"No binder candidate seed residues found for pdb: {graph.pdb_id}")
+            binder_chain_id = int(asym_id[binder_seed_residue])
 
         if (n_res - int(chain_lens[binder_chain_id])) < self.target_min_length and self.enforce_target_min_length:
             raise ValueError(f"Target chain too short for pdb: {graph.id}")

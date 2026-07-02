@@ -551,8 +551,15 @@ def load_target_from_pdb(target_spec, pdb_path, target_hotspots=None, convert_an
     if not hasattr(struct, "occupancy"):
         struct.set_annotation("occupancy", np.ones(len(struct), dtype=np.float32))
 
-    select = AtomSelectionStack.from_contig(target_spec)
-    mask = select.get_mask(struct)
+    # Contig syntax: "A1-115" or "A96-174,A306-446". Query syntax: "A" (whole chain).
+    # CPSea preprocessed receptors keep sparse PDB numbering, so a range like
+    # "A23-539" can fail contig parsing; fall back to query selection.
+    try:
+        select = AtomSelectionStack.from_contig(target_spec)
+        mask = select.get_mask(struct)
+    except ValueError:
+        select = AtomSelectionStack.from_query(target_spec)
+        mask = select.get_mask(struct)
     struct = struct[mask]
     ca_struct = struct[struct.atom_name == "CA"]
 

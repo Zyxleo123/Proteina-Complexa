@@ -394,3 +394,49 @@ target_dict_cfg:
     hotspot_residues: ["A113", "C73"]
     binder_length: [50, 120]
     pdb_id: "1tnf"
+
+  # CPSea_PDB held-out test receptors (chain A; sparse resids → use query "A" in load_target_from_pdb)
+  cpsea_1E2T:
+    source: cpsea
+    target_filename: 1E2T_A_2_17_relaxed
+    target_path: /zfsauton/scratch/yixiz/CPSea/CPSea_PDB/preprocessed/processed/test/1E2T_A_2_17_relaxed.pdb
+    target_input: "A"
+    hotspot_residues: []
+    binder_length: [5, 16]
+    pdb_id: null
+
+  cpsea_1GYT:
+    source: cpsea
+    target_filename: 1GYT_A_33_44_relaxed
+    target_path: /zfsauton/scratch/yixiz/CPSea/CPSea_PDB/preprocessed/processed/test/1GYT_A_33_44_relaxed.pdb
+    target_input: "A"
+    hotspot_residues: []
+    binder_length: [5, 16]
+    pdb_id: null
+
+  cpsea_1J7K:
+    source: cpsea
+    target_filename: 1J7K_A_241_255_relaxed
+    target_path: /zfsauton/scratch/yixiz/CPSea/CPSea_PDB/preprocessed/processed/test/1J7K_A_241_255_relaxed.pdb
+    target_input: "A"
+    hotspot_residues: []
+    binder_length: [5, 16]
+    pdb_id: null
+
+  cpsea_1M46:
+    source: cpsea
+    target_filename: 1M46_A_27_39_relaxed
+    target_path: /zfsauton/scratch/yixiz/CPSea/CPSea_PDB/preprocessed/processed/test/1M46_A_27_39_relaxed.pdb
+    target_input: "A"
+    hotspot_residues: []
+    binder_length: [5, 16]
+    pdb_id: null
+
+  cpsea_1MU2:
+    source: cpsea
+    target_filename: 1MU2_B_790_805_relaxed
+    target_path: /zfsauton/scratch/yixiz/CPSea/CPSea_PDB/preprocessed/processed/test/1MU2_B_790_805_relaxed.pdb
+    target_input: "A"
+    hotspot_residues: []
+    binder_length: [5, 16]
+    pdb_id: null

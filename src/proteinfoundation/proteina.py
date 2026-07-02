@@ -60,6 +60,8 @@ class Proteina(L.LightningModule):
         self.inf_cfg = None  # Only for inference runs
         self.validation_output_lens = {}
         self.validation_output_data = []
+        # True only when train.py wires a GenDataset val loader before the structure val loader.
+        self._val_has_lens_dataloader = False
         self.store_dir = store_dir if store_dir is not None else "./tmp"
         self.val_path_tmp = os.path.join(self.store_dir, "val_samples")
         # create_dir(self.val_path_tmp)
@@ -74,7 +76,22 @@ class Proteina(L.LightningModule):
                 # Re-enable struct mode if needed
                 OmegaConf.set_struct(cfg_exp, True)
 
-            self.autoencoder, self.latent_dim = self.load_autoencoder(cfg_exp, freeze_params=True)
+            # `freeze_autoencoder=false` unfreezes the AE for *joint* training: the flow loss
+            # then backprops into the encoder AND we add the AE's own recon+KL objective (see
+            # training_step) so the latent space is anchored instead of collapsing to a
+            # trivially-predictable target. Default keeps the historical frozen behaviour.
+            self.freeze_autoencoder = bool(cfg_exp.get("freeze_autoencoder", True))
+            self.ae_reg_weight = float(cfg_exp.get("ae_reg_weight", 1.0))
+            self.autoencoder, self.latent_dim = self.load_autoencoder(
+                cfg_exp, freeze_params=self.freeze_autoencoder
+            )
+            if self.autoencoder is not None:
+                logger.info(
+                    f"Autoencoder loaded (freeze={self.freeze_autoencoder}, "
+                    f"ae_reg_weight={self.ae_reg_weight}). "
+                    + ("Frozen (latents are a fixed target)." if self.freeze_autoencoder
+                       else "JOINT training: encoder+decoder are trainable and regularized by recon+KL.")
+                )
             # Add right latent dimensionality in the config file, needed to instantiate the flow matcher below
             if self.autoencoder is not None:
                 cfg_exp.product_flowmatcher.local_latents.dim = self.latent_dim
@@ -250,6 +267,25 @@ class Proteina(L.LightningModule):
         self.log_losses(bs=bs, losses=losses, log_prefix=log_prefix, batch=batch)
         train_loss = sum([torch.mean(losses[k]) for k in losses if "_justlog" not in k])
 
+        # Joint AE training: anchor the (now trainable) autoencoder with its own recon+KL
+        # objective so the encoder cannot collapse the flow target `z` into something trivial.
+        # The flow loss above already backprops into the encoder via x_1["local_latents"].
+        if (not getattr(self, "freeze_autoencoder", True)) and getattr(self, "autoencoder", None) is not None:
+            ae_reg, ae_losses = self.autoencoder.compute_ae_reg_losses(batch)
+            train_loss = train_loss + self.ae_reg_weight * ae_reg
+            for k, v in ae_losses.items():
+                self.log(
+                    f"{log_prefix}/ae_{k}",
+                    torch.mean(v),
+                    on_step=True,
+                    on_epoch=True,
+                    prog_bar=False,
+                    logger=True,
+                    batch_size=bs,
+                    sync_dist=True,
+                    add_dataloader_idx=False,
+                )
+
         self.log(
             f"{log_prefix}/loss",
             train_loss,
@@ -387,20 +423,21 @@ class Proteina(L.LightningModule):
                 sync_dist=True,
             )
 
-    def validation_step(self, batch: dict, batch_idx: int, dataloader_idx: int):
+    def validation_step(self, batch: dict, batch_idx: int, dataloader_idx: int = 0):
         """Validation step dispatching to length-based generation or data-based loss.
 
         Args:
             batch: batch from dataset
             batch_idx: batch index (unused)
-            dataloader_idx: 0 for length dataloader (generation), 1 for data dataloader (loss)
+            dataloader_idx: With dual val loaders: 0 = GenDataset (generation), 1 = val loss.
+                With a single val loader (CPSea / StructureDataModule), only val loss runs.
         """
-        if dataloader_idx == 0:
+        if self._val_has_lens_dataloader and dataloader_idx == 0:
             self.validation_step_lens(batch, batch_idx)
-        elif dataloader_idx == 1:
-            self.validation_step_data(batch, batch_idx)
-        else:
+        elif self._val_has_lens_dataloader and dataloader_idx != 1:
             raise OSError(f"Validation dataloader with index {dataloader_idx} not recognized")
+        else:
+            self.validation_step_data(batch, batch_idx)
 
     def validation_step_data(self, batch: dict, batch_idx: int):
         """Evaluates the training loss on validation data."""

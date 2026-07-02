@@ -149,6 +149,60 @@ class AutoEncoder(L.LightningModule):
             "atom_mask": atom_mask,
         }
 
+    def compute_ae_reg_losses(self, batch: dict) -> tuple[Tensor, dict[str, Tensor]]:
+        """Recon + KL regularizer for *joint* AE training inside the flow model.
+
+        Mirrors the objective of `training_step` (encode -> decode -> struct/seq/KL loss)
+        but is side-effect free (no logging) and returns a single scalar plus the per-term
+        losses for the caller to log. Runs a fresh encoder/decoder pass so gradients flow
+        into both. Operates on the same masked residues the flow model uses.
+
+        Requires `batch` to contain `coords_nm`, `coord_mask`, `residue_type`, and a `mask`
+        (set by the flow matcher's `corrupt_batch`).
+        """
+        mask = batch["mask"]  # [b, n] boolean; set upstream by corrupt_batch
+        ca_coors_nm = batch["coords_nm"][..., 1, :] * mask[..., None]  # [b, n, 3]
+
+        output_enc = self.encoder(batch)  # z_latent, mean, log_scale
+        output_dec = self.decode(
+            z_latent=output_enc["z_latent"],
+            ca_coors_nm=ca_coors_nm,
+            mask=mask,
+        )
+
+        # KL annealing matches training_step semantics (uses AE's own global_step schedule).
+        f = 1.0
+        if self.cfg_ae.loss.kl.anneal:
+            f = min(1.0, self.global_step / self.cfg_ae.loss.kl.patience)
+
+        losses: dict[str, Tensor] = {}
+        losses.update(
+            self.compute_kl_penalty(
+                mean=output_enc["mean"],
+                log_scale=output_enc["log_scale"],
+                mask=mask,
+                w=self.cfg_ae.loss.kl.weight * f,
+            )
+        )
+        losses.update(
+            self.compute_struct_rec_loss(
+                output_dec=output_dec,
+                batch=batch,
+                reduce_mode="sum",
+                loss_ty=self.cfg_ae.loss.struct.type,
+                weight=self.cfg_ae.loss.struct.weight,
+            )
+        )
+        losses.update(
+            self.compute_seq_rec_loss(
+                output_dec=output_dec,
+                batch=batch,
+                weight=self.cfg_ae.loss.seq.weight,
+            )
+        )
+        reg_loss = sum(torch.mean(losses[k]) for k in losses if "_justlog" not in k)
+        return reg_loss, losses
+
     def training_step(self, batch: dict, batch_idx: int):
         """
         Computes training loss for batch of samples.
@@ -165,7 +219,16 @@ class AutoEncoder(L.LightningModule):
         pca_every_n = 5000
         per_aatype_kl = True
 
-        mask = batch["mask_dict"]["coords"][..., 0, 0]  # [b, n] boolean
+        # `mask_dict` is produced by the PDB monomer datamodule the AE was trained on. The
+        # CPSea StructureDataModule batch omits it, so fall back to `mask` / CA presence to
+        # allow training the AE directly on peptide complexes (binder chain). Backward
+        # compatible: the original path is unchanged when `mask_dict` is present.
+        if "mask_dict" in batch:
+            mask = batch["mask_dict"]["coords"][..., 0, 0]  # [b, n] boolean
+        elif "mask" in batch:
+            mask = batch["mask"].bool()
+        else:
+            mask = batch["coord_mask"][..., 1].bool()  # [b, n] CA presence
         batch["mask"] = mask
         ca_coors_nm = batch["coords_nm"][..., 1, :]  # [b, n, 3]
         ca_coors_nm = ca_coors_nm * mask[..., None]  # [b, n, 3]

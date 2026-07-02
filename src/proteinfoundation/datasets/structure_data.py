@@ -341,6 +341,11 @@ class StructureDataset(Dataset):
             return None
         # Convert to atom37
         data = atomarray_to_atom37(atom_array, sample_id=str(sample_id), atomworks_data=data)
+        # Propagate metadata columns (e.g. binder_chain_id for CPSea) in simple mode
+        if not self._use_pipeline_mode:
+            for col in row.index:
+                if col not in [self.path_column, self.id_column]:
+                    setattr(data, col, row[col])
         # Apply atom37 transforms
         for transform in self.atom37_transforms:
             data = transform(data)
@@ -906,4 +911,10 @@ class StructureDataModule(L.LightningDataModule):
         )
 
     def add_validation_dataloader(self, cfg_val_data, n_replicas: int = 1):
-        """Compatibility method for validation dataloader from config."""
+        """Compatibility hook for a GenDataset-based length validation loader.
+
+        Not implemented yet — CPSea / unified training uses only the structure val
+        split (val loss). Length-based generation validation remains disabled in
+        ``Proteina.on_validation_epoch_end_lens``.
+        """
+        del cfg_val_data, n_replicas  # unused until dual val loaders are wired up

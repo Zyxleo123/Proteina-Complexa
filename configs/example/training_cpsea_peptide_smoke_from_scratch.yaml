@@ -1,0 +1,118 @@
+# @package _global_
+# CPSea cyclic-peptide binder smoke training FROM SCRATCH (flow model random init)
+#
+# "From scratch" here = do NOT load ./ckpts/complexa.ckpt (the 160M flow / score network).
+# The sidechain autoencoder is still loaded frozen from ./ckpts/complexa_ae.ckpt — that is
+# required for the local_latents modality (same as other binder training configs with empty
+# pretrain_ckpt_path). Training the AE itself is a separate pipeline (partial_autoencoder).
+#
+# Prerequisites:
+#   source env.sh
+#   python script_utils/preprocess_cpsea.py --seed 42
+#
+# Run (scratch preprocessed data):
+#   python -m proteinfoundation.train \
+#     --config-name example/training_cpsea_peptide_smoke_from_scratch \
+#     +single=true +nolog=true ++show_prog_bar=true
+#
+# Run (100-sample local data):
+#   python -m proteinfoundation.train \
+#     --config-name example/training_cpsea_peptide_smoke_from_scratch \
+#     +single=true +nolog=true ++show_prog_bar=true \
+#     ++dataset.datamodule.metadata_file=${PWD}/CPSea_data/preprocessed_sample100/metadata/cpsea_train.parquet \
+#     ++dataset.datamodule.val_metadata_file=${PWD}/CPSea_data/preprocessed_sample100/metadata/cpsea_val.parquet
+
+run_name: cpsea_peptide_smoke_from_scratch
+
+hardware:
+  ncpus_per_task_train_: 4
+  ncpus_per_task_prepro_: 4
+  accelerator: gpu
+  ngpus_per_node_: 1
+  nnodes_: 1
+
+defaults:
+  - /nn: local_latents_score_nn_160M_binder
+  - /generation: validation_local_latents
+  - /dataset/unified: cpsea_peptide
+  - _self_
+
+# Flow model: random initialization (no complexa.ckpt)
+pretrain_ckpt_path: null
+
+# Frozen sidechain encoder (still required for local_latents training)
+autoencoder_ckpt_path: ${oc.env:CKPT_PATH}/complexa_ae.ckpt
+
+product_flowmatcher:
+  bb_ca:
+    zero_com_noise: False
+    guidance_enabled: true
+    dim: 3
+  local_latents:
+    zero_com_noise: False
+    guidance_enabled: True
+    dim: null
+
+loss:
+  t_distribution:
+    bb_ca:
+      name: mix_unif_beta
+      p1: 1.9
+      p2: 1.0
+      p3: 0.02
+    local_latents:
+      name: uniform
+      p1: 1.0
+      p2: 1.0
+    shared_groups: []
+
+force_precision_f32: True
+
+training:
+  n_recycle: 0
+  motif_conditioning: False
+  self_cond: True
+  fold_cond: False
+  target_cond: False
+  mask_T_prob: 0.5
+  mask_A_prob: 0.5
+  mask_C_prob: 0.5
+  fold_label_sample_ratio: [0.5, 0.1, 0.15, 0.25]
+  p_folding_n_inv_folding_iters: 0.15
+
+lora:
+  r: null
+  lora_alpha: 32.0
+  lora_dropout: 0.0
+  train_bias: none
+
+dataset:
+  datamodule:
+    batch_size: 2
+    num_workers: 4
+
+opt:
+  lr: 0.0001
+  max_epochs: 1
+  accumulate_grad_batches: 1
+  skip_nan_grad: True
+  grad_and_weight_analysis: False
+  dist_strategy: auto
+  val_check_interval: 999999
+  limit_train_batches: 20
+
+log:
+  wandb_project: cpsea_peptide_smoke_from_scratch
+  log_wandb: False
+  log_every_n_steps: 1
+  checkpoint: False
+  checkpoint_every_n_steps: 10000
+  last_ckpt_every_n_steps: 1500
+
+seed: 42
+
+ema:
+  decay: 0.999
+  validate_original_weights: False
+  every_n_steps: 1
+  cpu_offload: False

@@ -1,0 +1,164 @@
+# Standalone sidechain-VAE (AutoEncoder) training on CPSea cyclic-peptide binders.
+#
+# Entry point: python -m proteinfoundation.partial_autoencoder.train --config-name training_ae_cpsea
+# Launcher:    ~/slurm/cpsea/cpsea_ae_train.sh
+#
+# This trains ONLY the autoencoder (encoder -> latent -> decoder), warm-started from the
+# public complexa_ae.ckpt, on the *binder chain* of the CPSea complexes. It is the
+# fallback lever if the frozen-AE latents turn out to be a poor target for short peptides
+# (the diagnostic found a tight posterior + ~0.2A recon, so this is exploratory).
+#
+# nn_ae is inlined (token_dim=768) to byte-match complexa_ae.ckpt for warm-start. The
+# dataset block is inlined (StructureDataModule + CPSea transforms); the AE `_step` falls
+# back to CA presence when `mask_dict` is absent (see autoencoder.py).
+
+run_name: cpsea_ae_finetune
+
+# Warm-start from the public Complexa autoencoder (matches nn_ae schema below).
+pretrain_ckpt_path: ${oc.env:CKPT_PATH}/complexa_ae.ckpt
+
+force_precision_f32: True
+seed: 42
+
+hardware:
+  ncpus_per_task_train_: 8
+  ncpus_per_task_prepro_: 8
+  accelerator: gpu
+  ngpus_per_node_: 1
+  nnodes_: 1
+
+nn_ae:
+  name: transformer_ae
+  latent_z_dim: &latent_z_dim 8
+  encoder:
+    nlayers: 12
+    token_dim: 768
+    nheads: 12
+    parallel_mha_transition: false
+    strict_feats: false
+    feats_seq:
+      - chain_break_per_res
+      - x1_aatype
+      - x1_a37coors_nm
+      - x1_a37coors_nm_rel
+      - x1_bb_angles
+      - x1_sidechain_angles
+    feats_cond_seq: null
+    dim_cond: 128
+    idx_emb_dim: 128
+    feats_pair_repr:
+      - rel_seq_sep
+      - x1_bb_pair_dists_nm
+      - x1_bb_pair_orientation
+    seq_sep_dim: 127
+    pair_repr_dim: 256
+    update_pair_repr: false
+    update_pair_repr_every_n: 3
+    use_tri_mult: false
+    use_qkln: true
+    normalize_latent: false
+    latent_z_dim: *latent_z_dim
+  decoder:
+    nlayers: 12
+    token_dim: 768
+    abs_coors: false
+    nheads: 12
+    parallel_mha_transition: false
+    strict_feats: false
+    feats_seq:
+      - ca_coors_nm
+      - z_latent_seq
+    feats_cond_seq: null
+    dim_cond: 128
+    idx_emb_dim: 128
+    feats_pair_repr:
+      - rel_seq_sep
+      - ca_coors_nm_pair_dists
+    seq_sep_dim: 127
+    pair_repr_dim: 256
+    update_pair_repr: false
+    update_pair_repr_every_n: 3
+    use_tri_mult: false
+    use_qkln: true
+    latent_z_dim: *latent_z_dim
+
+loss:
+  kl:
+    weight: 1.0e-05
+    anneal: false
+    patience: 10000
+  struct:
+    type: l2
+    weight: 1.0
+  seq:
+    weight: 1.0
+
+opt:
+  lr: 0.0001
+  max_epochs: 10000000
+  accumulate_grad_batches: 1
+  skip_nan_grad: True
+  grad_and_weight_analysis: False
+  dist_strategy: auto
+  val_check_interval: 5000
+  skip_large_grad_updates:
+    use: false
+    moving_avg_size: 100
+    factor_threshold: 10
+    min_opt_steps: 1500
+
+log:
+  wandb_project: cpsea_ae
+  log_wandb: true
+  wandb_entity: null
+  log_every_n_steps: 1
+  checkpoint: true
+  checkpoint_every_n_steps: 10000
+  last_ckpt_every_n_steps: 1500
+
+ema:
+  decay: 0.999
+  validate_original_weights: False
+  every_n_steps: 1
+  cpu_offload: False
+
+# CPSea peptide dataset (binder chain). Inlined StructureDataModule so this config is
+# self-contained regardless of Hydra group packaging. Root: ${oc.env:CPSEA_DATA_PATH}.
+dataset:
+  datamodule:
+    _target_: proteinfoundation.datasets.structure_data.StructureDataModule
+    metadata_file: ${oc.env:CPSEA_DATA_PATH}/preprocessed/metadata/cpsea_train.parquet
+    val_metadata_file: ${oc.env:CPSEA_DATA_PATH}/preprocessed/metadata/cpsea_val.parquet
+    base_dir: ""
+    batch_size: 8
+    num_workers: 8
+    path_column: path
+    id_column: example_id
+    pin_memory: true
+    use_parse: false
+    columns_to_load:
+      - example_id
+      - path
+      - binder_chain_id
+      - cluster_id
+      - peptide_length
+      - cyclization_type
+    atom37_transforms:
+      - _target_: proteinfoundation.datasets.transforms.CoordsToNanometers
+      - _target_: proteinfoundation.datasets.transforms.GlobalRotationTransform
+      - _target_: proteinfoundation.datasets.transforms.CroppingTransform2
+        crop_size: 256
+        interface_threshold: 8.0
+        dist_mode: "bb_ca"
+        data_mode: "all-atom"
+        binder_min_length: 5
+        binder_max_length: 16
+        binder_padding_length: 0
+        target_min_length: 30
+        target_spatial_crop_threshold: 15.0
+        max_num_target_chains: -1
+      - _target_: proteinfoundation.datasets.transforms.OpenFoldFrameTransform
+      - _target_: proteinfoundation.datasets.transforms.ChainBreakPerResidueTransform
+      - _target_: proteinfoundation.datasets.transforms.CenteringTransform
+        center_mode: "target"
+        data_mode: "all-atom"

@@ -19,9 +19,9 @@ defaults:
 # Run identification
 # =============================================================================
 run_name: search_binder_local
-ckpt_path: ./ckpts
+ckpt_path: ${oc.env:CKPT_PATH}
 ckpt_name: complexa.ckpt
-autoencoder_ckpt_path: ./ckpts/complexa_ae.ckpt
+autoencoder_ckpt_path: ${oc.env:CKPT_PATH}/complexa_ae.ckpt
 
 # =============================================================================
 # Job management — set gen_njobs/eval_njobs to your number of available GPUs
