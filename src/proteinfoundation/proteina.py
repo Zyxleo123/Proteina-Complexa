@@ -145,7 +145,21 @@ class Proteina(L.LightningModule):
 
     def configure_optimizers(self):
         optimizer = torch.optim.Adam([p for p in self.parameters() if p.requires_grad], lr=self.cfg_exp.opt.lr)
-        return optimizer
+        # Optional linear LR warmup (0 -> lr over warmup_steps, then constant). Helps when
+        # finetuning pretrained weights onto an out-of-distribution data regime (e.g. short
+        # cyclic peptides). Backward compatible: warmup_steps<=0 keeps the bare Adam optimizer.
+        warmup_steps = int(self.cfg_exp.opt.get("warmup_steps", 0) or 0)
+        if warmup_steps <= 0:
+            return optimizer
+
+        def _warmup(step: int) -> float:
+            return min(1.0, (step + 1) / warmup_steps)
+
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=_warmup)
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {"scheduler": scheduler, "interval": "step", "frequency": 1},
+        }
 
     def on_save_checkpoint(self, checkpoint):
         """Adds additional variables to checkpoint."""

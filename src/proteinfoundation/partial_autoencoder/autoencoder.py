@@ -164,10 +164,16 @@ class AutoEncoder(L.LightningModule):
         ca_coors_nm = batch["coords_nm"][..., 1, :] * mask[..., None]  # [b, n, 3]
 
         output_enc = self.encoder(batch)  # z_latent, mean, log_scale
-        output_dec = self.decode(
-            z_latent=output_enc["z_latent"],
-            ca_coors_nm=ca_coors_nm,
-            mask=mask,
+        # Call the raw decoder (not the `decode` wrapper) so the output keeps the keys the
+        # loss helpers expect (`aatype_max`, `seq_logits`, `residue_mask`); the wrapper renames
+        # and drops some of them. This mirrors `training_step` exactly.
+        output_dec = self.decoder(
+            {
+                "z_latent": output_enc["z_latent"],
+                "ca_coors_nm": ca_coors_nm,
+                "residue_mask": mask,
+                "mask": mask,
+            }
         )
 
         # KL annealing matches training_step semantics (uses AE's own global_step schedule).
