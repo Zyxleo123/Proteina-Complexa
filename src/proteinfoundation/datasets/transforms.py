@@ -2631,6 +2631,15 @@ class FilterTargetResiduesTransform(BaseTransform):
         graph.binder_residue_count = binder_residue_mask.sum().item()
         graph.target_residue_count = target_residue_mask.sum().item()
 
+        # num_nodes was set to the full-complex length at load time and is NOT auto-updated
+        # when we filter the per-residue tensors above. The collate reads num_nodes as the
+        # binder length (binder_lengths -> binder_pad -> binder mask), so a stale value makes
+        # the binder mask/pad span the whole complex (target positions become empty tokens
+        # that are still marked valid). Sync it to the filtered binder length. Safe: this
+        # transform runs last and only in binder pipelines, so it only makes num_nodes
+        # consistent with the tensors it just produced.
+        graph.num_nodes = int(graph.binder_residue_count)
+
         # Remove full-complex masks - they served their purpose and would cause
         # shape mismatches in collate (neither binder-sized nor target-sized)
         if hasattr(graph, "target_residue_mask"):
