@@ -117,7 +117,15 @@ class AutoEncoder(L.LightningModule):
         Runs the encoder and returns only the latent variables.
         """
         if "mask" not in batch:
-            mask = batch["mask_dict"]["coords"][..., 0, 0]  # [b, n] boolean
+            # Same fallback as `training_step`/`predict_step`: `mask_dict` is only produced
+            # by the original PDB-monomer datamodule. In the flow-model pipeline this branch
+            # is normally skipped because `corrupt_batch` already sets `batch["mask"]`, but
+            # guard it too for any caller (e.g. standalone scripts) that invokes `encode`
+            # directly on a CPSea StructureDataModule batch.
+            if "mask_dict" in batch:
+                mask = batch["mask_dict"]["coords"][..., 0, 0]  # [b, n] boolean
+            else:
+                mask = batch["coord_mask"][..., 1].bool()  # [b, n] CA presence
             batch["mask"] = mask
         # return self.encoder(batch)["z_latent"]
         return self.encoder(batch)  # z_latent, mean, log_scale
@@ -804,7 +812,12 @@ class AutoEncoder(L.LightningModule):
                         "coors_nm": batch["coords_nm"][i, ...],  # [n, 37, 3]
                         "aatype": batch["residue_type"][i, ...],  # [n]
                         "atom_mask": batch["coord_mask"][i, ...],  # [n, 37]
-                        "mask": batch["mask_dict"]["coords"][i, :, 0, 0],  # [n]
+                        # `training_step` (called above) already derived and cached the mask
+                        # on `batch["mask"]` via its mask_dict/mask/coord_mask fallback chain,
+                        # so reuse it here instead of assuming `mask_dict` exists (it doesn't
+                        # for the CPSea StructureDataModule). Identical value when mask_dict
+                        # is present, since that's the first branch of the fallback.
+                        "mask": batch["mask"][i, ...],  # [n]
                     }
                 )
                 self.validation_rec_samples.append(
@@ -887,7 +900,14 @@ class AutoEncoder(L.LightningModule):
         Returns:
             Dict representing the decoded batch, with all info from the encoder output.
         """
-        mask = batch["mask_dict"]["coords"][..., 0, 0]  # [b, n] boolean
+        # Same fallback as `training_step`: `mask_dict` is only produced by the original
+        # PDB-monomer datamodule; the CPSea StructureDataModule batch omits it.
+        if "mask_dict" in batch:
+            mask = batch["mask_dict"]["coords"][..., 0, 0]  # [b, n] boolean
+        elif "mask" in batch:
+            mask = batch["mask"].bool()
+        else:
+            mask = batch["coord_mask"][..., 1].bool()  # [b, n] CA presence
         batch["mask"] = mask
         ca_coors_nm = batch["coords_nm"][..., 1, :]  # [b, n, 3]
         ca_coors_nm = ca_coors_nm * mask[..., None]  # [b, n, 3]

@@ -264,6 +264,7 @@ class ProductSpaceFlowMatcher(L.LightningModule):
                 mask=batch["mask"],
                 t=batch["t"][data_mode],
                 nn_out=nn_out[data_mode],
+                loss_t_clamp=self.cfg_exp.loss.t_distribution[data_mode].get("loss_t_clamp", 1.0),
             )
             for data_mode in self.data_modes
         }

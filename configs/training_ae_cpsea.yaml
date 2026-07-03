@@ -162,3 +162,11 @@ dataset:
       - _target_: proteinfoundation.datasets.transforms.CenteringTransform
         center_mode: "target"
         data_mode: "all-atom"
+      # Reduce the main features to the binder (peptide) chain only, so the AE trains on the
+      # same residues the flow model encodes into local_latents. Without these two, the AE
+      # would treat the whole peptide+receptor complex as one ~200-residue chain
+      # (Pad binder=192, groups={}). ExtractTargetCoordinatesTransform separates the target,
+      # FilterTargetResiduesTransform drops it from the main features (and syncs num_nodes).
+      - _target_: proteinfoundation.datasets.transforms.ExtractTargetCoordinatesTransform
+        compact_mode: true
+      - _target_: proteinfoundation.datasets.transforms.FilterTargetResiduesTransform

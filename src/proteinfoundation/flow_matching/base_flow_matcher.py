@@ -173,6 +173,7 @@ class BaseFlowMatcher:
         mask: torch.Tensor,
         t: torch.Tensor,
         x_1_pred: torch.Tensor,
+        loss_t_clamp: float = 1.0,
     ) -> torch.Tensor:
         """
         Computes flow matching loss per element in the batch.
@@ -184,6 +185,10 @@ class BaseFlowMatcher:
             mask (optional): Binary mask, shape [*, n]
             t: time sampled, shape [b]
             x_1_pred: predicted clean sample, shape [b, ...]
+            loss_t_clamp: optional cap on t used when computing loss reweighting
+                factors that can diverge as t -> 1 (e.g. 1 / (1 - t)^2), to bound
+                loss variance. 1.0 means no clamping. Implementations that don't
+                use such a reweighting can ignore this.
 
         Returns:
             Loss per batch element, shape [b]

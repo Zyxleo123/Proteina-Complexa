@@ -2,6 +2,7 @@ import json
 import os
 import pickle
 import sys
+import uuid
 from pathlib import Path
 
 import hydra
@@ -9,6 +10,8 @@ import lightning as L
 import torch
 import wandb
 from dotenv import load_dotenv
+
+import proteinfoundation.patches.atomworks_patches  # noqa: F401
 from lightning.pytorch.loggers import WandbLogger
 from lightning.pytorch.plugins.environments import SLURMEnvironment
 from lightning.pytorch.utilities import rank_zero_only
@@ -16,6 +19,7 @@ from loguru import logger
 from omegaconf import OmegaConf
 
 from proteinfoundation.partial_autoencoder.autoencoder import AutoEncoder
+from proteinfoundation.train import LogConfigArtifactsCallback, store_n_log_configs
 from proteinfoundation.utils.ema_callback import EMA, EmaModelCheckpoint
 from proteinfoundation.utils.fetch_last_ckpt import fetch_last_ckpt
 from proteinfoundation.utils.seed_callback import SeedCallback
@@ -192,33 +196,10 @@ def setup_ckpt(cfg_exp, ckpt_path_store):
     return [checkpoint_callback, checkpoint_callback_last]
 
 
-@rank_zero_only
-def store_n_log_configs(cfg_exp, cfg_data, run_name, ckpt_path_store, wandb_logger):
-    """
-    Stores config files locally and logs them to wandb run.
-    """
-
-    def store_n_log_config(cfg, cfg_path, wandb_logger):
-        with open(cfg_path, "w") as f:
-            cfg_aux = OmegaConf.to_container(cfg, resolve=True)
-            json.dump(cfg_aux, f, indent=4, sort_keys=True)
-
-        if wandb_logger is not None:
-            artifact = wandb.Artifact(f"config_files_{run_name}", type="config")
-            artifact.add_file(cfg_path)
-            wandb_logger.experiment.log_artifact(artifact)
-
-    cfg_exp_file = os.path.join(ckpt_path_store, f"exp_config_{run_name}.json")
-    cfg_data_file = os.path.join(ckpt_path_store, f"data_config_{run_name}.json")
-
-    store_n_log_config(cfg_exp, cfg_exp_file, wandb_logger)
-    store_n_log_config(cfg_data, cfg_data_file, wandb_logger)
-
-
 @hydra.main(
     version_base=None,
-    config_path="../../configs",
-    config_name="training_ae",
+    config_path="../../../configs",
+    config_name="training_ae_cpsea",
 )
 def main(cfg_exp) -> None:
     load_dotenv()
@@ -236,23 +217,48 @@ def main(cfg_exp) -> None:
 
     run_name, root_run, ckpt_path_store = get_run_dirs(cfg_exp)
     callbacks = initialize_callbacks(cfg_exp)
-    cfg_data, datamodule = load_data_module(cfg_exp, is_cluster_run)
 
-    # Create model, warm-up or last ckpt
-    model, resume_ckpt_path = get_model_n_ckpt_resume(cfg_exp, ckpt_path_store)
+    last_ckpt_name = fetch_last_ckpt(ckpt_path_store)
+    resuming_training = last_ckpt_name is not None
+    log_info(f"WandB resume={resuming_training} (last ckpt: {last_ckpt_name})")
 
-    # logger
     wandb_logger = None
     if cfg_exp.log.log_wandb and not nolog:
-        wandb_logger = WandbLogger(
-            project=cfg_exp.log.wandb_project, id=run_name, entity=cfg_exp.log.get("wandb_entity", None)
-        )
+        wandb_project = cfg_exp.log.wandb_project
+        wandb_entity = cfg_exp.log.get("wandb_entity", None)
+        if resuming_training:
+            log_info(f"Using WandB logger (resume): project={wandb_project}, id={run_name}")
+            wandb_logger = WandbLogger(
+                project=wandb_project,
+                id=run_name,
+                name=run_name,
+                entity=wandb_entity,
+                resume="must",
+            )
+        else:
+            wandb_id = f"{run_name}-{uuid.uuid4().hex[:8]}"
+            log_info(f"Using WandB logger (new run): project={wandb_project}, id={wandb_id}, name={run_name}")
+            wandb_logger = WandbLogger(
+                project=wandb_project,
+                id=wandb_id,
+                name=run_name,
+                entity=wandb_entity,
+                resume="never",
+            )
 
-    # checkpoints
+    cfg_data, datamodule = load_data_module(cfg_exp, is_cluster_run)
+
+    cfg_exp_file, cfg_data_file = None, None
     if cfg_exp.log.checkpoint and not nolog:
         ckpt_callbacks = setup_ckpt(cfg_exp, ckpt_path_store)
         callbacks += ckpt_callbacks
-        store_n_log_configs(cfg_exp, cfg_data, run_name, ckpt_path_store, wandb_logger)
+        cfg_exp_file, cfg_data_file = store_n_log_configs(
+            cfg_exp, cfg_data, run_name, ckpt_path_store, wandb_logger
+        )
+    if wandb_logger is not None and cfg_exp_file is not None:
+        callbacks.append(LogConfigArtifactsCallback(cfg_exp_file, cfg_data_file, run_name))
+
+    model, resume_ckpt_path = get_model_n_ckpt_resume(cfg_exp, ckpt_path_store)
 
     # Train
     plugins = [SLURMEnvironment(auto_requeue=True)] if is_cluster_run else []

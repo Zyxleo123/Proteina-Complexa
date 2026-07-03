@@ -56,6 +56,12 @@ loss:
       p1: 1.9
       p2: 1.0
       p3: 0.02
+      # Beta(1.9, 1.0) has no vanishing factor near t=1 (density ~ t^0.9), so it
+      # frequently samples t close to 1. The FM loss reweights by 1/(1-t)^2, which
+      # explodes there, causing very high loss variance (see train/loss_bb_ca_step).
+      # Clamp t used for that reweighting (only the weight, not the reconstruction
+      # target) to bound the max weight to 1/(1-loss_t_clamp)^2. 1.0 = no clamping.
+      loss_t_clamp: 0.9
     local_latents:
       name: mix_unif_beta
       p1: 1.0
@@ -71,7 +77,7 @@ loss:
       # - ["bb_ca", "sc_angle"]
       # - ["dm_a", "dm_b"]
       # - ["bb_ca", "local_latents"]
-  # loss_t_clamp: 0.9  # Used for loss stability in frameflow, 1. for no clamping
+  # loss_t_clamp is now set per-modality under t_distribution.<mode>.loss_t_clamp (see above)
   # use_aux_loss: True  # Whether to use auxiliary loss
   # aux_loss_t_lim: 0.3  # Time limit to apply auxiliary loss
   # thres_aux_2d_loss: 0.6  # This is nm not Å

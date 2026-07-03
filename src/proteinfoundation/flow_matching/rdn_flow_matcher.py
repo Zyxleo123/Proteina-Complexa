@@ -221,9 +221,18 @@ class RDNFlowMatcher(BaseFlowMatcher):
         mask: Bool[Tensor, "* n"],
         t: Float[Tensor, "*"],
         nn_out: dict[str, Float[Tensor, "* n d"]],
+        loss_t_clamp: float = 1.0,
     ) -> Float[Tensor, "*"]:
         """
         Computes flow matching loss per element in the batch.
+
+        The loss is reweighted by 1 / (1 - t)^2, which blows up as t -> 1. If the
+        t-distribution used for this modality places non-negligible mass near t=1,
+        this reweighting can dominate the (logged and backpropagated) loss with rare,
+        extremely large values, making the loss curve very spiky without necessarily
+        indicating a training problem. `loss_t_clamp` bounds this by capping the t used
+        *only* for the weight (not for the clean-sample reconstruction itself, which
+        still uses the true t).
 
         Args:
             x_0: noise sample, shape [*, n, d]
@@ -232,6 +241,9 @@ class RDNFlowMatcher(BaseFlowMatcher):
             mask (optional): Binary mask, shape [*, n]
             t: time sampled, shape [*]
             x_1_pred: predicted clean sample, shape [*, n, d]
+            loss_t_clamp: caps t (only for the loss weight computation) at this value,
+                bounding the max loss weight to 1 / (1 - loss_t_clamp)^2. Use 1.0 for no
+                clamping (default, preserves old behavior).
 
         Returns:
             Loss per element in the batch, shape [*]
@@ -245,7 +257,8 @@ class RDNFlowMatcher(BaseFlowMatcher):
         nres = torch.sum(mask, dim=-1)  # [*]
         err = (x_1 - nn_out["x_1"]) * mask[..., None]  # [*, n, d]
         loss = torch.sum(err**2, dim=(-1, -2)) / nres  # [*]
-        total_loss_w = 1.0 / ((1.0 - t) ** 2 + 1e-5)
+        t_for_w = torch.clamp(t, max=loss_t_clamp)
+        total_loss_w = 1.0 / ((1.0 - t_for_w) ** 2 + 1e-5)
         loss = loss * total_loss_w  # [*]
         return loss
 
