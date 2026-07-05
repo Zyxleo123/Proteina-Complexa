@@ -172,28 +172,31 @@ def setup_ckpt(cfg_exp, ckpt_path_store):
     """
     Created checkpointing callbacks and creates directory to store checkpoints.
     """
+    save_extra = bool(cfg_exp.log.get("save_extra_checkpoints", False))
     args_ckpt_last = {
         "dirpath": ckpt_path_store,
         "save_weights_only": False,
-        "filename": "ignore",
+        "filename": "ignore" if save_extra else "last",
         "every_n_train_steps": cfg_exp.log.last_ckpt_every_n_steps,
-        "save_last": True,
+        "save_last": save_extra,
     }
-    args_ckpt = {
-        "dirpath": ckpt_path_store,
-        "save_last": False,
-        "save_weights_only": False,
-        "filename": "chk_{epoch:08d}_{step:012d}",
-        "every_n_train_steps": cfg_exp.log.checkpoint_every_n_steps,
-        "monitor": "train_loss",
-        "save_top_k": 10000,
-        "mode": "min",
-    }
-    checkpoint_callback = EmaModelCheckpoint(**args_ckpt)
     checkpoint_callback_last = EmaModelCheckpoint(**args_ckpt_last)
+    callbacks = [checkpoint_callback_last]
+    if save_extra:
+        args_ckpt = {
+            "dirpath": ckpt_path_store,
+            "save_last": False,
+            "save_weights_only": False,
+            "filename": "chk_{epoch:08d}_{step:012d}",
+            "every_n_train_steps": cfg_exp.log.checkpoint_every_n_steps,
+            "monitor": "train_loss",
+            "save_top_k": 10000,
+            "mode": "min",
+        }
+        callbacks.insert(0, EmaModelCheckpoint(**args_ckpt))
 
     create_dir(ckpt_path_store, parents=True, exist_ok=True)
-    return [checkpoint_callback, checkpoint_callback_last]
+    return callbacks
 
 
 @hydra.main(

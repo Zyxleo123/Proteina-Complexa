@@ -1,19 +1,21 @@
 # @package _global_
-# CPSea cyclic-peptide binder smoke training (single GPU, ~20 steps)
+# Experiment A: Frozen AE + mean latent target.
 #
-# Prerequisites:
-#   source env.sh                    # CPSEA_DATA_PATH, wandb keys, etc.
-#   python script_utils/preprocess_cpsea.py --seed 42   # writes $CPSEA_DATA_PATH/preprocessed/
+# Purpose: test whether sampled-latent posterior noise (not the AE itself) is the cause of the
+# frozen-AE `local_latents` loss floor. Uses the deterministic encoder posterior mean as the flow
+# target instead of a freshly sampled `z = mean + exp(log_scale) * eps`, while keeping the AE
+# frozen (no change to AE quality / KL / reconstruction).
 #
-# Run (after full CPSea_PDB preprocess on scratch):
-#   python -m proteinfoundation.train --config-name example/training_cpsea_peptide_smoke +single=true +nolog=true ++show_prog_bar=true
+# This is a full copy of example/training_cpsea_peptide_smoke.yaml (used identically by the
+# finetune/smoke slurm scripts) with only the new opt-in AE/flow experimental knobs added; the
+# base file remains the single source of truth for defaults and is unaffected by this file.
 #
-# Run (100-sample local smoke data, before scratch preprocess is ready):
-#   python -m proteinfoundation.train --config-name example/training_cpsea_peptide_smoke +single=true +nolog=true ++show_prog_bar=true \
-#     ++dataset.datamodule.metadata_file=${PWD}/CPSea_data/preprocessed_sample100/metadata/cpsea_train.parquet \
-#     ++dataset.datamodule.val_metadata_file=${PWD}/CPSea_data/preprocessed_sample100/metadata/cpsea_val.parquet
+# Run:
+#   CONFIG=example/training_cpsea_peptide_experiment_a_frozen_mean \
+#     RUN_NAME=cpsea_peptide_exp_a_frozen_mean \
+#     bash ~/slurm/cpsea/cpsea_peptide_train_finetune.sh full
 
-run_name: cpsea_peptide_smoke
+run_name: cpsea_peptide_experiment_a_frozen_mean
 
 hardware:
   ncpus_per_task_train_: 4
@@ -28,18 +30,20 @@ defaults:
   - /dataset/unified: cpsea_peptide
   - _self_
 
-# Finetune flow from public Complexa binder checkpoint; freeze CPSea-finetuned sidechain AE.
 pretrain_ckpt_path: ${oc.env:CKPT_PATH}/complexa.ckpt
 autoencoder_ckpt_path: ${oc.env:CPSEA_AE_CKPT_PATH}
 
-# Autoencoder training mode.
-#   freeze_autoencoder: true  -> AE frozen; local_latents are a fixed regression target (default).
-#   freeze_autoencoder: false -> JOINT training: encoder+decoder are trainable, the flow loss
-#                                backprops into the encoder, and the AE's own recon+KL objective
-#                                (scaled by ae_reg_weight) is added to keep the latent space anchored.
-# Override at launch with: ++freeze_autoencoder=false ++ae_reg_weight=1.0
 freeze_autoencoder: true
 ae_reg_weight: 1.0
+
+# --- Experiment A knob ---
+local_latent_target: mean
+
+# Diagnostics to compare against the main hypothesis (latent loss/dim, KL before/after
+# weighting, per-t-bin loss); safe to leave on, purely additive logging.
+log_latent_diagnostics: true
+log_t_binned_losses: true
+t_bins: [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]
 
 product_flowmatcher:
   bb_ca:
@@ -84,7 +88,6 @@ lora:
   lora_dropout: 0.0
   train_bias: none
 
-# Smaller loader + capped steps for smoke runs
 dataset:
   datamodule:
     batch_size: 2
@@ -92,17 +95,17 @@ dataset:
 
 opt:
   lr: 0.0001
-  warmup_steps: 0  # >0 enables linear LR warmup (0 -> lr) then constant; 0 = no scheduler
+  warmup_steps: 0
   max_epochs: 1
   accumulate_grad_batches: 1
   skip_nan_grad: True
   grad_and_weight_analysis: False
   dist_strategy: auto
-  val_check_interval: 999999  # skip validation during smoke
+  val_check_interval: 999999
   limit_train_batches: 20
 
 log:
-  wandb_project: cpsea_peptide_smoke
+  wandb_project: cpsea_peptide
   log_wandb: False
   log_every_n_steps: 1
   checkpoint: False

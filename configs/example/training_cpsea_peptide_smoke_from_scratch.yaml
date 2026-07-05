@@ -2,7 +2,7 @@
 # CPSea cyclic-peptide binder smoke training FROM SCRATCH (flow model random init)
 #
 # "From scratch" here = do NOT load ./ckpts/complexa.ckpt (the 160M flow / score network).
-# The sidechain autoencoder is still loaded frozen from ./ckpts/complexa_ae.ckpt — that is
+# The sidechain autoencoder is still loaded frozen from $CPSEA_AE_CKPT_PATH — that is
 # required for the local_latents modality (same as other binder training configs with empty
 # pretrain_ckpt_path). Training the AE itself is a separate pipeline (partial_autoencoder).
 #
@@ -41,7 +41,7 @@ defaults:
 pretrain_ckpt_path: null
 
 # Frozen sidechain encoder (still required for local_latents training)
-autoencoder_ckpt_path: ${oc.env:CKPT_PATH}/complexa_ae.ckpt
+autoencoder_ckpt_path: ${oc.env:CPSEA_AE_CKPT_PATH}
 
 product_flowmatcher:
   bb_ca:
@@ -106,8 +106,9 @@ log:
   log_wandb: False
   log_every_n_steps: 1
   checkpoint: False
-  checkpoint_every_n_steps: 10000
-  last_ckpt_every_n_steps: 1500
+  checkpoint_every_n_steps: null  # requires save_extra_checkpoints=true to write chk_* files
+  last_ckpt_every_n_steps: 1500  # always: last.ckpt / last-EMA.ckpt
+  save_extra_checkpoints: false  # true -> also chk_* and ignore* (legacy, ~3GB/extra per interval)
 
 seed: 42
 

@@ -115,6 +115,7 @@ log:
   checkpoint: true
   checkpoint_every_n_steps: 10000
   last_ckpt_every_n_steps: 1500
+  save_extra_checkpoints: true  # legacy: also write chk_* and ignore* in addition to last*
 
 ema:
   decay: 0.999

@@ -92,6 +92,26 @@ class Proteina(L.LightningModule):
                     + ("Frozen (latents are a fixed target)." if self.freeze_autoencoder
                        else "JOINT training: encoder+decoder are trainable and regularized by recon+KL.")
                 )
+                # Optional channel-wise latent normalization (default disabled, identical to
+                # historical behavior). Stats are precomputed offline (see
+                # `script_utils/compute_latent_stats.py`) and stashed as a plain attribute on
+                # the autoencoder instance so `get_clean_sample`/`format_sample_local_latents`
+                # (which only receive the autoencoder, not the full cfg_exp) can pick them up
+                # transparently for both the flow target (normalize) and decoding (unnormalize).
+                latent_norm_cfg = cfg_exp.get("latent_normalization", None) or {}
+                self.autoencoder.latent_norm_stats = None
+                if bool(latent_norm_cfg.get("enabled", False)):
+                    stats_path = latent_norm_cfg.get("stats_path", None)
+                    if not stats_path:
+                        raise ValueError("latent_normalization.enabled=true requires latent_normalization.stats_path")
+                    stats = torch.load(stats_path, map_location="cpu")
+                    norm_mean = torch.as_tensor(stats["mean"], dtype=torch.float32)
+                    norm_std = torch.as_tensor(stats["std"], dtype=torch.float32)
+                    assert norm_mean.shape[-1] == self.latent_dim and norm_std.shape[-1] == self.latent_dim, (
+                        f"latent_normalization stats dim {norm_mean.shape[-1]} != latent_dim {self.latent_dim}"
+                    )
+                    self.autoencoder.latent_norm_stats = {"mean": norm_mean, "std": norm_std}
+                    logger.info(f"Loaded latent normalization stats from {stats_path}")
             # Add right latent dimensionality in the config file, needed to instantiate the flow matcher below
             if self.autoencoder is not None:
                 cfg_exp.product_flowmatcher.local_latents.dim = self.latent_dim
@@ -144,10 +164,42 @@ class Proteina(L.LightningModule):
         return autoencoder, autoencoder.latent_dim
 
     def configure_optimizers(self):
-        optimizer = torch.optim.Adam([p for p in self.parameters() if p.requires_grad], lr=self.cfg_exp.opt.lr)
+        base_lr = self.cfg_exp.opt.lr
+        ae_lr = self.cfg_exp.get("ae_lr", None)
+        ae_lr_scale = self.cfg_exp.get("ae_lr_scale", None)
+
+        ae = getattr(self, "autoencoder", None)
+        use_separate_ae_lr = (
+            ae is not None
+            and not getattr(self, "freeze_autoencoder", True)
+            and (ae_lr is not None or ae_lr_scale is not None)
+        )
+
+        if use_separate_ae_lr:
+            # Joint training with a dedicated (typically smaller) AE learning rate: the AE can
+            # still adapt from its own recon/KL loss (see `training_step`) without moving as
+            # fast as the flow model, which may help preserve AE reconstruction quality/KL while
+            # still letting the flow shape the latent target somewhat. Default (both None) keeps
+            # the historical single-optimizer, single-lr behavior exactly.
+            ae_param_ids = {id(p) for p in ae.parameters()}
+            ae_params = [p for p in self.parameters() if p.requires_grad and id(p) in ae_param_ids]
+            other_params = [p for p in self.parameters() if p.requires_grad and id(p) not in ae_param_ids]
+            resolved_ae_lr = float(ae_lr) if ae_lr is not None else base_lr * float(ae_lr_scale)
+            logger.info(f"Using separate AE optimizer LR: {resolved_ae_lr} (flow/other params LR: {base_lr})")
+            optimizer = torch.optim.Adam(
+                [
+                    {"params": other_params, "lr": base_lr},
+                    {"params": ae_params, "lr": resolved_ae_lr},
+                ]
+            )
+        else:
+            optimizer = torch.optim.Adam([p for p in self.parameters() if p.requires_grad], lr=base_lr)
+
         # Optional linear LR warmup (0 -> lr over warmup_steps, then constant). Helps when
         # finetuning pretrained weights onto an out-of-distribution data regime (e.g. short
         # cyclic peptides). Backward compatible: warmup_steps<=0 keeps the bare Adam optimizer.
+        # When separate param groups are used, the same multiplier is applied to every group,
+        # preserving the base_lr/ae_lr ratio throughout warmup.
         warmup_steps = int(self.cfg_exp.opt.get("warmup_steps", 0) or 0)
         if warmup_steps <= 0:
             return optimizer
@@ -257,7 +309,12 @@ class Proteina(L.LightningModule):
             batch,
             self.cfg_exp.product_flowmatcher,
             getattr(self, "autoencoder", None),
+            local_latent_target=self.cfg_exp.get("local_latent_target", "sample"),
+            detach_latent_target_for_flow=bool(self.cfg_exp.get("detach_latent_target_for_flow", False)),
         )
+
+        if self.cfg_exp.get("log_latent_diagnostics", False):
+            self.log_latent_diagnostics(batch=batch, log_prefix=log_prefix)
 
         # Corrupt the batch
         batch = self.fm.corrupt_batch(batch)  # adds x_1, t, x_0, x_t, mask
@@ -342,6 +399,15 @@ class Proteina(L.LightningModule):
                 add_dataloader_idx=False,
             )
 
+            if k in self.fm.data_modes and self.cfg_exp.get("log_t_binned_losses", False):
+                self.log_t_binned_loss(
+                    bs=bs,
+                    data_mode=k,
+                    per_sample_loss=losses[k],
+                    batch=batch,
+                    log_prefix=log_prefix,
+                )
+
             if self.cfg_exp.training.get("p_folding_n_inv_folding_iters", 0.0) > 0.0:
                 # Log also for folding and inverse folding iters
                 # divides by p_aux to account for the fact that for most steps loss will be just zero
@@ -374,6 +440,127 @@ class Proteina(L.LightningModule):
                     sync_dist=True,
                     add_dataloader_idx=False,
                 )
+
+    def log_t_binned_loss(
+        self,
+        bs: int,
+        data_mode: str,
+        per_sample_loss: Float[torch.Tensor, "b"],
+        batch: dict,
+        log_prefix: str,
+    ):
+        """Logs `per_sample_loss` for `data_mode` split into time bins (opt-in diagnostic).
+
+        Motivated by the FM loss's late-time reweighting (`1/(1-t)^2`): high average loss for a
+        modality can come from every t equally, or be concentrated near t -> 1. Binning tells
+        these apart. Default off (`log_t_binned_losses=false`), no effect on training.
+
+        Note: if a bin has no samples in a given step, this logs 0 for that bin/step rather than
+        skipping the `self.log` call, so that DDP's `sync_dist` reduction always sees the same
+        set of logged keys across ranks every step (skipping conditionally could cause a
+        cross-rank mismatch/hang). This means bins are most meaningful aggregated (on_epoch) over
+        many steps/batches rather than read at a single step with a small batch size.
+        """
+        t_bins = list(self.cfg_exp.get("t_bins", [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]))
+        t_vals = batch["t"][data_mode].detach()
+        loss_vals = per_sample_loss.detach()
+        for lo, hi in zip(t_bins[:-1], t_bins[1:]):
+            is_last_bin = hi >= t_bins[-1]
+            bin_mask = (t_vals >= lo) & (t_vals <= hi if is_last_bin else t_vals < hi)
+            count = bin_mask.sum()
+            bin_loss = (loss_vals * bin_mask).sum() / count.clamp(min=1)
+            self.log(
+                f"{log_prefix}/loss_{data_mode}_t_{lo}_{hi}",
+                bin_loss,
+                on_step=True,
+                on_epoch=True,
+                prog_bar=False,
+                logger=True,
+                batch_size=bs,
+                sync_dist=True,
+                add_dataloader_idx=False,
+            )
+
+    def log_latent_diagnostics(self, batch: dict, log_prefix: str):
+        """Opt-in diagnostics for the local_latents AE target (`log_latent_diagnostics=true`).
+
+        Must be called after `add_clean_samples` (needs `batch["local_latents_encoder_output"]`,
+        `batch["local_latents_raw_target"]`, and `batch["x_1"]["local_latents"]`) and before
+        `corrupt_batch` overwrites `batch["mask"]` (harmless either way here since corrupt_batch
+        sets mask to the same value, but the encoder output / raw target keys are only present
+        pre-corruption). No-op if local_latents is not a configured data mode.
+
+        Logs (all masked over valid residues):
+          - latent target mean/std/min/max (what the flow actually regresses to; if latent
+            normalization is enabled this is the *normalized* target, and the raw
+            pre-normalization target is also logged as `latent_target_raw_*`)
+          - encoder posterior mean std, posterior scale (exp(log_scale)) mean/std
+          - KL before weighting (raw, unweighted) and after weighting (using the AE's own
+            configured KL weight, i.e. `autoencoder.cfg_ae.loss.kl.weight`)
+        """
+        if "local_latents" not in getattr(self.fm, "data_modes", []):
+            return
+        enc_out = batch.get("local_latents_encoder_output")
+        if enc_out is None:
+            return
+
+        # Same mask resolution as `ProductSpaceFlowMatcher.process_batch`: this runs before
+        # `corrupt_batch` sets `batch["mask"]`, and some datamodules (e.g. the original
+        # PDB-monomer/genie2 pipeline) only populate `mask_dict` at this point.
+        if "mask_dict" in batch:
+            mask = batch["mask_dict"]["coords"][..., 0, 0].bool()
+        else:
+            mask = batch["mask"].bool()
+        bs = mask.shape[0]
+
+        def _log_stats(v: torch.Tensor, name: str):
+            vals = v[mask]
+            if vals.numel() == 0:
+                return
+            for stat_name, stat_val in (
+                ("mean", vals.mean()),
+                ("std", vals.std()),
+                ("min", vals.min()),
+                ("max", vals.max()),
+            ):
+                self.log(
+                    f"{log_prefix}/latent_diag_{name}_{stat_name}",
+                    stat_val,
+                    on_step=True,
+                    on_epoch=True,
+                    prog_bar=False,
+                    logger=True,
+                    batch_size=bs,
+                    sync_dist=True,
+                    add_dataloader_idx=False,
+                )
+
+        _log_stats(batch["x_1"]["local_latents"], "target")
+        if getattr(self.autoencoder, "latent_norm_stats", None) is not None:
+            _log_stats(batch["local_latents_raw_target"], "target_raw")
+
+        _log_stats(enc_out["mean"], "posterior_mean")
+        _log_stats(torch.exp(enc_out["log_scale"]), "posterior_scale")
+
+        kl_raw = self.autoencoder.compute_kl_penalty(
+            mean=enc_out["mean"], log_scale=enc_out["log_scale"], mask=mask, w=1.0
+        )["kl_now_justlog"]
+        kl_weight = float(self.autoencoder.cfg_ae.loss.kl.weight)
+        for name, val in (
+            ("kl_before_weighting", torch.mean(kl_raw)),
+            ("kl_after_weighting", torch.mean(kl_raw) * kl_weight),
+        ):
+            self.log(
+                f"{log_prefix}/latent_diag_{name}",
+                val,
+                on_step=True,
+                on_epoch=True,
+                prog_bar=False,
+                logger=True,
+                batch_size=bs,
+                sync_dist=True,
+                add_dataloader_idx=False,
+            )
 
     def log_train_loss_n_prog_bar(self, b: int, train_loss: torch.Tensor):
         self.log(

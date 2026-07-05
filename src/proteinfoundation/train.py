@@ -1,6 +1,7 @@
 # Apply atomworks patches early - before any imports that use atomworks/biotite
 import json
 import os
+import re
 import sys
 import uuid
 from pathlib import Path
@@ -42,6 +43,54 @@ def log_info(msg: str):
 @rank_zero_only
 def create_dir(ckpt_path_store: str, parents: bool = True, exist_ok: bool = True):
     Path(ckpt_path_store).mkdir(parents=parents, exist_ok=exist_ok)
+
+
+def _wandb_run_id_path(ckpt_path_store: str) -> str:
+    return os.path.join(ckpt_path_store, "wandb_run_id.txt")
+
+
+@rank_zero_only
+def _save_wandb_run_id(ckpt_path_store: str, wandb_id: str) -> None:
+    create_dir(ckpt_path_store, parents=True, exist_ok=True)
+    path = _wandb_run_id_path(ckpt_path_store)
+    Path(path).write_text(wandb_id.strip() + "\n")
+    log_info(f"Saved WandB run id to {path}")
+
+
+def _recover_wandb_run_id_from_logs(run_name: str) -> str | None:
+    """Backfill wandb id for runs started before we persisted wandb_run_id.txt."""
+    log_dirs: list[Path] = []
+    zfs = os.environ.get("PROTEINA_ZFS_PATH", "")
+    if zfs:
+        log_dirs.append(Path(zfs) / "training_runs" / "logs" / "training")
+    cpsea_log = os.environ.get("CPSEA_LOG_DIR", "")
+    if cpsea_log:
+        log_dirs.append(Path(cpsea_log))
+
+    pattern = re.compile(rf"runs/{re.escape(run_name)}-[a-f0-9]{{8}}")
+    for log_dir in log_dirs:
+        if not log_dir.is_dir():
+            continue
+        logs = sorted(log_dir.glob(f"{run_name}_*.log"), key=lambda p: p.stat().st_mtime, reverse=True)
+        for log_path in logs[:5]:
+            try:
+                chunk = log_path.read_text(errors="ignore")[:1_000_000]
+            except OSError:
+                continue
+            if m := pattern.search(chunk):
+                return m.group(0).split("/")[-1]
+    return None
+
+
+def _load_wandb_run_id(ckpt_path_store: str, run_name: str) -> str | None:
+    path = _wandb_run_id_path(ckpt_path_store)
+    if os.path.isfile(path):
+        return Path(path).read_text().strip()
+    recovered = _recover_wandb_run_id_from_logs(run_name)
+    if recovered:
+        log_info(f"Recovered WandB run id from training logs: {recovered}")
+        _save_wandb_run_id(ckpt_path_store, recovered)
+    return recovered
 
 
 def check_cluster() -> bool:
@@ -89,6 +138,16 @@ def get_run_dirs(cfg_exp) -> tuple[str, str, str]:
     ckpt_path_store = os.path.join(root_run, "checkpoints")  # Checkpoints in ./store/run_id/checkpoints/<ckpt-file>
     log_info(f"Checkpoints directory: {ckpt_path_store}")
     return run_name, root_run, ckpt_path_store
+
+
+def _fetch_resume_ckpt_name(cfg_exp, ckpt_path_store: str) -> str | None:
+    """Return last.ckpt name to resume from, or None for a fresh start from pretrain_ckpt_path."""
+    training_cfg = cfg_exp.get("training", {})
+    resume_from_last = True if training_cfg is None else training_cfg.get("resume_from_last", True)
+    if not resume_from_last:
+        log_info("training.resume_from_last=false — ignoring existing last.ckpt")
+        return None
+    return fetch_last_ckpt(ckpt_path_store)
 
 
 def initialize_callbacks(cfg_exp) -> list:
@@ -284,7 +343,7 @@ def get_model_n_ckpt_resume(cfg_exp, ckpt_path_store: str) -> tuple[Proteina, st
     model = Proteina(cfg_exp)
 
     # get last ckpt if needs to resume training from there
-    last_ckpt_name = fetch_last_ckpt(ckpt_path_store)
+    last_ckpt_name = _fetch_resume_ckpt_name(cfg_exp, ckpt_path_store)
     last_ckpt_path = os.path.join(ckpt_path_store, last_ckpt_name) if last_ckpt_name is not None else None
     log_info(f"Last checkpoint: {last_ckpt_path}")
 
@@ -332,28 +391,31 @@ def get_model_n_ckpt_resume(cfg_exp, ckpt_path_store: str) -> tuple[Proteina, st
 
 def setup_ckpt(cfg_exp, ckpt_path_store: str) -> list:
     """Creates checkpointing callbacks and directory to store checkpoints."""
+    save_extra = bool(cfg_exp.log.get("save_extra_checkpoints", False))
     args_ckpt_last = {
         "dirpath": ckpt_path_store,
         "save_weights_only": False,
-        "filename": "ignore",
+        "filename": "ignore" if save_extra else "last",
         "every_n_train_steps": cfg_exp.log.last_ckpt_every_n_steps,
-        "save_last": True,
+        "save_last": save_extra,
     }
-    args_ckpt = {
-        "dirpath": ckpt_path_store,
-        "save_last": False,
-        "save_weights_only": False,
-        "filename": "chk_{epoch:08d}_{step:012d}",
-        "every_n_train_steps": cfg_exp.log.checkpoint_every_n_steps,
-        "monitor": "train_loss",
-        "save_top_k": 10000,
-        "mode": "min",
-    }
-    checkpoint_callback = EmaModelCheckpoint(**args_ckpt)
     checkpoint_callback_last = EmaModelCheckpoint(**args_ckpt_last)
+    callbacks = [checkpoint_callback_last]
+    if save_extra:
+        args_ckpt = {
+            "dirpath": ckpt_path_store,
+            "save_last": False,
+            "save_weights_only": False,
+            "filename": "chk_{epoch:08d}_{step:012d}",
+            "every_n_train_steps": cfg_exp.log.checkpoint_every_n_steps,
+            "monitor": "train_loss",
+            "save_top_k": 10000,
+            "mode": "min",
+        }
+        callbacks.insert(0, EmaModelCheckpoint(**args_ckpt))
 
     create_dir(ckpt_path_store, parents=True, exist_ok=True)
-    return [checkpoint_callback, checkpoint_callback_last]
+    return callbacks
 
 
 @rank_zero_only
@@ -437,7 +499,7 @@ def main(cfg_exp) -> None:
     # resume="allow" re-attaches to any prior run with that id in WANDB_DIR — even when there
     # is no last.ckpt and we are loading complexa.ckpt at step 0. Only resume the WandB run
     # when we are actually resuming training from last.ckpt.
-    last_ckpt_name = fetch_last_ckpt(ckpt_path_store)
+    last_ckpt_name = _fetch_resume_ckpt_name(cfg_exp, ckpt_path_store)
     resuming_training = last_ckpt_name is not None
     log_info(f"WandB resume={resuming_training} (last ckpt: {last_ckpt_name})")
 
@@ -447,13 +509,21 @@ def main(cfg_exp) -> None:
         wandb_project = cfg_exp.log.wandb_project
         wandb_entity = cfg_exp.log.get("wandb_entity", None)
         if resuming_training:
+            wandb_id = _load_wandb_run_id(ckpt_path_store, run_name)
+            if not wandb_id:
+                raise RuntimeError(
+                    f"Resuming training from last.ckpt but no WandB run id found for {run_name!r}. "
+                    f"Expected {_wandb_run_id_path(ckpt_path_store)} or a wandb URL in training logs. "
+                    f"Create the file manually, e.g.:\n"
+                    f'  echo "{run_name}-<8-char-suffix>" > {_wandb_run_id_path(ckpt_path_store)}'
+                )
             logger.info(
                 f"Using WandB logger (resume): project={wandb_project}, "
-                f"id={run_name}, entity={wandb_entity}"
+                f"id={wandb_id}, name={run_name}, entity={wandb_entity}"
             )
             wandb_logger = WandbLogger(
                 project=wandb_project,
-                id=run_name,
+                id=wandb_id,
                 name=run_name,
                 entity=wandb_entity,
                 resume="must",
@@ -471,6 +541,7 @@ def main(cfg_exp) -> None:
                 entity=wandb_entity,
                 resume="never",
             )
+            _save_wandb_run_id(ckpt_path_store, wandb_id)
 
     Trainer = L.Trainer
 

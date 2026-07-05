@@ -17,14 +17,32 @@ def get_clean_sample(
     batch: dict[str, torch.Tensor],
     dm: str,
     autoencoder: Any | None = None,
+    local_latent_target: str = "sample",
+    detach_latent_target: bool = False,
 ) -> torch.Tensor:
     """
     Get clean sample for a given data mode.
 
     Args:
-        batch: Batch to get clean sample from.
+        batch: Batch to get clean sample from. For dm=='local_latents' this function
+            stashes the raw encoder output dict under `batch["local_latents_encoder_output"]`
+            (mean/log_scale/z_latent, pre-target-selection, pre-detach, pre-normalization) and
+            the selected-but-unnormalized target under `batch["local_latents_raw_target"]`, so
+            callers (e.g. latent diagnostics logging) can inspect them without a second encoder
+            forward pass.
         dm: Data mode ('bb_ca' or 'local_latents').
-        autoencoder: AutoEncoder instance required for dm=='local_latents'.
+        autoencoder: AutoEncoder instance required for dm=='local_latents'. If it has a
+            `latent_norm_stats` attribute (dict with 'mean'/'std' tensors of shape [latent_dim]),
+            the returned local_latents target is channel-wise normalized:
+            `z_flow = (z_ae - mean) / std`. Default (no attribute / None): no normalization,
+            identical to historical behavior.
+        local_latent_target: "sample" (default, historical behavior: uses the reparameterized
+            encoder sample `z = mean + exp(log_scale) * eps`) or "mean" (uses the deterministic
+            posterior mean instead, removing posterior-sampling noise from the flow target).
+        detach_latent_target: If True, detaches the local_latents target from the autograd graph
+            so the flow matching loss cannot backprop into the encoder through this target. Only
+            relevant when the autoencoder is NOT frozen (joint training); has no additional
+            effect when the encoder is already frozen. Default False (historical behavior).
 
     Returns:
         Clean sample tensor for the given data mode.
@@ -35,7 +53,27 @@ def get_clean_sample(
         if autoencoder is None:
             raise ValueError("autoencoder required for local_latents data mode")
         encoded_batch = autoencoder.encode(batch)
-        return encoded_batch["z_latent"]
+        batch["local_latents_encoder_output"] = encoded_batch
+
+        if local_latent_target == "sample":
+            z = encoded_batch["z_latent"]
+        elif local_latent_target == "mean":
+            z = encoded_batch["mean"]
+        else:
+            raise ValueError(f"Unknown local_latent_target {local_latent_target}, expected 'sample' or 'mean'")
+
+        if detach_latent_target:
+            z = z.detach()
+
+        batch["local_latents_raw_target"] = z  # pre-normalization, used for diagnostics
+
+        latent_norm_stats = getattr(autoencoder, "latent_norm_stats", None)
+        if latent_norm_stats is not None:
+            norm_mean = latent_norm_stats["mean"].to(device=z.device, dtype=z.dtype)
+            norm_std = latent_norm_stats["std"].to(device=z.device, dtype=z.dtype)
+            z = (z - norm_mean) / norm_std
+
+        return z
     raise ValueError(f"Loading clean samples from data mode {dm} not supported.")
 
 
@@ -43,6 +81,8 @@ def add_clean_samples(
     batch: dict[str, torch.Tensor],
     product_flowmatcher: Any,
     autoencoder: Any | None = None,
+    local_latent_target: str = "sample",
+    detach_latent_target_for_flow: bool = False,
 ) -> dict[str, torch.Tensor]:
     """
     Add clean samples for all data modes to the batch.
@@ -51,11 +91,22 @@ def add_clean_samples(
         batch: Batch to add clean samples to.
         product_flowmatcher: Config dict with data mode keys.
         autoencoder: AutoEncoder instance (required for local_latents mode).
+        local_latent_target: see `get_clean_sample`.
+        detach_latent_target_for_flow: see `get_clean_sample` (`detach_latent_target`).
 
     Returns:
         Batch with 'x_1' key added.
     """
-    batch["x_1"] = {dm: get_clean_sample(batch, dm, autoencoder) for dm in product_flowmatcher}
+    batch["x_1"] = {
+        dm: get_clean_sample(
+            batch,
+            dm,
+            autoencoder,
+            local_latent_target=local_latent_target,
+            detach_latent_target=detach_latent_target_for_flow,
+        )
+        for dm in product_flowmatcher
+    }
     return batch
 
 
@@ -260,7 +311,14 @@ def format_sample_local_latents(
     Returns:
         Formatted sample in requested mode
     """
-    output_decoder = autoencoder.decode(z_latent=x["local_latents"], ca_coors_nm=x["bb_ca"], mask=mask)
+    z_latent = x["local_latents"]
+    latent_norm_stats = getattr(autoencoder, "latent_norm_stats", None)
+    if latent_norm_stats is not None:
+        # Inverse of the normalization applied in `get_clean_sample`: z_ae = z_flow * std + mean.
+        norm_mean = latent_norm_stats["mean"].to(device=z_latent.device, dtype=z_latent.dtype)
+        norm_std = latent_norm_stats["std"].to(device=z_latent.device, dtype=z_latent.dtype)
+        z_latent = z_latent * norm_std + norm_mean
+    output_decoder = autoencoder.decode(z_latent=z_latent, ca_coors_nm=x["bb_ca"], mask=mask)
 
     if ret_mode == "samples":
         return x

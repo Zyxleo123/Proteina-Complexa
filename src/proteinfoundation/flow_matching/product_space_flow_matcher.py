@@ -249,6 +249,23 @@ class ProductSpaceFlowMatcher(L.LightningModule):
         """
         Computes flow matching loss for all modalities.
 
+        Optionally (both opt-in, default off/identity so behavior is unchanged unless
+        explicitly configured):
+          - `normalize_flow_loss_by_dim` (bool, top-level cfg_exp key): divides each modality's
+            raw loss by its feature dimension (e.g. 3 for bb_ca, latent_dim for local_latents)
+            before summing, so high-dimensional modalities don't dominate the total loss purely
+            by dimension count.
+          - `flow_loss_weights` (dict[str, float], top-level cfg_exp key): per-modality scalar
+            weight applied after the optional dimension normalization. Missing modalities
+            default to weight 1.0.
+
+        Order when both are enabled: raw loss -> divide by dim -> multiply by weight.
+
+        When either modification actually changes a modality's loss (dim-normalization enabled,
+        or that modality's weight != 1.0), the unmodified raw loss is also returned under the key
+        `f"{data_mode}_raw_justlog"` (excluded from the training loss sum via the `_justlog`
+        suffix, logged only) so raw vs. effective losses can be compared without ambiguity.
+
         Args:
             batch: Input batch containing x_1, x_0, t, mask, etc
             nn_out: Output of nn
@@ -256,8 +273,15 @@ class ProductSpaceFlowMatcher(L.LightningModule):
         Returns:
             Losses for each data modality, per element in the batch.
         """
-        loss = {
-            data_mode: self.base_flow_matchers[data_mode].compute_fm_loss(
+        normalize_by_dim = bool(self.cfg_exp.get("normalize_flow_loss_by_dim", False))
+        flow_loss_weights = self.cfg_exp.get("flow_loss_weights", {}) or {}
+        modifies_loss = normalize_by_dim or any(
+            float(flow_loss_weights.get(data_mode, 1.0)) != 1.0 for data_mode in self.data_modes
+        )
+
+        loss = {}
+        for data_mode in self.data_modes:
+            raw_loss = self.base_flow_matchers[data_mode].compute_fm_loss(
                 x_0=batch["x_0"][data_mode],
                 x_1=batch["x_1"][data_mode],
                 x_t=batch["x_t"][data_mode],
@@ -266,8 +290,16 @@ class ProductSpaceFlowMatcher(L.LightningModule):
                 nn_out=nn_out[data_mode],
                 loss_t_clamp=self.cfg_exp.loss.t_distribution[data_mode].get("loss_t_clamp", 1.0),
             )
-            for data_mode in self.data_modes
-        }
+
+            effective_loss = raw_loss
+            if normalize_by_dim:
+                effective_loss = effective_loss / self.base_flow_matchers[data_mode].dim
+            weight = float(flow_loss_weights.get(data_mode, 1.0))
+            effective_loss = effective_loss * weight
+
+            loss[data_mode] = effective_loss
+            if modifies_loss:
+                loss[f"{data_mode}_raw_justlog"] = raw_loss
         return loss
 
     def compute_aux_loss(

@@ -190,6 +190,17 @@ def load_ckpt_n_configure_inference(cfg: dict) -> Proteina:
     if hasattr(model, "autoencoder") and model.autoencoder is not None and model.autoencoder.decoder is None:
         logger.info("Decoder missing from main checkpoint, loading full autoencoder from hardcoded path")
 
+        # Preserve the *flow-training* run's latent normalization stats (set in `Proteina.__init__`
+        # from `model.cfg_exp.latent_normalization`, if that opt-in knob was enabled). The
+        # `full_autoencoder_path` checkpoint below is an independent, standalone AE checkpoint
+        # (e.g. `complexa_ae.ckpt`/`frozen_ae.ckpt`) whose own `cfg_exp` generally does NOT set
+        # `latent_normalization`, so its freshly-loaded autoencoder would otherwise silently have
+        # `latent_norm_stats=None`. If that swapped-in autoencoder is then used to decode latents
+        # that the flow was actually trained to predict in *normalized* space, decoding skips the
+        # required `z_ae = z_norm * std + mean` inverse transform and generation silently produces
+        # garbage structures despite a healthy training loss curve.
+        latent_norm_stats = getattr(model.autoencoder, "latent_norm_stats", None)
+
         full_autoencoder_path = cfg.get("autoencoder_ckpt_path")
         if full_autoencoder_path is None:
             raise ValueError("autoencoder_ckpt_path not found in config")
@@ -199,6 +210,12 @@ def load_ckpt_n_configure_inference(cfg: dict) -> Proteina:
 
             # Replace the autoencoder with the full one
             if full_model.autoencoder is not None and full_model.autoencoder.decoder is not None:
+                full_model.autoencoder.latent_norm_stats = latent_norm_stats
+                if latent_norm_stats is not None:
+                    logger.info(
+                        "Carried over latent_normalization stats from the flow-training checkpoint "
+                        "onto the swapped-in full autoencoder (decode will unnormalize)."
+                    )
                 model.autoencoder = full_model.autoencoder
                 logger.info("Successfully loaded full autoencoder with decoder")
 
