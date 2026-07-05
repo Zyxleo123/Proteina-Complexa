@@ -106,11 +106,17 @@ class ConcatPairFeaturesFactory(torch.nn.Module):
             # Lower left: NOT COMPUTED - just transpose of upper right for efficiency!
 
             # Lower right: Target-to-target features (using generic cross-sequence features)
+            # `target_effective_chain_id` (set by SegmentAwareResidueFeaturesTransform via
+            # ExtractTargetCoordinatesTransform) distinguishes different continuous receptor
+            # segments within the same PDB chain, so target-to-target seq_sep/chain-idx are
+            # segment-aware: null across a physical receptor break, unchanged within a segment.
             self.lower_right_seq_sep = CrossSequenceRelativeSequenceSeparationPairFeat(
                 seq1_key="seq_target",
                 seq2_key="seq_target",
                 idx1_key="target_pdb_idx",
                 idx2_key="target_pdb_idx",
+                effective_chain1_key="target_effective_chain_id",
+                effective_chain2_key="target_effective_chain_id",
                 **kwargs,
             )
             self.lower_right_xt_dist = CrossSequenceBackbonePairDistancesPairFeat(
@@ -122,7 +128,7 @@ class ConcatPairFeaturesFactory(torch.nn.Module):
             )
 
             self.lower_right_chain = CrossSequenceChainIndexPairFeat(
-                chain1_key="target_chains", chain2_key="target_chains", **kwargs
+                chain1_key="target_effective_chain_id", chain2_key="target_effective_chain_id", **kwargs
             )
             self.lower_right_hotspots = CrossSequenceHotspotMaskPairFeat(
                 hotspot_mask1_key="target_hotspot_mask",
@@ -466,6 +472,13 @@ class ConcatPairFeaturesFactory(torch.nn.Module):
                 batch_copy["target_chains"] = torch.full((b, n_target), max_chain + 1, device=device)
             else:
                 batch_copy["target_chains"] = torch.ones((b, n_target), device=device)
+
+        # Fall back to `target_chains` (whole-chain identity) if segment-aware
+        # `target_effective_chain_id` was never computed upstream (e.g. datasets that don't
+        # run SegmentAwareResidueFeaturesTransform). This reproduces the pre-segment-aware
+        # behavior exactly for those datasets.
+        if "target_effective_chain_id" not in batch_copy and "target_chains" in batch_copy:
+            batch_copy["target_effective_chain_id"] = batch_copy["target_chains"]
 
         # Add target pdb indices if not present (use sequential numbering)
         if "target_pdb_idx" not in batch_copy and "seq_target" in batch_copy:

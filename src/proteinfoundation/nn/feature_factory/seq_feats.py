@@ -5,7 +5,7 @@ from openfold.data import data_transforms
 from torch.nn import functional as F
 
 from proteinfoundation.nn.feature_factory.base_feature import Feature
-from proteinfoundation.nn.feature_factory.feature_utils import bin_and_one_hot
+from proteinfoundation.nn.feature_factory.feature_utils import bin_and_one_hot, compute_backbone_continuity_mask
 from proteinfoundation.utils.angle_utils import bond_angles, signed_dihedral_angle
 
 
@@ -265,7 +265,16 @@ class BackboneTorsionAnglesSeqFeat(Feature):
     """
     Computes torsion angle and featurizes it, with binning and 1-hot.
 
-    TODO: Add mask?
+    Backbone torsions (phi, psi, omega) are inter-residue quantities: psi_k
+    and omega_k require residue k+1, and (as computed here) the phi channel
+    at tensor position k actually holds phi_{k+1}, which requires residue k.
+    Either way, all three angles at output position k are only meaningful if
+    residues k and k+1 are truly backbone-consecutive (same continuous
+    segment) - see ``compute_backbone_continuity_mask``. When they are not
+    (e.g. a receptor/pocket crop's physical chain break, or two residues that
+    are merely tensor-adjacent after cropping), the corresponding one-hot
+    vector is set to all-zero (the "missing" representation), never bin 0
+    (which is a real angle bin).
     """
 
     def __init__(self, **kwargs):
@@ -273,24 +282,21 @@ class BackboneTorsionAnglesSeqFeat(Feature):
 
     def forward(self, batch):
         # # # # # # # # # # # # # # # # # # # #
-        bb_torsion = self._get_bb_torsion_angles(batch)  # [b, n, 3]
+        bb_torsion, valid_pair = self._get_bb_torsion_angles(batch)  # [b, n, 3], [b, n]
+        bb_torsion = torch.nan_to_num(bb_torsion, nan=0.0)
         bb_torsion_feats = bin_and_one_hot(
             bb_torsion,
             torch.linspace(-torch.pi, torch.pi, 20, device=bb_torsion.device),
         )  # [b, n, 3, nbins], nbins in 20+1
+        bb_torsion_feats = bb_torsion_feats * valid_pair[:, :, None, None]  # all-zero (not bin 0) when invalid
         bb_torsion_feats = einops.rearrange(bb_torsion_feats, "b n t d -> b n (t d)")  # [b, n, 3 * nbins]
         return bb_torsion_feats
 
     def _get_bb_torsion_angles(self, batch):
         a37 = batch["coords"]  # [b, n, 37, 3]
-        if "residue_pdb_idx" in batch and batch["residue_pdb_idx"] is not None:
-            # no need to force 1 since taking difference
-            idx = batch["residue_pdb_idx"]  # [b, n]
-        else:
-            self.assert_defaults_allowed(batch, "Relative sequence separation pair")
-            b, n = self.extract_bs_and_n(batch)
-            device = self.extract_device(batch)
-            idx = torch.arange(1, n + 1, dtype=torch.float32, device=device).unsqueeze(0).expand(b, -1)  # [b, n]
+        b, n = a37.shape[0], a37.shape[1]
+        good_pair = compute_backbone_continuity_mask(batch, n)  # [b, n-1] bool
+
         N = a37[:, :, 0, :]  # [b, n, 3]
         CA = a37[:, :, 1, :]  # [b, n, 3]
         C = a37[:, :, 2, :]  # [b, n, 3]
@@ -300,19 +306,25 @@ class BackboneTorsionAnglesSeqFeat(Feature):
         phi = signed_dihedral_angle(C[:, :-1, :], N[:, 1:, :], CA[:, 1:, :], C[:, 1:, :])  # [b, n-1]
         bb_angles = torch.stack([psi, omega, phi], dim=-1)  # [b, n-1, 3]
 
-        good_pair = idx[:, 1:] - idx[:, :-1] == 1  # boolean [b, n-1]
-        bb_angles = bb_angles * good_pair[..., None]  # [b, n-1, 3]
-
-        zero_pad = torch.zeros((a37.shape[0], 1, 3), device=bb_angles.device)
+        zero_pad = torch.zeros((b, 1, 3), device=bb_angles.device)
         bb_angles = torch.cat([bb_angles, zero_pad], dim=1)  # [b, n, 3]
-        return bb_angles
+
+        # Last residue has no "next" residue, so it never has a valid (k, k+1) pair.
+        invalid_pad = torch.zeros((b, 1), dtype=torch.bool, device=good_pair.device)
+        valid_pair = torch.cat([good_pair, invalid_pad], dim=1)  # [b, n]
+        return bb_angles, valid_pair
 
 
 class BackboneBondAnglesSeqFeat(Feature):
     """
     Computes bond angle and featurizes it, with binning and 1-hot.
 
-    TODO: Add mask?
+    theta_1 (N-CA-C) is intra-residue and always valid whenever the residue
+    has those atoms. theta_2 and theta_3 are inter-residue (span residues k
+    and k+1) and are only meaningful if k and k+1 are truly
+    backbone-consecutive (same continuous segment); see
+    ``compute_backbone_continuity_mask``. When they are not, the
+    corresponding one-hot vector is set to all-zero (never bin 0).
     """
 
     def __init__(self, **kwargs):
@@ -321,31 +333,21 @@ class BackboneBondAnglesSeqFeat(Feature):
     def forward(self, batch):
         # TODO: Pass arguments here, just the 20
         # # # # # # # # # # # # # # # # # # # #
-        bb_bond_angle = self._get_bb_bond_angles(batch)  # [b, n, 3]
+        bb_bond_angle, valid_mask = self._get_bb_bond_angles(batch)  # [b, n, 3], [b, n, 3]
+        bb_bond_angle = torch.nan_to_num(bb_bond_angle, nan=0.0)
         bb_bond_angle_feats = bin_and_one_hot(
             bb_bond_angle,
             torch.linspace(-torch.pi, torch.pi, 20, device=bb_bond_angle.device),
         )  # [b, n, 3, nbins]
         # I think this is always between 0 and pi
+        bb_bond_angle_feats = bb_bond_angle_feats * valid_mask[..., None]  # all-zero (not bin 0) when invalid
         bb_bond_angle_feats = einops.rearrange(bb_bond_angle_feats, "b n t d -> b n (t d)")  # [b, n, 3 * nbins]
         return bb_bond_angle_feats
 
     def _get_bb_bond_angles(self, batch):
         a37 = batch["coords"]  # [b, n, 37, 3]
-        if "mask_dict" in batch:
-            mask = batch["mask_dict"]["coords"][..., 0, 0]  # [b, n]
-        else:
-            mask = batch["mask"]  # [b, n]
-
-        if "residue_pdb_idx" in batch and batch["residue_pdb_idx"] is not None:
-            # no need to force 1 since taking difference
-            idx = batch["residue_pdb_idx"]  # [b, n]
-        else:
-            self.assert_defaults_allowed(batch, "Relative sequence separation pair")
-            b, n = self.extract_bs_and_n(batch)
-            device = self.extract_device(batch)
-            idx = torch.arange(1, n + 1, dtype=torch.float32, device=device).unsqueeze(0).expand(b, -1)  # [b, n]
-        b = a37.shape[0]
+        b, n = a37.shape[0], a37.shape[1]
+        good_pair = compute_backbone_continuity_mask(batch, n)  # [b, n-1] bool
 
         N = a37[:, :, 0, :]  # [b, n, 3]
         CA = a37[:, :, 1, :]  # [b, n, 3]
@@ -354,18 +356,19 @@ class BackboneBondAnglesSeqFeat(Feature):
         theta_2 = bond_angles(CA[:, :-1, :], C[:, :-1, :], N[:, 1:, :])  # [b, n-1]
         theta_3 = bond_angles(C[:, :-1, :], N[:, 1:, :], CA[:, 1:, :])  # [b, n-1]
 
-        # Account for chain breaks in theta_2 and theta_3
-        good_pair = idx[:, 1:] - idx[:, :-1] == 1  # boolean [b, n-1]
-        theta_2 = theta_2 * good_pair  # [b, n-1]
-        theta_3 = theta_3 * good_pair  # [b, n-1]
-
         # Add a zero at the end of theta_2 and theta_3 to get shape [b, n]
         zero_pad = torch.zeros((b, 1), device=theta_2.device)  # [b, 1]
         theta_2 = torch.cat([theta_2, zero_pad], dim=-1)  # [b, n]
         theta_3 = torch.cat([theta_3, zero_pad], dim=-1)  # [b, n]
 
         bb_angles = torch.stack([theta_1, theta_2, theta_3], dim=-1)  # [b, n, 3]
-        return bb_angles
+
+        # theta_1 is intra-residue: always valid. theta_2/theta_3 need residues k, k+1
+        # to be backbone-consecutive; the last residue has no "next" residue.
+        invalid_pad = torch.zeros((b, 1), dtype=torch.bool, device=good_pair.device)
+        valid_23 = torch.cat([good_pair, invalid_pad], dim=1)  # [b, n]
+        valid_mask = torch.stack([torch.ones_like(valid_23), valid_23, valid_23], dim=-1)  # [b, n, 3]
+        return bb_angles, valid_mask
 
 
 class OpenfoldSideChainAnglesSeqFeat(Feature):

@@ -27,6 +27,13 @@ datamodule:
     - cyclization_type
 
   atom37_transforms:
+    # Must run first: detects continuous backbone segments (segment_id, pos_in_segment,
+    # effective_chain_id) from the raw, un-cropped, un-rotated residue order and Angstrom
+    # coordinates. CPSea receptor/target chains are discontinuous receptor/pocket crops;
+    # see docs/README_DATA_SEQ_BREAK_ISSUE.md.
+    - _target_: proteinfoundation.datasets.transforms.SegmentAwareResidueFeaturesTransform
+      cn_break_cutoff: 2.0
+      segment_fix_level: full  # mild | aggressive | full (see relaunch_cpseaae_seqfix_experiments.sh)
     - _target_: proteinfoundation.datasets.transforms.CoordsToNanometers
     - _target_: proteinfoundation.datasets.transforms.GlobalRotationTransform
     - _target_: proteinfoundation.datasets.transforms.CroppingTransform2

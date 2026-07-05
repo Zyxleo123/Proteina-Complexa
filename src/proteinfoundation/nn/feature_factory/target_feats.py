@@ -4,7 +4,11 @@ from openfold.np.residue_constants import atom_types
 from torch.nn.utils.rnn import pad_sequence
 
 from proteinfoundation.nn.feature_factory.base_feature import Feature
-from proteinfoundation.nn.feature_factory.feature_utils import bin_and_one_hot, bin_pairwise_distances
+from proteinfoundation.nn.feature_factory.feature_utils import (
+    bin_and_one_hot,
+    bin_pairwise_distances,
+    segment_fix_level_at_least,
+)
 from proteinfoundation.nn.feature_factory.pair_feats import BackbonePairDistancesNanometerPairFeat
 from proteinfoundation.nn.feature_factory.seq_cond_feats import HotspotMaskSeqFeat
 from proteinfoundation.nn.feature_factory.seq_feats import (
@@ -155,7 +159,16 @@ class TargetSideChainAnglesSeqFeat(Feature):
 
 
 class TargetTorsionAnglesSeqFeat(Feature):
-    """Computes torsion angles feature from target."""
+    """Computes torsion angles feature from target.
+
+    Passes through ``target_pdb_idx`` (and, when available, the
+    segment-aware ``target_effective_chain_id`` / ``target_pos_in_segment``
+    set by ``SegmentAwareResidueFeaturesTransform``) so that
+    ``BackboneTorsionAnglesSeqFeat`` correctly invalidates torsions that span
+    a physical chain break in a discontinuous receptor/pocket crop, instead
+    of treating every tensor-adjacent target residue pair as backbone-
+    consecutive.
+    """
 
     def __init__(self, **kwargs):
         super().__init__(dim=63)  # 3 * 21 for torsion angles
@@ -197,6 +210,17 @@ class TargetTorsionAnglesSeqFeat(Feature):
                 "coords": batch["x_target"],
                 "coord_mask": batch["target_mask"],
             }
+            if "target_pdb_idx" in batch:
+                batch_bb_angles["residue_pdb_idx"] = batch["target_pdb_idx"]
+            if "segment_fix_level" in batch:
+                batch_bb_angles["segment_fix_level"] = batch["segment_fix_level"]
+            if (
+                segment_fix_level_at_least(batch, "full")
+                and "target_effective_chain_id" in batch
+                and "target_pos_in_segment" in batch
+            ):
+                batch_bb_angles["effective_chain_id"] = batch["target_effective_chain_id"]
+                batch_bb_angles["pos_in_segment"] = batch["target_pos_in_segment"]
             return BackboneTorsionAnglesSeqFeat()(batch_bb_angles)
         else:
             b, _ = self.extract_bs_and_n(batch)

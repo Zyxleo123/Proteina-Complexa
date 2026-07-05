@@ -22,6 +22,13 @@ from openfold.utils import rigid_utils
 from torch.nn import functional as F
 
 from proteinfoundation.datasets.atomworks_ligand_transforms import get_af3_raw_molecule_features, get_laplacian_pe
+from proteinfoundation.datasets.segment_utils import (
+    BREAK_NUMBERING_ONLY,
+    BREAK_REAL_BREAK,
+    DEFAULT_CN_BREAK_CUTOFF,
+    compute_segment_info,
+    summarize_breaks,
+)
 from proteinfoundation.nn.feature_factory.feature_utils import BOND_ORDER_MAP
 from proteinfoundation.utils.align_utils import mean_w_mask
 from proteinfoundation.utils.constants import AA_CHARACTER_PROTORP, AME_ATOMS, SIDECHAIN_TIP_ATOMS
@@ -124,6 +131,86 @@ class ChainBreakPerResidueTransform(BaseTransform):
                 torch.tensor([False], dtype=torch.bool, device=chain_breaks_per_residue.device),
             )
         )
+        return graph
+
+
+class SegmentAwareResidueFeaturesTransform(BaseTransform):
+    """Detects continuous backbone segments for every chain and stores segment metadata.
+
+    Receptor/target chains in some datasets (e.g. CPSea) are discontinuous
+    receptor/pocket crops rather than one continuous polymer: two residues
+    that are adjacent in file/tensor order need not be adjacent in the actual
+    backbone. This transform must run early, before cropping and before any
+    transform that reorders/subsets residues, on the raw per-residue ``Data``
+    object (with ``chains``, ``residue_pdb_idx``, ``coords``, ``coord_mask``
+    in their original file order), so segment identities reflect the true
+    file order and physical backbone geometry.
+
+    Adds three ordinary per-residue tensors of shape ``[n]``, which
+    downstream cropping / filtering / extraction transforms propagate
+    automatically (they are re-indexed exactly like ``chains`` or
+    ``residue_pdb_idx``):
+        - ``segment_id``: 0-indexed continuous-segment index within its chain.
+        - ``pos_in_segment``: 0-indexed position of the residue within its segment.
+        - ``effective_chain_id``: a single integer, unique per
+          ``(chain, segment)`` pair, i.e. equal for two residues iff they are
+          in the same chain AND the same continuous segment. Pair/sequence
+          features should use this instead of the raw chain-letter index
+          ``chains`` whenever they need to decide if two residues belong to
+          the "same chain-like object".
+
+    If ``graph.binder_chain_id`` is present (CPSea metadata), this transform
+    also sanity-checks that the binder chain has no ``REAL_BREAK`` or
+    ``NUMBERING_ONLY`` boundaries (the binder is expected to be filtered to a
+    contiguous peptide upstream) and logs a warning otherwise, since a broken
+    binder backbone would indicate a data-quality issue rather than a normal
+    receptor discontinuity.
+    """
+
+    def __init__(
+        self,
+        cn_break_cutoff: float = DEFAULT_CN_BREAK_CUTOFF,
+        segment_fix_level: str = "full",
+    ):
+        self.cn_break_cutoff = cn_break_cutoff
+        level = segment_fix_level.lower()
+        if level not in {"mild", "aggressive", "full"}:
+            raise ValueError(
+                f"segment_fix_level must be mild, aggressive, or full; got {segment_fix_level!r}"
+            )
+        self.segment_fix_level = level
+
+    def __call__(self, graph: Data) -> Data:
+        info = compute_segment_info(
+            chains=graph.chains,
+            residue_pdb_idx=graph.residue_pdb_idx,
+            coords=graph.coords,
+            coord_mask=graph.coord_mask,
+            cn_break_cutoff=self.cn_break_cutoff,
+        )
+        graph.segment_id = info.segment_id
+        graph.pos_in_segment = info.pos_in_segment
+        graph.effective_chain_id = info.effective_chain_id
+        graph.segment_fix_level = self.segment_fix_level
+
+        binder_chain_id = getattr(graph, "binder_chain_id", None)
+        if binder_chain_id is not None and hasattr(graph, "chain_id"):
+            # chain_id is the list of per-residue PDB chain letters (original order).
+            chain_letters = graph.chain_id
+            int_chain_of_binder = {
+                graph.chains[i].item() for i, c in enumerate(chain_letters) if c == binder_chain_id
+            }
+            for chain_int in int_chain_of_binder:
+                counts = summarize_breaks(info.break_type, graph.chains, chain_id_of_interest=chain_int)
+                n_real_break = counts.get(BREAK_REAL_BREAK, 0)
+                n_numbering_only = counts.get(BREAK_NUMBERING_ONLY, 0)
+                if n_real_break > 0 or n_numbering_only > 0:
+                    logger.warning(
+                        f"Binder chain '{binder_chain_id}' (sample {getattr(graph, 'id', '?')}) has "
+                        f"REAL_BREAK={n_real_break}, NUMBERING_ONLY={n_numbering_only}. "
+                        "The binder is expected to be a contiguous peptide; this indicates a "
+                        "data-quality issue rather than a normal receptor discontinuity."
+                    )
         return graph
 
 
@@ -2391,6 +2478,10 @@ class ExtractTargetCoordinatesTransform(BaseTransform):
                     graph.target_pdb_idx = graph.residue_pdb_idx[target_residue_mask]
                 if hasattr(graph, "chains"):
                     graph.target_chains = graph.chains[target_residue_mask]
+                if hasattr(graph, "effective_chain_id"):
+                    graph.target_effective_chain_id = graph.effective_chain_id[target_residue_mask]
+                if hasattr(graph, "pos_in_segment"):
+                    graph.target_pos_in_segment = graph.pos_in_segment[target_residue_mask]
                 # Now do the same for potential ligand features
                 if hasattr(graph, "target_charge"):
                     graph.target_charge = graph.target_charge[target_residue_mask]
@@ -2414,6 +2505,8 @@ class ExtractTargetCoordinatesTransform(BaseTransform):
                     "target_chains",
                 ]
                 for f in (
+                    "target_effective_chain_id",
+                    "target_pos_in_segment",
                     "target_charge",
                     "target_atom_name",
                     "target_bond_order",
@@ -2434,6 +2527,10 @@ class ExtractTargetCoordinatesTransform(BaseTransform):
                 graph.target_hotspot_mask = torch.zeros(0, dtype=torch.bool, device=device)  # [0]
                 graph.target_pdb_idx = torch.zeros(0, dtype=torch.long, device=device)  # [0]
                 graph.target_chains = torch.zeros(0, dtype=graph.chains.dtype, device=device)  # [0]
+                if hasattr(graph, "effective_chain_id"):
+                    graph.target_effective_chain_id = torch.zeros(0, dtype=torch.long, device=device)  # [0]
+                if hasattr(graph, "pos_in_segment"):
+                    graph.target_pos_in_segment = torch.zeros(0, dtype=torch.long, device=device)  # [0]
                 # add fake ligand feautures make sure squares are squared are correct
 
                 graph.target_charge = torch.zeros(0, dtype=torch.float32, device=device)
@@ -2449,6 +2546,10 @@ class ExtractTargetCoordinatesTransform(BaseTransform):
             graph.target_hotspot_mask = graph.hotspot_mask * graph.target_mask  # [n]
             graph.target_pdb_idx = graph.residue_pdb_idx  # [n]
             graph.target_chains = graph.chains  # [n]
+            if hasattr(graph, "effective_chain_id"):
+                graph.target_effective_chain_id = graph.effective_chain_id  # [n]
+            if hasattr(graph, "pos_in_segment"):
+                graph.target_pos_in_segment = graph.pos_in_segment  # [n]
 
         # Always add the per-residue mask for compatibility
         graph.target_residue_mask = target_residue_mask  # [n] (original sequence length)

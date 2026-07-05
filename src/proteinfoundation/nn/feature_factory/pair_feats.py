@@ -3,23 +3,39 @@ import torch
 from loguru import logger
 
 from proteinfoundation.nn.feature_factory.base_feature import Feature
-from proteinfoundation.nn.feature_factory.feature_utils import bin_and_one_hot, bin_pairwise_distances
+from proteinfoundation.nn.feature_factory.feature_utils import (
+    bin_and_one_hot,
+    bin_pairwise_distances,
+    segment_fix_level_at_least,
+)
 from proteinfoundation.utils.angle_utils import bond_angles, signed_dihedral_angle
 
 
 class ChainIdxPairFeat(Feature):
-    """Gets chain idx feature (-1 for padding) and returns feature of shape [b, n, n, 1]."""
+    """Gets chain idx feature (-1 for padding) and returns feature of shape [b, n, n, 1].
+
+    Prefers ``effective_chain_id`` (set by ``SegmentAwareResidueFeaturesTransform``)
+    over the raw PDB chain-letter index ``chains`` when available, so that two
+    residues from the same PDB chain but different continuous segments (e.g. a
+    discontinuous receptor/pocket crop) are correctly treated as different
+    chain-like objects. Falls back to ``chains`` for datasets that don't run
+    segment detection, which reproduces the previous behavior exactly.
+    """
 
     def __init__(self, **kwargs):
         super().__init__(dim=1)
         self._has_logged = False
 
     def forward(self, batch):
-        if "chains" in batch:
-            seq_mask = batch["chains"]  # [b, n]
-            # mask = torch.einsum("bi,bj->bij", seq_mask, seq_mask).unsqueeze(
-            #     -1
-            # )  # [b, n, n, 1]
+        if "effective_chain_id" in batch and segment_fix_level_at_least(batch, "mild"):
+            chain_key = "effective_chain_id"
+        elif "chains" in batch:
+            chain_key = "chains"
+        else:
+            chain_key = None
+
+        if chain_key is not None:
+            seq_mask = batch[chain_key]  # [b, n]
             seq_mask = (seq_mask[:, :, None] != seq_mask[:, None, :]).float()
             mask = seq_mask.unsqueeze(-1)  # [b, n, n, 1]
         else:
@@ -56,7 +72,17 @@ class HotspotMaskPairFeat(Feature):
 
 
 class SequenceSeparationPairFeat(Feature):
-    """Computes sequence separation and returns feature of shape [b, n, n, seq_sep_dim]."""
+    """Computes sequence separation and returns feature of shape [b, n, n, seq_sep_dim].
+
+    If ``effective_chain_id`` (set by ``SegmentAwareResidueFeaturesTransform``)
+    is available, sequence separation is only computed for pairs of residues
+    that share the same effective chain (i.e. same PDB chain AND same
+    continuous segment); otherwise the feature is the null/all-zero one-hot
+    vector. This prevents e.g. two receptor residues on either side of a
+    physical chain break, or a binder/target pair, from getting a spurious
+    small ``seq_sep`` just because they happen to be tensor-adjacent. When
+    ``effective_chain_id`` is not present, behavior is unchanged from before.
+    """
 
     def __init__(self, seq_sep_dim, **kwargs):
         super().__init__(dim=seq_sep_dim)
@@ -83,7 +109,14 @@ class SequenceSeparationPairFeat(Feature):
         high = self.dim / 2.0 - 1
         bin_limits = torch.linspace(low, high, self.dim - 1, device=inds.device)
 
-        return bin_and_one_hot(seq_sep, bin_limits)  # [b, n, n, seq_sep_dim]
+        feat = bin_and_one_hot(seq_sep, bin_limits)  # [b, n, n, seq_sep_dim]
+
+        if "effective_chain_id" in batch and segment_fix_level_at_least(batch, "aggressive"):
+            eff_chain = batch["effective_chain_id"]  # [b, n]
+            same_effective_chain = (eff_chain[:, :, None] == eff_chain[:, None, :]).unsqueeze(-1)  # [b, n, n, 1]
+            feat = feat * same_effective_chain
+
+        return feat
 
 
 class XtBBCAPairwiseDistancesPairFeat(Feature):
@@ -323,7 +356,20 @@ class ContactTypePairFeat(Feature):
 
 
 class CrossSequenceRelativeSequenceSeparationPairFeat(Feature):
-    """Computes relative sequence separation between two sequences and returns rectangular feature of shape [b, n1, n2, seq_sep_dim]."""
+    """Computes relative sequence separation between two sequences and returns rectangular feature of shape [b, n1, n2, seq_sep_dim].
+
+    Only computed for the same-group self-block (``idx1_key == idx2_key``,
+    e.g. target-to-target); cross-group blocks (e.g. binder-to-target)
+    already always return the null/all-zero feature (see ``forward``).
+
+    Optionally accepts ``effective_chain1_key``/``effective_chain2_key``
+    (set by ``SegmentAwareResidueFeaturesTransform``, e.g.
+    ``target_effective_chain_id``): when given and present in the batch,
+    sequence separation is additionally masked to zero for any pair that
+    does not share the same effective chain (i.e. crosses a physical chain
+    break within the same-group block). This is what makes e.g.
+    target-to-target sequence separation segment-aware.
+    """
 
     def __init__(
         self,
@@ -331,6 +377,8 @@ class CrossSequenceRelativeSequenceSeparationPairFeat(Feature):
         seq2_key="residue_type_2",
         idx1_key="residue_pdb_idx",
         idx2_key="residue_pdb_idx_2",
+        effective_chain1_key=None,
+        effective_chain2_key=None,
         seq_sep_dim=21,
         **kwargs,
     ):
@@ -339,6 +387,8 @@ class CrossSequenceRelativeSequenceSeparationPairFeat(Feature):
         self.seq2_key = seq2_key
         self.idx1_key = idx1_key
         self.idx2_key = idx2_key
+        self.effective_chain1_key = effective_chain1_key
+        self.effective_chain2_key = effective_chain2_key
         self.seq_sep_dim = seq_sep_dim
 
     def forward(self, batch):
@@ -378,7 +428,19 @@ class CrossSequenceRelativeSequenceSeparationPairFeat(Feature):
 
         if self.idx1_key == self.idx2_key:
             # Only compute sequence separation for the same part
-            return bin_and_one_hot(seq_sep, bin_limits)  # [b, n1, n2, seq_sep_dim]
+            feat = bin_and_one_hot(seq_sep, bin_limits)  # [b, n1, n2, seq_sep_dim]
+            if (
+                segment_fix_level_at_least(batch, "aggressive")
+                and self.effective_chain1_key is not None
+                and self.effective_chain2_key is not None
+                and self.effective_chain1_key in batch
+                and self.effective_chain2_key in batch
+            ):
+                eff1 = batch[self.effective_chain1_key]  # [b, n1]
+                eff2 = batch[self.effective_chain2_key]  # [b, n2]
+                same_effective_chain = (eff1[:, :, None] == eff2[:, None, :]).unsqueeze(-1)  # [b, n1, n2, 1]
+                feat = feat * same_effective_chain
+            return feat
         else:
             return torch.zeros(b, n1, n2, self.seq_sep_dim, device=device)
 

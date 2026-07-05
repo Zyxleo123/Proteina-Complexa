@@ -137,6 +137,77 @@ def bin_and_one_hot(tensor, bin_limits):
     return torch.nn.functional.one_hot(bin_indices, len(bin_limits) + 1) * 1.0
 
 
+_SEGMENT_FIX_LEVELS = {"mild": 1, "aggressive": 2, "full": 3}
+
+
+def segment_fix_level_at_least(batch, minimum: str) -> bool:
+    """Return True when the batch's segment-fix tier is >= ``minimum``.
+
+    Tiers (CPSea receptor discontinuity ablations):
+      - ``mild``: segment detection + chain_idx uses ``effective_chain_id``
+      - ``aggressive``: mild + null seq_sep across segment boundaries
+      - ``full``: aggressive + null backbone torsions/bond angles across breaks
+
+    ``segment_fix_level`` is set on each sample by
+    ``SegmentAwareResidueFeaturesTransform`` and collated as a list of strings.
+    When absent, defaults to ``full`` (current production behavior).
+    """
+    raw = batch.get("segment_fix_level", "full")
+    if isinstance(raw, (list, tuple)):
+        raw = raw[0] if raw else "full"
+    current = _SEGMENT_FIX_LEVELS.get(str(raw).lower(), 3)
+    required = _SEGMENT_FIX_LEVELS.get(minimum.lower(), 3)
+    return current >= required
+
+
+def compute_backbone_continuity_mask(batch, n):
+    """
+    Returns a boolean mask over tensor-adjacent residue pairs (k, k+1) indicating whether
+    they are genuinely backbone-consecutive (same continuous polymer segment), for gating
+    inter-residue backbone features (torsions, bond angles) that span a residue pair.
+
+    Prefers ``effective_chain_id`` + ``pos_in_segment`` (set by
+    ``SegmentAwareResidueFeaturesTransform``) when both are present, since these correctly
+    account for physical chain breaks (e.g. a discontinuous receptor/pocket crop), not just
+    residue-numbering jumps. A pair is valid only if both residues share the same
+    ``effective_chain_id`` AND their ``pos_in_segment`` differ by exactly 1 (this also
+    correctly invalidates a pair that becomes tensor-adjacent only because cropping removed
+    residues from the middle of a segment).
+
+    Falls back to ``residue_pdb_idx`` consecutiveness (previous behavior) if segment info is
+    absent, and finally to "always valid" if no residue-index information is available at
+    all (matches the previous default behavior for featureless placeholder data).
+
+    Args:
+        batch: dict-like batch, potentially containing "effective_chain_id",
+            "pos_in_segment", "residue_pdb_idx", each of shape [b, n].
+        n: sequence length (used only for the final fallback).
+
+    Returns:
+        Boolean tensor of shape [b, n - 1].
+    """
+    if (
+        segment_fix_level_at_least(batch, "full")
+        and "effective_chain_id" in batch
+        and "pos_in_segment" in batch
+    ):
+        eff_chain = batch["effective_chain_id"]  # [b, n]
+        pos_in_segment = batch["pos_in_segment"]  # [b, n]
+        same_segment = eff_chain[:, 1:] == eff_chain[:, :-1]
+        consecutive_pos = (pos_in_segment[:, 1:] - pos_in_segment[:, :-1]) == 1
+        return same_segment & consecutive_pos
+
+    if "residue_pdb_idx" in batch and batch["residue_pdb_idx"] is not None:
+        idx = batch["residue_pdb_idx"]  # [b, n]
+        return (idx[:, 1:] - idx[:, :-1]) == 1
+
+    if "coords" in batch:
+        b, device = batch["coords"].shape[0], batch["coords"].device
+    else:
+        b, device = 1, "cpu"
+    return torch.ones(b, n - 1, dtype=torch.bool, device=device)
+
+
 def indices_force_start_w_one(pdb_idx, mask):
     """
     Takes a tensor with pdb indices for a batch and forces them all to start with the index 1.
