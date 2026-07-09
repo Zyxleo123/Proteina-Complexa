@@ -806,6 +806,35 @@ class AutoEncoder(L.LightningModule):
             bs = batch["coords_nm"].shape[0]
             loss, rec_sample = self.training_step(batch, batch_idx=-1)
             self.validation_output.append(loss.item())
+
+            # Reconstruction + cyclization-geometry metrics (opt-out via
+            # `++log_cyclic_recon_metrics=false`). These surface the head-to-tail / disulfide /
+            # isopeptide bond distances that a global L2 recon loss averages away -- e.g. a linear
+            # AE reconstructs the closing C-N at ~1.9 A (bond_success ~0.18) while `coord_mae_A`
+            # still looks perfect. The cyclic_* keys are NaN unless the AE dataset includes
+            # `CyclizationLabelTransform` (which adds cyclization_i/j/type); the coord/seq keys are
+            # always populated. `run_ae_reconstruction_eval` returns a fixed key set every call, so
+            # logging it unconditionally is DDP-safe (identical keys across ranks).
+            if bool(self.cfg_ae.get("log_cyclic_recon_metrics", True)):
+                try:
+                    from proteinfoundation.eval.ae_reconstruction_eval import run_ae_reconstruction_eval
+
+                    recon_metrics = run_ae_reconstruction_eval(self, batch, prefix="val/ae_recon")
+                    for k, v in recon_metrics.items():
+                        self.log(
+                            k,
+                            v,
+                            on_step=False,
+                            on_epoch=True,
+                            prog_bar=False,
+                            logger=True,
+                            batch_size=bs,
+                            sync_dist=True,
+                            add_dataloader_idx=False,
+                        )
+                except Exception as e:  # never let a diagnostic break AE validation
+                    logger.warning(f"ae_recon cyclic metrics failed, skipping: {e}")
+
             for i in range(bs):
                 self.validation_data_samples.append(
                     {

@@ -274,63 +274,70 @@ def load_data_module(cfg_exp, is_cluster_run: bool) -> tuple:
         )
 
 
+def _splice_tensor_to_model_shape(model_tensor: torch.Tensor, ckpt_tensor: torch.Tensor) -> torch.Tensor:
+    """Copy checkpoint values into the leading overlap of ``model_tensor``; zero-fill the rest."""
+    if model_tensor.shape == ckpt_tensor.shape:
+        return ckpt_tensor
+    if model_tensor.ndim != ckpt_tensor.ndim:
+        raise ValueError(
+            f"rank mismatch: model {tuple(model_tensor.shape)} vs ckpt {tuple(ckpt_tensor.shape)}"
+        )
+    out = torch.zeros_like(model_tensor)
+    overlap_slices = tuple(slice(0, min(ms, cs)) for ms, cs in zip(model_tensor.shape, ckpt_tensor.shape))
+    out[overlap_slices] = ckpt_tensor[overlap_slices]
+    return out
+
+
 def _splice_pretrained_weights(
     model_state_dict: dict,
     ckpt_state_dict: dict,
-    # Skip concat_pair_factory entirely - architecture changes too much between versions
-    skip_prefixes: tuple[str, ...] = ("nn.concat_pair_factory",),
-    # Prefixes whose linear_out* weights may change input dim (e.g., adding conditioning features).
-    # Any key matching "<prefix>.linear_out*.weight" will be resized on shape mismatch.
-    # Covers v1 (single linear_out) and v2 (linear_out, linear_out_ligand, linear_out_target).
-    resizable_prefixes: tuple[str, ...] = (
-        "nn.init_repr_factory",
-        "nn.cond_factory",
-        "nn.pair_repr_builder.init_repr_factory",
-        "nn.concat_factory",
-    ),
+    skip_prefixes: tuple[str, ...] = ("nn.concat_pair_factory", "autoencoder"),
 ) -> dict:
     """Splice pre-trained weights into a model with potentially different dimensions.
 
-    For resizable keys with shape mismatches: truncates if ckpt is larger,
-    zero-pads if model is larger. Skips keys matching skip_prefixes entirely.
-    Keys not in resizable_keys with shape mismatches will be silently dropped
-    by load_state_dict(strict=False).
+    For keys with shape mismatches, copies the overlapping leading subtensor from the
+    checkpoint and zero-initializes any extra capacity (wider layers, longer pair repr,
+    etc.). Skips keys matching ``skip_prefixes``. Keys absent from the checkpoint keep
+    the model's random initialization via ``load_state_dict(strict=False)``.
 
-    In summary: You only need to resize weights whose input dimension changes due
-    to the feature concatenation (the linear_out projections). We skip the concat
-    factories themselves as they are either brand new (handled by strict=False)
-    or architecturally different (handled by skip_prefixes).
+    ``autoencoder`` is skipped because a flow ``pretrain_ckpt_path`` (e.g. complexa.ckpt)
+    bundles its own ``autoencoder.*`` weights, which would otherwise OVERWRITE the AE that
+    ``Proteina.__init__`` already loaded from ``autoencoder_ckpt_path`` -- silently replacing
+    a task-finetuned AE (e.g. the CPSea cyclic-peptide AE) with the pretrained one. Freezing
+    does not protect against this: it only stops gradients, not ``load_state_dict``. The AE
+    must always come from ``autoencoder_ckpt_path``; the flow checkpoint never touches it.
+    This is independent of ``freeze_autoencoder`` (joint training still starts the AE from
+    ``autoencoder_ckpt_path`` and then trains it).
 
     Args:
         model_state_dict: Current model state dict.
         ckpt_state_dict: Pre-trained checkpoint state dict.
         skip_prefixes: Key prefixes to skip entirely (all weights under prefix).
-        resizable_keys: Keys where shape mismatch is handled by truncation/zero-padding.
 
     Returns:
         Spliced state dict ready for model.load_state_dict(strict=False).
     """
 
-    def _is_resizable(key: str) -> bool:
-        """Check if key is a linear_out* weight under a resizable prefix."""
-        return any(
-            key.startswith(prefix) and "linear_out" in key and key.endswith(".weight") for prefix in resizable_prefixes
-        )
-
     state_dict = {}
+    n_spliced = 0
+    n_skipped_shape = 0
     for k, v in ckpt_state_dict.items():
         if any(k.startswith(prefix) for prefix in skip_prefixes):
             continue
-        if _is_resizable(k) and k in model_state_dict and model_state_dict[k].shape != v.shape:
-            dim_now = model_state_dict[k].shape[-1]
-            dim_pre = v.shape[-1]
-            if dim_pre > dim_now:
-                state_dict[k] = v[..., :dim_now]  # example if we want to remove the chain idx seq feat
-            else:  # if the pre-trained ckpt is smaller, we zero-pad the model weights. Cannot be == due to if shape check above
-                state_dict[k] = torch.zeros_like(model_state_dict[k])
-                state_dict[k][..., :dim_pre] = v
-        else:
+        if k not in model_state_dict:
+            continue
+        model_v = model_state_dict[k]
+        if model_v.shape == v.shape:
             state_dict[k] = v
+        elif model_v.ndim == v.ndim:
+            state_dict[k] = _splice_tensor_to_model_shape(model_v, v)
+            n_spliced += 1
+        else:
+            n_skipped_shape += 1
+    if n_spliced:
+        log_info(f"Spliced {n_spliced} checkpoint tensors with shape mismatches (overlap copy + zero pad).")
+    if n_skipped_shape:
+        log_info(f"Skipped {n_skipped_shape} checkpoint tensors with incompatible rank.")
     return state_dict
 
 
