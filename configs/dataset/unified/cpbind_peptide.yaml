@@ -1,15 +1,20 @@
-# CPSea cyclic peptide–receptor complexes (CPSea_PDB subset)
+# CPBind cyclic peptide–receptor complexes
 #
-# Data root: ${oc.env:CPSEA_DATA_PATH} (default: /zfsauton/scratch/yixiz/CPSea/CPSea_PDB)
-# Preprocess with: script_utils/preprocess_cpsea.py  (writes to $CPSEA_DATA_PATH/preprocessed)
-# Output PDBs preserve remapped cyclization CONECT (ignored by training loaders).
+# Data root: ${oc.env:CPBIND_DATA_PATH} (default: /zfsauton/scratch/yixiz/CPSea/CPBind)
+# Preprocessed with the same script_utils/preprocess_cpsea.py as CPSea, so the layout, the
+# parquet column schema, and the `cpsea_{train,val,test}.parquet` filenames are identical --
+# only the root differs. The transform chain below is therefore the same as cpsea_peptide.yaml.
+#
+# Scale: 545,300 structures (train 491,667 / val 25,853 / test 27,780) -- ~44x CPSea_PDB.
+# Binder is chain B throughout; peptide_length 5-16, within CroppingTransform2's binder bounds.
+# Exactly one kept CONECT bond per structure, so the single-cyclization-edge assumption holds.
 #
 # Pipeline: PDB → AtomArray → atom37 Data → atom37_transforms → model
 
 datamodule:
   _target_: proteinfoundation.datasets.structure_data.StructureDataModule
-  metadata_file: ${oc.env:CPSEA_DATA_PATH}/preprocessed/metadata/cpsea_train.parquet
-  val_metadata_file: ${oc.env:CPSEA_DATA_PATH}/preprocessed/metadata/cpsea_val.parquet
+  metadata_file: ${oc.env:CPBIND_DATA_PATH,/zfsauton/scratch/yixiz/CPSea/CPBind}/preprocessed/metadata/cpsea_train.parquet
+  val_metadata_file: ${oc.env:CPBIND_DATA_PATH,/zfsauton/scratch/yixiz/CPSea/CPBind}/preprocessed/metadata/cpsea_val.parquet
   base_dir: ""
   batch_size: 6
   num_workers: 8
@@ -29,11 +34,11 @@ datamodule:
   atom37_transforms:
     # Must run first: detects continuous backbone segments (segment_id, pos_in_segment,
     # effective_chain_id) from the raw, un-cropped, un-rotated residue order and Angstrom
-    # coordinates. CPSea receptor/target chains are discontinuous receptor/pocket crops;
+    # coordinates. Receptor/target chains are discontinuous receptor/pocket crops;
     # see docs/README_DATA_SEQ_BREAK_ISSUE.md.
     - _target_: proteinfoundation.datasets.transforms.SegmentAwareResidueFeaturesTransform
       cn_break_cutoff: 2.0
-      segment_fix_level: full  # mild | aggressive | full (see relaunch_cpseaae_seqfix_experiments.sh)
+      segment_fix_level: full
     - _target_: proteinfoundation.datasets.transforms.CoordsToNanometers
     - _target_: proteinfoundation.datasets.transforms.GlobalRotationTransform
     - _target_: proteinfoundation.datasets.transforms.CroppingTransform2
@@ -41,11 +46,6 @@ datamodule:
       interface_threshold: 8.0
       dist_mode: "bb_ca"
       data_mode: "all-atom"
-      # The binder is a covalent macrocycle: any contiguous crop severs the ring and drops its
-      # cyclization endpoints. Only the receptor may be cropped. (Cropping only fires at all for
-      # complexes >= crop_size residues -- 3.5% of cpsea_train -- so this was a silent
-      # corruption of a minority of rows, not all of them.)
-      crop_binder: false
       binder_min_length: 5
       binder_max_length: 16
       binder_padding_length: 0
@@ -69,7 +69,6 @@ datamodule:
     - _target_: proteinfoundation.datasets.transforms.FilterTargetResiduesTransform
     # Must run after FilterTargetResiduesTransform: needs binder-local (0..L_b-1) indexing.
     # Derives the single ground-truth cyclization edge (cyclization_i/j/type, has_cyclization)
-    # for the CyclizationLinkHead (see proteinfoundation.cyclization). Label-only; never
-    # touches coordinates. See configs/example/training_cpsea_peptide_smoke.yaml `cyclization:`.
+    # for the CyclizationLinkHead from the preserved CONECT records.
     - _target_: proteinfoundation.datasets.transforms.CyclizationLabelTransform
       default_binder_chain_id: "B"

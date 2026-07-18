@@ -136,6 +136,7 @@ metric:
   pre_refolding:
     bioinformatics: True   # Shape complementarity, SASA, hydrophobicity
     tmol: True             # TMOL force field (H-bonds, electrostatics)
+    rosetta: False         # PyRosetta InterfaceAnalyzerMover (dG_separated; requires PyRosetta)
   
   # Post-refolding metrics (on successful refolded structures)
   # Same granular control as pre-refolding
@@ -143,6 +144,7 @@ metric:
   refolded:
     bioinformatics: True
     tmol: True
+    rosetta: False
   
   # =========================================================================
   # Monomer metrics (set compute_monomer_metrics to enable)
@@ -183,3 +185,13 @@ metric:
 aggregation:
   limit: null  # Optional: Limit number of result files to process
   filter_by_avg_ipsae: 0.0  # Filter by average ipsae (0 = no filtering)
+
+# =============================================================================
+# Weights & Biases logging (evaluation summaries)
+# =============================================================================
+log:
+  log_wandb: false
+  wandb_project: complexa_eval
+  wandb_entity: null
+  wandb_run_name: null  # defaults to run_name / config name
+  wandb_log_only_job0: true  # when eval_njobs > 1, only job 0 logs to wandb

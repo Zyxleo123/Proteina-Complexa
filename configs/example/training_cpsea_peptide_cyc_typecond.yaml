@@ -1,0 +1,237 @@
+# @package _global_
+# Cyclization TYPE CONDITIONING: the desired cyclization type is an *input*; the model still
+# generates the cyclization residues (i, j).
+#
+# Full copy of example/training_cpsea_peptide_smoke.yaml (so the shared slurm launcher works
+# unchanged) with the cyclization conditioning knobs turned on. The smoke file remains the
+# single source of truth for defaults.
+#
+# Two things make the conditioning real rather than vacuous:
+#   1. `cyclization_type_emb` in nn.feats_cond_seq feeds the type to the DENOISER, so the model
+#      learns to generate a sequence that can actually support the request (e.g. two CYS for a
+#      disulfide). Without it the type would only reach the linkage head.
+#   2. The head is conditioned by narrowing its validity mask to the requested type's slice,
+#      which turns its existing global (i, j, type) softmax into exactly p(i, j | type).
+#      No new head parameters.
+#
+# Run:
+#   CONFIG=example/training_cpsea_peptide_cyc_typecond \
+#     RUN_NAME=cpsea_cyc_typecond \
+#     WANDB_PROJECT=cpsea_cyclization \
+#     CHECKPOINT=true \
+#     bash ~/slurm/cpsea/cpsea_peptide_train_finetune.sh full
+#
+# Baseline to compare against (same everything, joint (i,j,type) prediction, no type input):
+#   CONFIG=example/training_cpsea_peptide_cyc_typecond \
+#     RUN_NAME=cpsea_cyc_joint_baseline CHECKPOINT=true \
+#     EXTRA_OVERRIDES="++cyclization.type_conditioning=false ++training.cyclization_type_dropout_rate=0.0 ++nn.feats_cond_seq=[time_emb_bb_ca,time_emb_local_latents]" \
+#     bash ~/slurm/cpsea/cpsea_peptide_train_finetune.sh full
+
+run_name: cpsea_cyc_typecond
+
+hardware:
+  ncpus_per_task_train_: 4
+  ncpus_per_task_prepro_: 4
+  accelerator: gpu
+  ngpus_per_node_: 1
+  nnodes_: 1
+
+defaults:
+  - /nn: local_latents_score_nn_160M_binder
+  - /generation: validation_local_latents
+  - /dataset/unified: cpsea_peptide
+  # The sampler `val_generation` integrates with, pulled STRAIGHT from the design pipeline so the
+  # two cannot drift. Without this, validation_step_generate falls back to generation.model["ode"]
+  # -- Proteina's UNCONDITIONAL MONOMER sampler (see /generation above: nres [50,100]) -- which
+  # sets bb_ca.center_every_step=True. Zero-CoM-ing every step is correct for a monomer centred on
+  # itself and WRONG here: cpsea_peptide centres on the TARGET, so the binder belongs off-origin at
+  # its binding site, and centering drags it to the receptor's core every step. That produces
+  # shredded samples (Ca-Ca ~4 nm vs 0.38 real) that say nothing about the model.
+  - /pipeline/model_sampling@val_generation.design_sampling
+  - _self_
+
+pretrain_ckpt_path: ${oc.env:CKPT_PATH}/complexa.ckpt
+autoencoder_ckpt_path: ${oc.env:CPSEA_AE_CKPT_PATH}
+
+freeze_autoencoder: true
+ae_reg_weight: 1.0
+
+# `_self_` is last in `defaults`, so this overrides the /nn group above.
+# cyclization_type_emb MUST be LAST in the list: feats_cond_seq is the column order of the
+# concat feeding cond_factory.linear_out, and _splice_pretrained_weights (train.py) warm-starts
+# that layer by copying complexa.ckpt's leading columns and zero-padding the rest. Appending
+# last keeps the pretrained time-embedding columns aligned and makes the type embedding
+# contribute exactly zero at init -- an exact warm start. Reordering silently corrupts the splice.
+nn:
+  feats_cond_seq: ["time_emb_bb_ca", "time_emb_local_latents", "cyclization_type_emb"]
+  cyc_emb_dim: 256  # match the 160M trunk's dim_cond / t_emb_dim / idx_emb_dim
+  # cyclization_ring_pe MUST be LAST here for exactly the same reason cyclization_type_emb
+  # must be last in feats_cond_seq: feats_pair_repr is the column order of the concat feeding
+  # pair_repr_builder.init_repr_factory.linear_out, which _splice_pretrained_weights warm-starts
+  # by copying complexa.ckpt's leading columns and zero-padding the rest. The first six entries
+  # below reproduce /nn/local_latents_score_nn_160M_binder verbatim; only the append is new.
+  #
+  # rel_seq_sep is deliberately KEPT alongside it. The ring PE does not replace linear
+  # separation, it corrects the topology the linear encoding gets wrong at the closing bond:
+  # rel_seq_sep stays signed/directional and still carries the chain, while cyclization_ring_pe
+  # says which residues the requested cycle actually makes neighbours.
+  feats_pair_repr: ["rel_seq_sep", "xt_bb_ca_pair_dists", "x_sc_bb_ca_pair_dists", "optional_ca_pair_dist", "chain_idx_pair", "hotspot_mask_pair", "cyclization_ring_pe"]
+  ring_sep_dim: 32  # one-hot geodesic bins; >> any binder length here (12-mer -> geodesic <= 6)
+
+product_flowmatcher:
+  bb_ca:
+    zero_com_noise: False
+    guidance_enabled: true
+    dim: 3
+  local_latents:
+    zero_com_noise: False
+    guidance_enabled: True
+    dim: null
+
+loss:
+  t_distribution:
+    bb_ca:
+      name: mix_unif_beta
+      p1: 1.9
+      p2: 1.0
+      p3: 0.02
+    local_latents:
+      name: uniform
+      p1: 1.0
+      p2: 1.0
+    shared_groups: []
+
+force_precision_f32: True
+
+# SAMPLING validation -- the only non-teacher-forced signal in this run.
+#
+# Every other logged metric (flow loss, t-binned loss, four-way decode) builds x_t by interpolating
+# the TRUE x_1 with noise, so the model is always handed a real interpolant and most of the answer
+# with it; decode_gtca_* goes further and hands the decoder the native Ca trace. Sampling never sees
+# a true interpolant -- it consumes its own accumulated output. The model can therefore sit at a
+# healthy loss with 100% teacher-forced sequence recovery and still emit garbage when integrated,
+# and no teacher-forced metric can reveal that. This block integrates the ODE from t=0 on real val
+# complexes and scores what actually comes out.
+#
+# Cheap on purpose: single-pass (no search, no lookahead), no AF2, no MPNN, no folding. Just
+# ODE + AE decode + reference-free geometry. Costs ~n_batches * n_repeat ODE integrations.
+#
+# Read: val_gen/cyc/*_bond_success  -- does the macrocycle CLOSE? (~45% teacher-forced; unknown
+#                                      when sampled -- this is the number to watch)
+#       val_gen/iface/*             -- is the binder even ON the receptor, or floating off?
+#       val_gen/geom/ca_ca_viol_frac-- is it a peptide at all? (real CPSea Ca-Ca = 0.3835 nm)
+#       val_gen/div/ca_rmsd_nm      -- spread across repeats of the SAME target. ~0 = mode collapse
+#                                      (one answer per receptor regardless of noise).
+#       val_gen/seq/top1_frac       -- sequence collapse; poly-Gly still scores fine on coord MSE.
+#
+# NOTE: opt.val_check_interval below is 999999 (validation effectively never fires). Lower it, or
+# none of this -- nor the existing val loss -- will ever be logged.
+val_generation:
+  enabled: true
+  n_batches: 2      # val batches to sample. Each costs an ODE integration; keep small.
+  n_repeat: 4       # samples per complex. >1 is what makes div/* (mode collapse) readable.
+  # null => inherit from design_sampling (nsteps 400, self_cond true). Every sampler knob is
+  # inherited the same way: schedules, sampling_mode (sc, NOT vf), sc_scale_noise, centering.
+  # Pin these only to make a smoke run cheap, and remember that doing so is itself a step away
+  # from design-time behaviour.
+  nsteps: null
+  self_cond: null
+
+training:
+  n_recycle: 0
+  motif_conditioning: False
+  self_cond: True
+  fold_cond: False
+  target_cond: False
+  mask_T_prob: 0.5
+  mask_A_prob: 0.5
+  mask_C_prob: 0.5
+  fold_label_sample_ratio: [0.5, 0.1, 0.15, 0.25]
+  p_folding_n_inv_folding_iters: 0.15
+  # Every CPSea row carries a real cyclization type (isopeptide 57.7% / mainchain 31.8% /
+  # disulfide 10.5%, zero unlabeled), so dropout is the ONLY source of UNSPECIFIED rows.
+  # At 0.0 the null token would never be trained, the head would lose its cross-type negatives,
+  # and the model could not sample unconditionally or do classifier-free guidance on the type.
+  cyclization_type_dropout_rate: 0.15
+
+cyclization:
+  enabled: true
+  loss_weight: 0.1
+  hidden_dim: 256
+  detach_link_inputs: true
+  force_gold_valid: true
+  allow_asn_gln_isopeptide: true
+  type_conditioning: true
+  target_type: null  # inference only; set at generation time
+
+  # Hold DISULFIDE/ISOPEPTIDE to the terminal pair (0, L-1) that MAINCHAIN is already hard-coded to.
+  # Measured on CPSea: 520/520 sampled binders cyclize between the termini, ALL THREE types
+  # (incl. 55/55 disulfides). So the endpoints are a constant, not something to discover, and the
+  # freedom to pick any CYS-CYS / LYS-acid pair was never expressiveness -- it was an escape hatch.
+  # At inference the head argmaxes with Ca coords in hand, so it found whichever pair was already
+  # closest to a bond; in a compact 10-16mer some CYS pair nearly always is. That is why disulfide
+  # closure read ~1.7 A while mainchain -- which has no hatch, and the EASIEST anchor atoms -- read
+  # 0%. The metric was rewarding "two cysteines are near each other", not ring closure.
+  # Training is unaffected: force_gold_valid punches the gold entry through afterwards.
+  terminal_only: true
+
+  # Supervise the closing-bond DISTANCE, not just its (i, j, type) classification.
+  # The head above is already near-perfect while sampled ring closure sits near half:
+  # classifying which residues should bond says nothing about putting them a bond length
+  # apart, and nothing else in the objective ever did.
+  #
+  # Two-sided/flat-bottom by construction (see cyclization/bond_loss.py): zero penalty
+  # inside the acceptance window, quadratic outside on BOTH sides. Not a tunable taste --
+  # sampled designs have come out FUSED (anchor atoms at 0.76 A vs a real amide C-N of
+  # 1.33 A), which is exactly what a one-sided "pull the ends together" term optimises into.
+  #
+  # Watch `train/cyclization_bond_window_success` (the closure criterion, on the samples the
+  # loss actually trains) against `train/cyclization_bond_mean_dist_A`. If mean_dist_A drops
+  # BELOW the window while window_success stalls, the ring is fusing, not closing.
+  bond_loss:
+    enabled: true
+    # Penalty is in A^2, so an open ring a few A out is O(10) before weighting. Start low and
+    # raise only if window_success is flat; too high trades fold/interface quality for closure.
+    loss_weight: 0.05
+    # The distance is read off the PREDICTED clean structure, which is noise below this t --
+    # penalising it there supervises the model's own noise. Ramps linearly from here to t=1.
+    t_lower_lim: 0.5
+
+lora:
+  r: null
+  lora_alpha: 32.0
+  lora_dropout: 0.0
+  train_bias: none
+
+dataset:
+  datamodule:
+    batch_size: 2
+    num_workers: 4
+
+opt:
+  lr: 0.0001
+  warmup_steps: 0
+  max_epochs: 1
+  accumulate_grad_batches: 1
+  skip_nan_grad: True
+  grad_and_weight_analysis: False
+  dist_strategy: auto
+  val_check_interval: 999999
+  limit_train_batches: 20
+
+log:
+  wandb_project: cpsea_peptide
+  log_wandb: False
+  log_every_n_steps: 1
+  checkpoint: False
+  checkpoint_every_n_steps: null
+  last_ckpt_every_n_steps: 1500
+  save_extra_checkpoints: false
+
+seed: 42
+
+ema:
+  decay: 0.999
+  validate_original_weights: False
+  every_n_steps: 1
+  cpu_offload: False

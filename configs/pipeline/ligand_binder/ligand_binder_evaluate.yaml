@@ -43,6 +43,7 @@ metric:
   pre_refolding:
     bioinformatics: false  # Shape complementarity, SASA, hydrophobicity (requires sc/dssp binaries)
     tmol: false            # TMOL force field (H-bonds, electrostatics)
+    rosetta: false         # PyRosetta interface dG_separated (requires PyRosetta)
 
   # ---------------------------------------------------------------------------
   # Post-refolding interface metrics (on refolded structures)
@@ -51,6 +52,7 @@ metric:
   refolded:
     bioinformatics: false
     tmol: false
+    rosetta: false
 
   # ---------------------------------------------------------------------------
   # Monomer metrics (set compute_monomer_metrics to enable)

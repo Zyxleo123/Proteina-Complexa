@@ -35,6 +35,15 @@ dataloader:
         target_hotspots: ${.....target_dict_cfg.${.task_name}.hotspot_residues}
         binder_center: null
         pdb_id: ${.....target_dict_cfg.${.task_name}.pdb_id}
+        # Which macrocycle chemistry to ask a cyclization-type-conditioned model for:
+        # mainchain | disulfide | isopeptide | unspecified. null (the default) leaves the key
+        # out of the batch entirely, which is what a non-cyclic model expects.
+        #
+        # For a model trained with `cyclization.type_conditioning=true`, null and "unspecified"
+        # both mean "you choose" -- the conditioning is then inert and the model reverts to its
+        # favourite chemistry (in practice isopeptide/disulfide, never mainchain). Name a type
+        # here to actually exercise the conditioning.
+        cyclization_type: ${oc.select:.....target_dict_cfg.${.task_name}.cyclization_type,null}
     transforms:
       - _target_: proteinfoundation.datasets.transforms.CoordsTensorCenteringTransform
         tensor_name: "x_target"
@@ -150,6 +159,22 @@ reward_model:
         avg_ipsae_10: 0.0
       seed: 0
       device_id: null  # Auto-detects current CUDA device
+
+    # Ring-closure reward (macrocyclic binders). Pure geometry -- one interatomic distance --
+    # so it is cheap enough to steer the beam-search lookahead, unlike a folding/Rosetta call.
+    # Reward is 0 for a closed ring and negative for an open OR fused one (two-sided; a
+    # one-sided "pull the ends together" reward optimises into the interpenetrating-ring
+    # failure). cyclization_type is pulled from the target's targets_dict entry (same source as
+    # the generator's conditioning); non-cyclic targets resolve to null and the reward is a
+    # no-op (differentiable zero, no PDB read), so this is safe to leave wired into every run.
+    # Final ranking is NOT done here -- gate open rings and rank by Rosetta dG post-eval with
+    # result_analysis/reselect_by_closure_rosetta.py.
+    cyc_closure:
+      _target_: "proteinfoundation.rewards.cyclization_reward.CyclizationClosureRewardModel"
+      cyclization_type: ${oc.select:....target_dict_cfg.${....task_name}.cyclization_type,null}
+      weight: 1.0          # TUNE against af2folding's i_pae term (~O(0.5)); needs one real run to calibrate
+      miss_dist_A: 4.0     # distance charged when the requested anchor atoms are absent
+      structure_source: null  # score the GENERATED structure (the only one with the ring)
 
     # # TMOL reward model (optional)
     # tmol:

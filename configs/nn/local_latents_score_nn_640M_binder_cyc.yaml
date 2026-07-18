@@ -1,0 +1,69 @@
+# ~640M-parameter binder flow model with cyclization-type conditioning.
+#
+# Identical to local_latents_score_nn_640M_binder.yaml except for the extra
+# "cyclization_type_emb" conditioning feature (and its `cyc_emb_dim`), which feeds the
+# *desired* cyclization type into the denoiser. That is what lets the model generate a
+# sequence/geometry that actually supports the requested linkage (e.g. placing two CYS
+# for a disulfide) rather than only re-reading a cyclization-blind structure.
+#
+# Use with `cyclization.type_conditioning=true`. Kept as a separate config because adding
+# a feature to feats_cond_seq widens the conditioning projection, so checkpoints are not
+# interchangeable with the plain 640M binder config.
+
+name: local_latents_transformer
+
+output_parameterization:
+  bb_ca: v
+  local_latents: v
+
+nlayers: 14
+token_dim: 1536
+nheads: 24
+parallel_mha_transition: False
+
+strict_feats: False
+
+feats_seq: ["xt_bb_ca", "xt_local_latents", "x_sc_bb_ca", "x_sc_local_latents", "optional_ca_coors_nm_seq_feat", "optional_res_type_seq_feat", "hotspot_mask_seq", "res_seq_pdb_idx"]
+# The cyclization type is a single global label per sample, so it belongs in the
+# conditioning vector that modulates every layer (like fold_emb / the time embedding),
+# not in the per-residue token representation.
+feats_cond_seq: ["time_emb_bb_ca", "time_emb_local_latents", "cyclization_type_emb"]
+
+dim_cond: 512
+idx_emb_dim: 512
+t_emb_dim: 512
+cyc_emb_dim: 512
+
+# cyclization_ring_pe is the pair-side counterpart of cyclization_type_emb: the type says WHAT
+# linkage to build, this says WHICH residues the requested cycle makes neighbours. Without it the
+# relative positional encoding insists the two ends of a head-to-tail 12-mer are 11 apart when the
+# closing bond makes them topological distance 1 -- the representation cannot perceive the bond it
+# is being asked to form. rel_seq_sep is kept: this corrects the topology, it does not replace the
+# chain. MUST stay LAST -- feats_pair_repr is the column order of the concat feeding
+# pair_repr_builder.init_repr_factory.linear_out, which _splice_pretrained_weights warm-starts by
+# copying the checkpoint's leading columns and zero-padding the rest; reordering corrupts the splice.
+feats_pair_repr: ["rel_seq_sep", "xt_bb_ca_pair_dists", "x_sc_bb_ca_pair_dists", "optional_ca_pair_dist", "chain_idx_pair", "hotspot_mask_pair", "cyclization_ring_pe"]
+feats_pair_cond: ["time_emb_bb_ca", "time_emb_local_latents"]
+ring_sep_dim: 32  # one-hot geodesic bins; >> any cyclic-peptide binder length
+
+concat_features:
+  enable_motif: false
+  enable_target: true
+  enable_ligand: false
+  motif_pair_features: false
+  target_pair_features: true
+  ligand_pair_features: false
+
+xt_pair_dist_dim: 30
+xt_pair_dist_min: 0.1
+xt_pair_dist_max: 3
+x_sc_pair_dist_dim: 30
+x_sc_pair_dist_min: 0.1
+x_sc_pair_dist_max: 3
+seq_sep_dim: 127
+pair_repr_dim: 512
+
+update_pair_repr: False
+update_pair_repr_every_n: 3
+use_tri_mult: False
+use_qkln: True

@@ -1,0 +1,2 @@
+# @package _global_.nn
+# No-op scale preset — keeps 160M binder base widths/depth.

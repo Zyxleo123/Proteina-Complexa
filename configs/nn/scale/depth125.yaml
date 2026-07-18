@@ -1,0 +1,3 @@
+# @package _global_.nn
+# +25% depth: 14 -> 18 layers (~+28% params).
+nlayers: 18

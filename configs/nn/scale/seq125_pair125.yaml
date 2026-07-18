@@ -1,0 +1,8 @@
+# @package _global_.nn
+# +25% both sequence and pair widths.
+token_dim: 960
+nheads: 15
+dim_cond: 320
+idx_emb_dim: 320
+t_emb_dim: 320
+pair_repr_dim: 320

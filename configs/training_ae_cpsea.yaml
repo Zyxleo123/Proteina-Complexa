@@ -178,3 +178,10 @@ dataset:
       - _target_: proteinfoundation.datasets.transforms.ExtractTargetCoordinatesTransform
         compact_mode: true
       - _target_: proteinfoundation.datasets.transforms.FilterTargetResiduesTransform
+      # Must run after FilterTargetResiduesTransform: needs binder-local (0..L_b-1) indexing.
+      # Derives the single ground-truth cyclization edge (cyclization_i/j/type, has_cyclization)
+      # so val/ae_recon/{cyclic,mainchain_cn,disulfide}_* metrics populate during AE finetune
+      # instead of NaN. Label-only; never touches coordinates. Opt out of the metrics (not the
+      # labels) via ++log_cyclic_recon_metrics=false.
+      - _target_: proteinfoundation.datasets.transforms.CyclizationLabelTransform
+        default_binder_chain_id: "B"

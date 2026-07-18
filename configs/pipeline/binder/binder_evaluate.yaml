@@ -39,18 +39,32 @@ metric:
   # ---------------------------------------------------------------------------
   # Pre-refolding interface metrics (on generated structures)
   # ---------------------------------------------------------------------------
-  compute_pre_refolding_metrics: false
+  # For cyclic peptides these are the load-bearing interface numbers: AF2's pLDDT/i_pAE are
+  # computed on a refold that has no macrocycle bond, whereas Rosetta scores the GENERATED
+  # structure, which does carry the closed ring. dG_separated / dSASA_int therefore measure
+  # target engagement on geometry the model actually produced.
+  compute_pre_refolding_metrics: true
   pre_refolding:
     bioinformatics: false  # Shape complementarity, SASA, hydrophobicity (requires sc/dssp binaries)
     tmol: false            # TMOL force field (H-bonds, electrostatics)
+    rosetta: true          # PyRosetta interface dG_separated (requires PyRosetta)
+    cyclization: true      # Macrocycle closing-bond distance / closed / fused, and whether the
+                           # requested cyclization type was actually built. No-op for a binder
+                           # with no cyclization chemistry at its termini; costs a PDB parse.
 
   # ---------------------------------------------------------------------------
   # Post-refolding interface metrics (on refolded structures)
   # ---------------------------------------------------------------------------
+  # Rosetta is left OFF here on purpose. Scoring the refolded structure means scoring an AF2
+  # prediction of a LINEAR peptide -- the macrocycle bond is gone, so its interface energy is
+  # not the designed molecule's. It is also ~17 seqs x N designs of constrained FastRelax
+  # (~90 s each), i.e. hours per target, versus N for pre_refolding. Turn on only to compare
+  # a refold against its generated counterpart deliberately.
   compute_refolded_structure_metrics: false
   refolded:
     bioinformatics: false
     tmol: false
+    rosetta: false
 
   # ---------------------------------------------------------------------------
   # Monomer metrics (set compute_monomer_metrics to enable)

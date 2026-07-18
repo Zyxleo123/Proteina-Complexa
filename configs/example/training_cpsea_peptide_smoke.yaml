@@ -12,6 +12,13 @@
 #   python -m proteinfoundation.train --config-name example/training_cpsea_peptide_smoke +single=true +nolog=true ++show_prog_bar=true \
 #     ++dataset.datamodule.metadata_file=${PWD}/CPSea_data/preprocessed_sample100/metadata/cpsea_train.parquet \
 #     ++dataset.datamodule.val_metadata_file=${PWD}/CPSea_data/preprocessed_sample100/metadata/cpsea_val.parquet
+#
+# Model scale presets (+~25% capacity knobs; override at launch):
+#   nn/scale=seq125          # wider sequence trunk (token_dim, cond embeddings)
+#   nn/scale=pair125         # wider pair_repr_dim
+#   nn/scale=seq125_pair125  # both
+#   nn/scale=depth125        # 14 -> 18 layers
+# Fine-grained overrides still work, e.g. ++nn.token_dim=832 ++nn.nlayers=16
 
 run_name: cpsea_peptide_smoke
 
@@ -24,6 +31,7 @@ hardware:
 
 defaults:
   - /nn: local_latents_score_nn_160M_binder
+  - /nn/scale: none
   - /generation: validation_local_latents
   - /dataset/unified: cpsea_peptide
   - _self_
@@ -77,6 +85,39 @@ training:
   mask_C_prob: 0.5
   fold_label_sample_ratio: [0.5, 0.1, 0.15, 0.25]
   p_folding_n_inv_folding_iters: 0.15
+  # Only used when cyclization.type_conditioning=true. Per-sample probability of replacing
+  # the gold type with UNSPECIFIED, so one model learns both the conditional p(i,j | type)
+  # and the unconditional joint p(i,j,type).
+  #
+  # Must be > 0 when type_conditioning is on. Every CPSea train row resolves to a real type
+  # (isopeptide 57.7% / mainchain 31.8% / disulfide 10.5%, zero unlabeled -- see
+  # scripts/check_cpsea_cyclization_labels.py), so dropout is the *only* source of
+  # UNSPECIFIED rows. At 0.0 the model would never see the null token, which would leave the
+  # unconditional path untrained, strip the cross-type negatives the head needs to keep
+  # discriminating types, and make the UNSPECIFIED embedding useless for guidance.
+  # 0.15 is a reasonable starting point.
+  cyclization_type_dropout_rate: 0.0
+
+# CPSea cyclization-linkage auxiliary head (see proteinfoundation.cyclization).
+# Disabled by default so existing training/inference behavior is unchanged.
+# Enable with: ++cyclization.enabled=true
+cyclization:
+  enabled: false
+  loss_weight: 0.1
+  hidden_dim: 256
+  detach_link_inputs: true  # keeps the (already-trained) flow model untouched while the head trains
+  force_gold_valid: true  # training only: never let an incomplete chemistry rule mask out the true label
+  allow_asn_gln_isopeptide: true
+
+  # Type conditioning: take the desired cyclization type as an *input* and generate only the
+  # cyclization residues (i, j), instead of predicting the whole (i, j, type) triple jointly.
+  # Requires "cyclization_type_emb" in the nn's feats_cond_seq -- without it the type reaches
+  # the head but not the denoiser, so the generated sequence need not support the request.
+  # Also set training.cyclization_type_dropout_rate.
+  type_conditioning: false
+  # Inference only. null => UNSPECIFIED => unconditional joint behavior (the default).
+  # One of: mainchain | disulfide | isopeptide.
+  target_type: null
 
 lora:
   r: null

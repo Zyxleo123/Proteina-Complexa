@@ -1,0 +1,99 @@
+# @package _global_
+# CPSea sanity control: normal target order, same hyperparams as sanity_shuffle.
+
+run_name: cpsea_peptide_sanity_control
+
+hardware:
+  ncpus_per_task_train_: 4
+  ncpus_per_task_prepro_: 4
+  accelerator: gpu
+  ngpus_per_node_: 1
+  nnodes_: 1
+
+defaults:
+  - /nn: local_latents_score_nn_160M_binder
+  - /generation: validation_local_latents
+  - /dataset/unified: cpsea_peptide
+  - _self_
+
+pretrain_ckpt_path: ${oc.env:CKPT_PATH}/complexa.ckpt
+autoencoder_ckpt_path: ${oc.env:CPSEA_AE_CKPT_PATH}
+
+freeze_autoencoder: true
+ae_reg_weight: 1.0
+
+product_flowmatcher:
+  bb_ca:
+    zero_com_noise: False
+    guidance_enabled: true
+    dim: 3
+  local_latents:
+    zero_com_noise: False
+    guidance_enabled: True
+    dim: null
+
+loss:
+  t_distribution:
+    bb_ca:
+      name: mix_unif_beta
+      p1: 1.9
+      p2: 1.0
+      p3: 0.02
+    local_latents:
+      name: uniform
+      p1: 1.0
+      p2: 1.0
+    shared_groups: []
+
+force_precision_f32: True
+
+training:
+  n_recycle: 0
+  motif_conditioning: False
+  self_cond: True
+  fold_cond: False
+  target_cond: False
+  mask_T_prob: 0.5
+  mask_A_prob: 0.5
+  mask_C_prob: 0.5
+  fold_label_sample_ratio: [0.5, 0.1, 0.15, 0.25]
+  p_folding_n_inv_folding_iters: 0.15
+
+lora:
+  r: null
+  lora_alpha: 32.0
+  lora_dropout: 0.0
+  train_bias: none
+
+dataset:
+  datamodule:
+    batch_size: 16
+    num_workers: 8
+
+opt:
+  lr: 0.0001
+  warmup_steps: 500
+  max_epochs: 10000000
+  accumulate_grad_batches: 8
+  skip_nan_grad: True
+  grad_and_weight_analysis: False
+  dist_strategy: auto
+  val_check_interval: 999999
+  limit_train_batches: 2000
+
+log:
+  wandb_project: cpsea_peptide_sanity
+  log_wandb: True
+  log_every_n_steps: 50
+  checkpoint: true
+  checkpoint_every_n_steps: null
+  last_ckpt_every_n_steps: 1500
+  save_extra_checkpoints: false
+
+seed: 42
+
+ema:
+  decay: 0.999
+  validate_original_weights: False
+  every_n_steps: 1
+  cpu_offload: False

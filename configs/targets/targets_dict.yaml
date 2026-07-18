@@ -404,6 +404,7 @@ target_dict_cfg:
     hotspot_residues: []
     binder_length: [5, 16]
     pdb_id: null
+    cyclization_type: mainchain  # native: N(res2)-C(res17) backbone amide (head-to-tail)
 
   cpsea_1GYT:
     source: cpsea
@@ -413,6 +414,7 @@ target_dict_cfg:
     hotspot_residues: []
     binder_length: [5, 16]
     pdb_id: null
+    cyclization_type: isopeptide  # native: NZ(Lys33)-CG(Asp44) side-chain isopeptide
 
   cpsea_1J7K:
     source: cpsea
@@ -422,6 +424,7 @@ target_dict_cfg:
     hotspot_residues: []
     binder_length: [5, 16]
     pdb_id: null
+    cyclization_type: mainchain  # native: N(res241)-C(res255) backbone amide (head-to-tail)
 
   cpsea_1M46:
     source: cpsea
@@ -431,6 +434,7 @@ target_dict_cfg:
     hotspot_residues: []
     binder_length: [5, 16]
     pdb_id: null
+    cyclization_type: isopeptide  # native: NZ(Lys27)-CG(Asp39) side-chain isopeptide
 
   cpsea_1MU2:
     source: cpsea
@@ -440,3 +444,4 @@ target_dict_cfg:
     hotspot_residues: []
     binder_length: [5, 16]
     pdb_id: null
+    cyclization_type: isopeptide  # native: NZ(Lys790)-CG(Asp805) side-chain isopeptide

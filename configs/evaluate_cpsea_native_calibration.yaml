@@ -1,0 +1,86 @@
+# CPSea native-complex calibration.
+#
+# Scores the REAL crystallographic cyclic peptide from each target through the exact same
+# harness the designs go through, to establish what the `protein_binder` success criteria
+# (i_pAE*31 <= 7.0, pLDDT >= 0.9, scRMSD_ca < 1.5) actually score on a known-good answer.
+#
+# Why this run exists: every CPSea design run ever recorded -- 10 runs x 5 targets x 3
+# sequence types -- has a pass rate of exactly 0.0. A criterion that has never fired for any
+# model cannot distinguish between models, and two of the three are suspected unreachable
+# for a 5-16-residue macrocycle: AF2 refolds the binder as a LINEAR peptide, with no
+# macrocycle bond, so it predicts a floppy short chain and returns low pLDDT / high i_pAE by
+# construction. If the native peptide also scores 0.0, the thresholds are disproven for this
+# molecule class and this run hands us the achievable ceiling to recalibrate them against.
+#
+# Mirrors the design eval deliberately (colabdesign/AF2, sequence_types [self]) -- a ceiling
+# measured with a different folding backend would not be comparable to the numbers it is
+# meant to calibrate.
+#
+# Usage (one target at a time; each has a different target structure):
+#   complexa analysis configs/evaluate_cpsea_native_calibration.yaml \
+#       run_name=native_calib_cpsea_1E2T \
+#       dataset.task_name=cpsea_1E2T \
+#       sample_storage_path=./calibration_native/cpsea_1E2T/processed
+
+defaults:
+  # `/targets/...`, not `generation/...` -- the latter is what `evaluate_from_pdb_dir.yaml` says
+  # and it does not resolve (there is no `configs/generation/targets_dict.yaml`). That config is
+  # stale; copy this line, not that one.
+  - /targets/targets_dict@dataset
+  - _self_
+
+run_name: native_calib_cpsea_1E2T
+ckpt_path: native
+ckpt_name: crystal_structure
+
+protein_type: binder
+input_mode: pdb_dir
+
+sample_storage_path: ./calibration_native/cpsea_1E2T/processed
+output_dir: ./evaluation_results/${run_name}
+
+ignore_generated_pdb_suffix: "_binder.pdb"
+
+ncpus_: 24
+seed: 5
+eval_njobs: 1
+dryrun: false
+show_progress: true
+
+dataset:
+  task_name: cpsea_1E2T
+
+metric:
+  compute_binder_metrics: true
+
+  # MUST match the design eval's backend. The design runs used colabdesign (their job dirs
+  # contain AF2/), and pLDDT/i_pAE are not comparable across folding models.
+  binder_folding_method: colabdesign
+
+  # `self` only: the native sequence refolded as-is IS the ceiling. Running ProteinMPNN over
+  # a natural macrocycle would redesign away the very chemistry being calibrated (it is
+  # cyclization-blind and rewrites the anchor residues), which is a design experiment, not a
+  # measurement of what a real answer scores.
+  sequence_types: [self]
+
+  num_redesign_seqs: 8
+  interface_cutoff: 8.0
+  inverse_folding_model: soluble_mpnn
+  compute_esm_metrics: false
+  ranking_criteria: null
+
+  # Rosetta + closure on the native complex: the interface-energy and ring-closure ceiling.
+  compute_pre_refolding_metrics: true
+  pre_refolding:
+    bioinformatics: false
+    tmol: false
+    rosetta: true
+    cyclization: true
+
+  compute_refolded_structure_metrics: false
+  refolded:
+    bioinformatics: false
+    tmol: false
+    rosetta: false
+
+  compute_monomer_metrics: false

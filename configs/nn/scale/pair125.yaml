@@ -1,0 +1,5 @@
+# @package _global_.nn
+# +25% pair representation width (c_pair).
+# Base: pair_repr_dim=256. Small param delta when update_pair_repr=false,
+# but increases pair-bias / cross-sequence pair projection capacity.
+pair_repr_dim: 320

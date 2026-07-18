@@ -1,0 +1,215 @@
+# @package _global_
+# TINY-SET OVERFIT SANITY TEST (near-deterministic memorisation diagnostic).
+#
+# Question: can the flow fit CPSea *at all*? 64 complexes, stochastic augmentations
+# and conditioning dropout disabled, AE target = encoder posterior *mean* (not sample),
+# train until it either memorises them or doesn't.
+#
+# Success criterion (read mid-t bins, not just the WandB scalar):
+#   - Mid-t bb_ca / local_latents (e.g. t in [0.4, 0.6]) dive near 0
+#     => the machinery works; a full-set plateau is a distribution / optimization
+#        problem (schedules, loss scales, data scale). Tune those next.
+#   - Still flat after mean targets + pinned hotspots/crops
+#     => implementation / target-construction / AE-interface bug. Fix that BEFORE
+#        touching loss weights or architecture.
+#
+# Why not "WandB totals -> 0":
+#   Logged train/loss_* totals are still x1 MSE * 1/(1-t)^2. t-binned curves
+#   (train/loss_*_t_*) are plain unscaled x1 MSE; empty bins log NaN, not 0.
+#
+# This is a diagnostic, not a model: it is *supposed* to overfit. Ignore val (val == train
+# here, deliberately, so val curves are a memorisation readout rather than a generalisation
+# one).
+#
+# Prepare the subset first (prefers complexes with peptide+receptor < 256):
+#   source env.sh
+#   python script_utils/make_cpsea_overfit_subset.py --n 64
+#
+# Run:
+#   CONFIG=example/training_cpsea_peptide_overfit \
+#     RUN_NAME=cpsea_overfit64_mean \
+#     WANDB_PROJECT=cpsea_cyclization \
+#     CHECKPOINT=false \
+#     bash ~/slurm/cpsea/cpsea_peptide_train_finetune.sh full
+#
+# Companion control -- same config, but from scratch instead of the Complexa prior. If the
+# finetune overfits and from-scratch does not (or vice versa), the pretrained prior is implicated:
+#   EXTRA_OVERRIDES="++pretrain_ckpt_path=null"
+#
+# After ~2k epochs:
+#   - Mid-t bins collapse  => prior overfit plateau was a false floor; return to full-set
+#     schedules / Exp A-D knobs.
+#   - Still flat           => run diagnose_ae_latents.py on the same overfit parquet before
+#     touching architecture.
+
+run_name: cpsea_overfit64_mean
+
+hardware:
+  ncpus_per_task_train_: 4
+  ncpus_per_task_prepro_: 4
+  accelerator: gpu
+  ngpus_per_node_: 1
+  nnodes_: 1
+
+defaults:
+  - /nn: local_latents_score_nn_160M_binder
+  - /generation: validation_local_latents
+  - /dataset/unified: cpsea_peptide
+  - _self_
+
+pretrain_ckpt_path: ${oc.env:CKPT_PATH}/complexa.ckpt
+autoencoder_ckpt_path: ${oc.env:CPSEA_AE_CKPT_PATH}
+
+freeze_autoencoder: true
+ae_reg_weight: 1.0
+
+# Deterministic AE flow target (Exp A): no posterior sampling noise floor.
+local_latent_target: mean
+log_latent_diagnostics: true
+log_t_binned_losses: true
+t_bins: [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]
+
+nn:
+  feats_cond_seq: ["time_emb_bb_ca", "time_emb_local_latents", "cyclization_type_emb"]
+  cyc_emb_dim: 256
+
+product_flowmatcher:
+  bb_ca:
+    zero_com_noise: False
+    guidance_enabled: true
+    dim: 3
+  local_latents:
+    zero_com_noise: False
+    guidance_enabled: True
+    dim: null
+
+loss:
+  t_distribution:
+    bb_ca:
+      name: mix_unif_beta
+      p1: 1.9
+      p2: 1.0
+      p3: 0.02
+      # Bound 1/(1-t)^2 reweight so late-t spikes do not dominate the logged scalar.
+      loss_t_clamp: 0.9
+    local_latents:
+      name: uniform
+      p1: 1.0
+      p2: 1.0
+      loss_t_clamp: 0.9
+    shared_groups: []
+
+force_precision_f32: True
+
+training:
+  n_recycle: 0
+  motif_conditioning: False
+  # Off for pure memorisation: self-cond injects a second input mode 50% of the time.
+  self_cond: False
+  fold_cond: False
+  target_cond: False
+  # All conditioning dropout off: every step sees the same, fully-specified inputs. With dropout
+  # on, the "same" example is a different learning problem each epoch and a nonzero loss floor
+  # would be expected rather than diagnostic.
+  mask_T_prob: 0.0
+  mask_A_prob: 0.0
+  mask_C_prob: 0.0
+  fold_label_sample_ratio: [0.5, 0.1, 0.15, 0.25]
+  p_folding_n_inv_folding_iters: 0.0
+  cyclization_type_dropout_rate: 0.0
+
+cyclization:
+  enabled: true
+  loss_weight: 0.1
+  hidden_dim: 256
+  detach_link_inputs: true
+  force_gold_valid: true
+  allow_asn_gln_isopeptide: true
+  type_conditioning: true
+  target_type: null
+
+lora:
+  r: null
+  lora_alpha: 32.0
+  lora_dropout: 0.0
+  train_bias: none
+
+dataset:
+  datamodule:
+    # val == train, on purpose: this run measures memorisation, not generalisation.
+    metadata_file: ${oc.env:CPSEA_DATA_PATH}/preprocessed/metadata/cpsea_train_overfit64.parquet
+    val_metadata_file: ${oc.env:CPSEA_DATA_PATH}/preprocessed/metadata/cpsea_train_overfit64.parquet
+    batch_size: 8
+    num_workers: 4
+
+    # Full transform list, copied from dataset/unified/cpsea_peptide.yaml with every stochastic
+    # augmentation removed or pinned. Kept in sync by hand -- if the base list changes, change
+    # this one too.
+    atom37_transforms:
+      - _target_: proteinfoundation.datasets.transforms.SegmentAwareResidueFeaturesTransform
+        cn_break_cutoff: 2.0
+        segment_fix_level: full
+      - _target_: proteinfoundation.datasets.transforms.CoordsToNanometers
+      # GlobalRotationTransform dropped: random global rotation is the one augmentation left that
+      # makes each epoch's tensors differ. Dropping it makes the 64 examples literally fixed.
+      - _target_: proteinfoundation.datasets.transforms.CroppingTransform2
+        # Large enough that CroppingTransform2 always early-returns (no random target crop).
+        crop_size: 4096
+        interface_threshold: 8.0
+        dist_mode: "bb_ca"
+        data_mode: "all-atom"
+        crop_binder: false
+        binder_min_length: 5
+        binder_max_length: 16
+        binder_padding_length: 0
+        target_min_length: 30
+        target_spatial_crop_threshold: 15.0
+        max_num_target_chains: -1
+      - _target_: proteinfoundation.datasets.transforms.ContactTransform
+        cutoff: 8.0
+        # Pin hotspots to *all* interface residues every epoch (dropout alone is not enough:
+        # min_perc/max_perc subset sampling was still random).
+        min_perc: 1.0
+        max_perc: 1.0
+        contact_prob: 1.0
+        contact_dropout_prob: 0.0
+        hotspot_dropout_prob: 0.0
+      - _target_: proteinfoundation.datasets.transforms.OpenFoldFrameTransform
+      - _target_: proteinfoundation.datasets.transforms.ChainBreakPerResidueTransform
+      - _target_: proteinfoundation.datasets.transforms.CenteringTransform
+        center_mode: "target"
+        data_mode: "all-atom"
+      - _target_: proteinfoundation.datasets.transforms.ExtractTargetCoordinatesTransform
+        compact_mode: true
+      - _target_: proteinfoundation.datasets.transforms.FilterTargetResiduesTransform
+      - _target_: proteinfoundation.datasets.transforms.CyclizationLabelTransform
+        default_binder_chain_id: "B"
+
+opt:
+  lr: 0.0001
+  warmup_steps: 0
+  # 64 examples / batch 8 = 8 steps per epoch, so 2000 epochs ~= 16k steps.
+  max_epochs: 2000
+  accumulate_grad_batches: 1
+  skip_nan_grad: True
+  grad_and_weight_analysis: False
+  dist_strategy: auto
+  val_check_interval: 999999
+  limit_train_batches: null
+
+log:
+  wandb_project: cpsea_cyclization
+  log_wandb: True
+  log_every_n_steps: 8  # once per epoch
+  checkpoint: False
+  checkpoint_every_n_steps: null
+  last_ckpt_every_n_steps: 2000
+  save_extra_checkpoints: false
+
+seed: 42
+
+ema:
+  decay: 0.999
+  validate_original_weights: False
+  every_n_steps: 1
+  cpu_offload: False

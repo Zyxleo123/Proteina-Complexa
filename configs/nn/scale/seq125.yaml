@@ -1,0 +1,9 @@
+# @package _global_.nn
+# +25% sequence trunk width (c_seq): token + conditioning embeddings.
+# Base 160M binder: token_dim=768, nheads=12, dim_cond/idx_emb/t_emb=256.
+# ~+56% total params (transformer FFN/attn scale ~dim^2).
+token_dim: 960
+nheads: 15
+dim_cond: 320
+idx_emb_dim: 320
+t_emb_dim: 320

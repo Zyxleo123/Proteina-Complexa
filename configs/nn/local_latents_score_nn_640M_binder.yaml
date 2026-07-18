@@ -1,0 +1,51 @@
+# ~640M-parameter binder flow model (~4× local_latents_score_nn_160M_binder).
+# Scaling: 2× width (token_dim 1536, nheads 24, head_dim 64), same depth (14 layers).
+# Measured: ~635M trainable params in LocalLatentsTransformer (latent_dim=8).
+#
+# Note: complexa.ckpt is 160M — use pretrain_ckpt_path: null for from-scratch flow
+# training, or expect partial / incompatible weight load if finetuning from 160M.
+
+name: local_latents_transformer
+
+output_parameterization:
+  bb_ca: v
+  local_latents: v
+
+nlayers: 14
+token_dim: 1536
+nheads: 24
+parallel_mha_transition: False
+
+strict_feats: False
+
+feats_seq: ["xt_bb_ca", "xt_local_latents", "x_sc_bb_ca", "x_sc_local_latents", "optional_ca_coors_nm_seq_feat", "optional_res_type_seq_feat", "hotspot_mask_seq", "res_seq_pdb_idx"]
+feats_cond_seq: ["time_emb_bb_ca", "time_emb_local_latents"]
+
+dim_cond: 512
+idx_emb_dim: 512
+t_emb_dim: 512
+
+feats_pair_repr: ["rel_seq_sep", "xt_bb_ca_pair_dists", "x_sc_bb_ca_pair_dists", "optional_ca_pair_dist", "chain_idx_pair", "hotspot_mask_pair"]
+feats_pair_cond: ["time_emb_bb_ca", "time_emb_local_latents"]
+
+concat_features:
+  enable_motif: false
+  enable_target: true
+  enable_ligand: false
+  motif_pair_features: false
+  target_pair_features: true
+  ligand_pair_features: false
+
+xt_pair_dist_dim: 30
+xt_pair_dist_min: 0.1
+xt_pair_dist_max: 3
+x_sc_pair_dist_dim: 30
+x_sc_pair_dist_min: 0.1
+x_sc_pair_dist_max: 3
+seq_sep_dim: 127
+pair_repr_dim: 512
+
+update_pair_repr: False
+update_pair_repr_every_n: 3
+use_tri_mult: False
+use_qkln: True

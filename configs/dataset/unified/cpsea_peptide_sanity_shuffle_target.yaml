@@ -1,10 +1,8 @@
-# CPSea cyclic peptide–receptor complexes (CPSea_PDB subset)
+# CPSea peptide dataset with target-residue order shuffled (sanity test).
 #
-# Data root: ${oc.env:CPSEA_DATA_PATH} (default: /zfsauton/scratch/yixiz/CPSea/CPSea_PDB)
-# Preprocess with: script_utils/preprocess_cpsea.py  (writes to $CPSEA_DATA_PATH/preprocessed)
-# Output PDBs preserve remapped cyclization CONECT (ignored by training loaders).
-#
-# Pipeline: PDB → AtomArray → atom37 Data → atom37_transforms → model
+# Identical to cpsea_peptide.yaml except ShuffleTargetResidueOrderTransform runs after
+# segment detection + centering and before target extraction. Segment metadata travels
+# with each residue; binder order is unchanged.
 
 datamodule:
   _target_: proteinfoundation.datasets.structure_data.StructureDataModule
@@ -27,13 +25,9 @@ datamodule:
     - cyclization_type
 
   atom37_transforms:
-    # Must run first: detects continuous backbone segments (segment_id, pos_in_segment,
-    # effective_chain_id) from the raw, un-cropped, un-rotated residue order and Angstrom
-    # coordinates. CPSea receptor/target chains are discontinuous receptor/pocket crops;
-    # see docs/README_DATA_SEQ_BREAK_ISSUE.md.
     - _target_: proteinfoundation.datasets.transforms.SegmentAwareResidueFeaturesTransform
       cn_break_cutoff: 2.0
-      segment_fix_level: full  # mild | aggressive | full (see relaunch_cpseaae_seqfix_experiments.sh)
+      segment_fix_level: full
     - _target_: proteinfoundation.datasets.transforms.CoordsToNanometers
     - _target_: proteinfoundation.datasets.transforms.GlobalRotationTransform
     - _target_: proteinfoundation.datasets.transforms.CroppingTransform2
@@ -41,11 +35,6 @@ datamodule:
       interface_threshold: 8.0
       dist_mode: "bb_ca"
       data_mode: "all-atom"
-      # The binder is a covalent macrocycle: any contiguous crop severs the ring and drops its
-      # cyclization endpoints. Only the receptor may be cropped. (Cropping only fires at all for
-      # complexes >= crop_size residues -- 3.5% of cpsea_train -- so this was a silent
-      # corruption of a minority of rows, not all of them.)
-      crop_binder: false
       binder_min_length: 5
       binder_max_length: 16
       binder_padding_length: 0
@@ -64,12 +53,8 @@ datamodule:
     - _target_: proteinfoundation.datasets.transforms.CenteringTransform
       center_mode: "target"
       data_mode: "all-atom"
+    - _target_: proteinfoundation.datasets.transforms.ShuffleTargetResidueOrderTransform
+      enabled: true
     - _target_: proteinfoundation.datasets.transforms.ExtractTargetCoordinatesTransform
       compact_mode: true
     - _target_: proteinfoundation.datasets.transforms.FilterTargetResiduesTransform
-    # Must run after FilterTargetResiduesTransform: needs binder-local (0..L_b-1) indexing.
-    # Derives the single ground-truth cyclization edge (cyclization_i/j/type, has_cyclization)
-    # for the CyclizationLinkHead (see proteinfoundation.cyclization). Label-only; never
-    # touches coordinates. See configs/example/training_cpsea_peptide_smoke.yaml `cyclization:`.
-    - _target_: proteinfoundation.datasets.transforms.CyclizationLabelTransform
-      default_binder_chain_id: "B"
