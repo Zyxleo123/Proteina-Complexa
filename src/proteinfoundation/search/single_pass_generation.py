@@ -3,6 +3,7 @@
 This module provides a simple single-pass generation algorithm (no search).
 """
 
+from proteinfoundation.cyclization.inference import attach_cyclization_prediction
 from proteinfoundation.search.base_search import BaseSearch
 from proteinfoundation.search.search_utils import make_initial_search_tags
 from proteinfoundation.utils.sample_utils import prepend_target_to_samples, sample_formatting
@@ -29,6 +30,10 @@ class SinglePassGeneration(BaseSearch):
             data_modes=list(self.proteina.cfg_exp.product_flowmatcher),
             autoencoder=getattr(self.proteina, "autoencoder", None),
         )
+
+        # No-op unless cyclization.enabled=true. Indices are binder-local (0..L_b-1),
+        # matching the dataset convention -- computed before any target prepending below.
+        sample_prots = attach_cyclization_prediction(self.proteina, gen_samples, batch, sample_prots)
 
         # 1:1 with batch — no expansion, default repeat_mode is fine.
         if batch.get("prepend_target", False) and not hasattr(self.proteina, "ligand"):

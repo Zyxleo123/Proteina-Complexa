@@ -371,7 +371,20 @@ def combine_lookahead_and_final(
         Combined dict with coors, residue_type, mask, rewards (dict),
         sample_type, and metadata_tag.
     """
-    tensor_keys = ["coors", "residue_type", "mask", "chain_index"]
+    tensor_keys = [
+        "coors",
+        "residue_type",
+        "mask",
+        "chain_index",
+        # Cyclization prediction metadata (no-op / absent unless cyclization.enabled=true).
+        "pred_cyclization_i",
+        "pred_cyclization_j",
+        "pred_cyclization_type",
+        "pred_cyclization_confidence",
+        # Only present under cyclization.type_conditioning=true.
+        "cyclization_type_requested",
+        "cyclization_type_satisfied",
+    ]
     parts = []
     lookahead_rewards = None
 
@@ -414,7 +427,18 @@ def combine_lookahead_and_final(
     return combined
 
 
-_TENSOR_KEYS = ["coors", "residue_type", "mask", "chain_index"]
+_TENSOR_KEYS = [
+    "coors",
+    "residue_type",
+    "mask",
+    "chain_index",
+    "pred_cyclization_i",
+    "pred_cyclization_j",
+    "pred_cyclization_type",
+    "pred_cyclization_confidence",
+    "cyclization_type_requested",
+    "cyclization_type_satisfied",
+]
 
 
 def clone_sample_dict(d: dict[str, Any]) -> dict[str, Any]:
