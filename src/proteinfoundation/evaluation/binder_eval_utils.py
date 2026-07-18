@@ -13,6 +13,8 @@ import os
 from typing import Any
 
 import numpy as np
+
+from proteinfoundation.evaluation.cyclization_pdb_metrics import CYCLIZATION_METRIC_COLS
 from atomworks.io.utils.io_utils import load_any
 from biotite.structure import filter_amino_acids
 from biotite.structure.io.pdb import PDBFile
@@ -70,6 +72,25 @@ TMOL_METRIC_COLS = [
     "total_interface_elec_energy_tmol",
     "n_interface_elec_interactions_tmol",
 ]
+
+try:
+    from proteinfoundation.evaluation.rosetta_energy import ROSETTA_METRIC_COLS
+except ImportError:
+    ROSETTA_METRIC_COLS = [
+        "binder_rosetta_dG_separated",
+        "binder_rosetta_dSASA_int",
+        "binder_rosetta_dSASA_hphobic",
+        "binder_rosetta_dSASA_polar",
+        "binder_rosetta_delta_unsatHbonds",
+        "binder_rosetta_sc_value",
+        "binder_rosetta_interface_delta_E",
+        "binder_rosetta_nres_int",
+        "binder_rosetta_hbonds_int",
+        "binder_rosetta_packstat",
+        "binder_rosetta_dG_separated_norelax",
+        "binder_rosetta_total_score_norelax",
+        "binder_rosetta_total_score_relaxed",
+    ]
 
 # =============================================================================
 # Ranking Criteria Functions
@@ -193,6 +214,8 @@ def select_best_sample_idx(
 def get_metric_columns(
     compute_bioinformatics: bool = False,
     compute_tmol: bool = False,
+    compute_rosetta: bool = False,
+    compute_cyclization: bool = False,
 ) -> list[str]:
     """
     Get list of metric columns based on which metrics are enabled.
@@ -200,6 +223,8 @@ def get_metric_columns(
     Args:
         compute_bioinformatics: Whether bioinformatics metrics are enabled
         compute_tmol: Whether TMOL metrics are enabled
+        compute_rosetta: Whether PyRosetta interface energy metrics are enabled
+        compute_cyclization: Whether macrocycle closure metrics are enabled
 
     Returns:
         List of metric column names
@@ -209,6 +234,10 @@ def get_metric_columns(
         cols.extend(BIOINFORMATICS_METRIC_COLS)
     if compute_tmol:
         cols.extend(TMOL_METRIC_COLS)
+    if compute_rosetta:
+        cols.extend(ROSETTA_METRIC_COLS)
+    if compute_cyclization:
+        cols.extend(CYCLIZATION_METRIC_COLS)
     return cols
 
 

@@ -27,11 +27,15 @@ from proteinfoundation.evaluation.binder_eval_utils import (
     DEFAULT_NUM_REDESIGN_SEQS_LIGAND,
     DEFAULT_NUM_REDESIGN_SEQS_PROTEIN,
     DEFAULT_PROTEIN_RANKING_CRITERIA,
+    ROSETTA_METRIC_COLS,
     TMOL_METRIC_COLS,
     get_binder_chain_from_complex,
     get_metric_columns,
     select_best_sample_idx,
     validate_ranking_criteria,
+)
+from proteinfoundation.evaluation.cyclization_pdb_metrics import (
+    compute_cyclization_metrics_single,
 )
 from proteinfoundation.evaluation.esm_eval import ESM_AVAILABLE, compute_esm_ppl_for_sequences
 from proteinfoundation.evaluation.utils import maybe_tqdm, parse_cfg_for_table
@@ -60,6 +64,20 @@ try:
     PR_ALTERNATIVE_AVAILABLE = True
 except (ImportError, RuntimeError, OSError) as e:
     logger.warning(f"PR Alternative import failed: {e}. Bioinformatics metrics will return NaN.")
+
+# PyRosetta interface energy (PepGLAD-style dG_separated) - optional dependency
+PYROSETTA_AVAILABLE = False
+try:
+    from proteinfoundation.evaluation.rosetta_energy import (
+        compute_rosetta_interface_metrics_single,
+        is_pyrosetta_available,
+    )
+
+    PYROSETTA_AVAILABLE = is_pyrosetta_available()
+    if not PYROSETTA_AVAILABLE:
+        logger.warning("PyRosetta is not installed. Rosetta interface energy metrics will return NaN.")
+except (ImportError, RuntimeError, OSError) as e:
+    logger.warning(f"Rosetta energy import failed: {e}. Rosetta metrics will return NaN.")
 
 
 # =============================================================================
@@ -416,6 +434,22 @@ def compute_tmol_metrics_single(
         return dict.fromkeys(TMOL_METRIC_COLS, np.nan)
 
 
+def compute_rosetta_metrics_single(
+    pdb_path: str,
+    binder_chain: str,
+    target_chain: str,
+) -> dict[str, Any]:
+    """Compute PyRosetta InterfaceAnalyzerMover metrics for a single PDB."""
+    if not PYROSETTA_AVAILABLE:
+        return dict.fromkeys(ROSETTA_METRIC_COLS, np.nan)
+
+    try:
+        return compute_rosetta_interface_metrics_single(pdb_path, binder_chain, target_chain)
+    except Exception as e:
+        logger.error(f"Rosetta metrics failed for {pdb_path}: {e}")
+        return dict.fromkeys(ROSETTA_METRIC_COLS, np.nan)
+
+
 # =============================================================================
 # Interface Metrics - Unified Computation
 # =============================================================================
@@ -425,6 +459,9 @@ def compute_interface_metrics(
     pdb_paths: list[str],
     compute_bioinformatics: bool = False,
     compute_tmol: bool = False,
+    compute_rosetta: bool = False,
+    compute_cyclization: bool = False,
+    cyclization_type: str | None = None,
     sc_bin: str | None = None,
     show_progress: bool = False,
 ) -> list[dict[str, Any]]:
@@ -441,6 +478,11 @@ def compute_interface_metrics(
         pdb_paths: List of PDB file paths
         compute_bioinformatics: Whether to compute bioinformatics metrics (SC, SASA, hydrophobicity)
         compute_tmol: Whether to compute TMOL force field metrics
+        compute_rosetta: Whether to compute PyRosetta interface energy (dG_separated, etc.)
+        compute_cyclization: Whether to measure macrocycle closure on the binder chain.
+            Only meaningful on GENERATED structures -- a refold has no closing bond.
+        cyclization_type: The cyclization type the model was conditioned on, if any.
+            Enables `binder_cyc_type_satisfied` (did the model build what it was told to).
         sc_bin: Path to shape complementarity binary (for bioinformatics)
         show_progress: Whether to show progress bar
 
@@ -457,6 +499,10 @@ def compute_interface_metrics(
         enabled_metrics.append("bioinformatics")
     if compute_tmol:
         enabled_metrics.append("tmol")
+    if compute_rosetta:
+        enabled_metrics.append("rosetta")
+    if compute_cyclization:
+        enabled_metrics.append("cyclization")
 
     logger.info(f"Computing interface metrics for {len(pdb_paths)} PDBs: {enabled_metrics}")
 
@@ -471,6 +517,9 @@ def compute_interface_metrics(
 
     if compute_tmol and not TMOL_AVAILABLE:
         logger.warning("TMOL metrics requested but TMOL not available. Metrics will be NaN.")
+
+    if compute_rosetta and not PYROSETTA_AVAILABLE:
+        logger.warning("Rosetta metrics requested but PyRosetta not available. Metrics will be NaN.")
 
     # Initialize TMOL model lazily if needed and available
     tmol_model = None
@@ -513,6 +562,21 @@ def compute_interface_metrics(
             logger.info("Computing TMOL metrics...")
             metrics.update(compute_tmol_metrics_single(pdb_path, tmol_model))
 
+        # PyRosetta interface energy metrics
+        if compute_rosetta:
+            if multi_target:
+                logger.info("Multi-target complex detected. Rosetta interface metrics will be NaN.")
+                metrics.update(dict.fromkeys(ROSETTA_METRIC_COLS, np.nan))
+            else:
+                logger.info("Computing Rosetta interface energy metrics...")
+                metrics.update(compute_rosetta_metrics_single(pdb_path, binder_chain, target_chain))
+
+        # Macrocycle closure. Cheap (a PDB parse and one distance), and it is the only
+        # metric here that can see the ring at all -- every other column is computed on a
+        # linear-peptide view of the binder.
+        if compute_cyclization:
+            metrics.update(compute_cyclization_metrics_single(pdb_path, binder_chain, cyclization_type))
+
         results.append(metrics)
 
     logger.info(f"Interface metrics complete: {len(results)} PDBs processed")
@@ -524,6 +588,9 @@ def compute_interface_metrics_df(
     pdb_paths: list[str],
     compute_bioinformatics: bool = False,
     compute_tmol: bool = False,
+    compute_rosetta: bool = False,
+    compute_cyclization: bool = False,
+    cyclization_type: str | None = None,
     sc_bin: str | None = None,
     show_progress: bool = False,
 ) -> pd.DataFrame:
@@ -538,6 +605,7 @@ def compute_interface_metrics_df(
         pdb_paths: List of PDB file paths
         compute_bioinformatics: Whether to compute bioinformatics metrics
         compute_tmol: Whether to compute TMOL metrics
+        compute_rosetta: Whether to compute PyRosetta interface energy metrics
         sc_bin: Path to shape complementarity binary
         show_progress: Whether to show progress bar
 
@@ -551,6 +619,9 @@ def compute_interface_metrics_df(
         pdb_paths=pdb_paths,
         compute_bioinformatics=compute_bioinformatics,
         compute_tmol=compute_tmol,
+        compute_rosetta=compute_rosetta,
+        compute_cyclization=compute_cyclization,
+        cyclization_type=cyclization_type,
         sc_bin=sc_bin,
         show_progress=show_progress,
     )
@@ -565,6 +636,8 @@ def compute_interface_metrics_df(
     metric_cols = get_metric_columns(
         compute_bioinformatics=compute_bioinformatics,
         compute_tmol=compute_tmol,
+        compute_rosetta=compute_rosetta,
+        compute_cyclization=compute_cyclization,
     )
 
     all_columns = columns + ["id_gen", "pdb_path"] + metric_cols
@@ -631,6 +704,7 @@ def compute_interface_metrics_on_refolded_structures(
     cfg: DictConfig,
     compute_bioinformatics: bool = False,
     compute_tmol: bool = False,
+    compute_rosetta: bool = False,
     show_progress: bool = False,
 ) -> pd.DataFrame:
     """
@@ -643,13 +717,14 @@ def compute_interface_metrics_on_refolded_structures(
         cfg: Full configuration.
         compute_bioinformatics: Whether to compute bioinformatics metrics (SC, SASA, hydrophobicity).
         compute_tmol: Whether to compute TMOL force field metrics.
+        compute_rosetta: Whether to compute PyRosetta interface energy metrics.
         show_progress: Whether to show progress bar (default: False).
 
     Returns:
         DataFrame with added refolded structure metrics.
     """
     # Check if any metrics requested
-    if not any([compute_bioinformatics, compute_tmol]):
+    if not any([compute_bioinformatics, compute_tmol, compute_rosetta]):
         return df
 
     successful_samples = []
@@ -679,6 +754,8 @@ def compute_interface_metrics_on_refolded_structures(
         enabled_metrics.append("bioinformatics")
     if compute_tmol:
         enabled_metrics.append("TMOL")
+    if compute_rosetta:
+        enabled_metrics.append("rosetta")
 
     logger.info(f"Computing metrics [{', '.join(enabled_metrics)}] on {len(successful_samples)} refolded structures")
 
@@ -703,6 +780,7 @@ def compute_interface_metrics_on_refolded_structures(
             pdb_paths=structure_paths,
             compute_bioinformatics=compute_bioinformatics,
             compute_tmol=compute_tmol,
+            compute_rosetta=compute_rosetta,
             show_progress=show_progress,
         )
 

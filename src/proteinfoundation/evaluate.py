@@ -36,6 +36,7 @@ Usage:
         protein_type=monomer metric.compute_monomer_metrics=true
 """
 
+import contextlib
 import os
 import random
 import sys
@@ -61,6 +62,7 @@ from omegaconf import DictConfig
 
 from proteinfoundation.evaluation.binder_eval import (  # Availability flags for optional dependencies
     PR_ALTERNATIVE_AVAILABLE,
+    PYROSETTA_AVAILABLE,
     TMOL_AVAILABLE,
     compute_binder_metrics,
     compute_interface_metrics_df,
@@ -82,6 +84,7 @@ from proteinfoundation.evaluation.utils import (
     split_by_job_generated,
     split_pdb_files_by_job,
 )
+from proteinfoundation.evaluation.wandb_logging import log_evaluation_results_to_wandb
 
 # Import shared column filtering from analysis utilities
 from proteinfoundation.result_analysis.analysis_utils import SEQUENCE_TYPES, filter_columns_for_csv
@@ -239,6 +242,9 @@ def print_dryrun_summary(
     logger.info(
         f"  PR Alternative (bioinformatics): {'Available' if PR_ALTERNATIVE_AVAILABLE else 'NOT AVAILABLE - metrics will be NaN'}"
     )
+    logger.info(
+        f"  PyRosetta (interface dG): {'Available' if PYROSETTA_AVAILABLE else 'NOT AVAILABLE - metrics will be NaN'}"
+    )
 
     cfg_metric = cfg.get("metric", {})
     logger.info("\nMetrics to compute:")
@@ -264,12 +270,15 @@ def print_dryrun_summary(
             pre_cfg = cfg_metric.get("pre_refolding", {})
             bio_enabled = pre_cfg.get("bioinformatics", True)
             tmol_enabled = pre_cfg.get("tmol", True)
+            rosetta_enabled = pre_cfg.get("rosetta", False)
 
             bio_status = "" if PR_ALTERNATIVE_AVAILABLE else " [UNAVAILABLE]"
             tmol_status = "" if TMOL_AVAILABLE else " [UNAVAILABLE]"
+            rosetta_status = "" if PYROSETTA_AVAILABLE else " [UNAVAILABLE]"
 
             logger.info(f"        bioinformatics (SC/SASA): {bio_enabled}{bio_status}")
             logger.info(f"        tmol (force field): {tmol_enabled}{tmol_status}")
+            logger.info(f"        rosetta (interface dG): {rosetta_enabled}{rosetta_status}")
 
         # Refolded structure metrics with granular flags
         refolded_enabled = cfg_metric.get("compute_refolded_structure_metrics", False)
@@ -278,12 +287,15 @@ def print_dryrun_summary(
             refolded_cfg = cfg_metric.get("refolded", {})
             bio_enabled = refolded_cfg.get("bioinformatics", True)
             tmol_enabled = refolded_cfg.get("tmol", True)
+            rosetta_enabled = refolded_cfg.get("rosetta", False)
 
             bio_status = "" if PR_ALTERNATIVE_AVAILABLE else " [UNAVAILABLE]"
             tmol_status = "" if TMOL_AVAILABLE else " [UNAVAILABLE]"
+            rosetta_status = "" if PYROSETTA_AVAILABLE else " [UNAVAILABLE]"
 
             logger.info(f"        bioinformatics (SC/SASA): {bio_enabled}{bio_status}")
             logger.info(f"        tmol (force field): {tmol_enabled}{tmol_status}")
+            logger.info(f"        rosetta (interface dG): {rosetta_enabled}{rosetta_status}")
 
     if run_motif:
         # Mirror the actual default logic from motif_eval.compute_motif_metrics:
@@ -401,15 +413,29 @@ def _add_pre_refolding_metrics(
     pre_refolding_cfg = cfg_metric.get("pre_refolding", {})
     compute_bioinformatics = pre_refolding_cfg.get("bioinformatics", True)
     compute_tmol = pre_refolding_cfg.get("tmol", True)
+    compute_rosetta = pre_refolding_cfg.get("rosetta", False)
+    compute_cyclization = pre_refolding_cfg.get("cyclization", False)
+
+    # The type the generator was told to build, so closure can be scored against the
+    # request rather than against whatever the model happened to produce. Lives on the
+    # generation-side dataset config (see `binder_generate.yaml`), which is where it was
+    # set; re-deriving it here would let the two disagree silently.
+    cyclization_type = None
+    with contextlib.suppress(Exception):
+        cyclization_type = cfg.dataloader.dataset.conditional_features[0].get("cyclization_type")
 
     enabled = []
     if compute_bioinformatics:
         enabled.append("bioinformatics")
     if compute_tmol:
         enabled.append("TMOL")
+    if compute_rosetta:
+        enabled.append("rosetta")
+    if compute_cyclization:
+        enabled.append(f"cyclization(requested={cyclization_type})")
     logger.info(f"Pre-refolding metrics enabled: {enabled}")
 
-    if not any([compute_bioinformatics, compute_tmol]):
+    if not any([compute_bioinformatics, compute_tmol, compute_rosetta, compute_cyclization]):
         return df
 
     try:
@@ -418,6 +444,9 @@ def _add_pre_refolding_metrics(
             pdb_paths=gen_structure_paths,
             compute_bioinformatics=compute_bioinformatics,
             compute_tmol=compute_tmol,
+            compute_rosetta=compute_rosetta,
+            compute_cyclization=compute_cyclization,
+            cyclization_type=cyclization_type,
             show_progress=show_progress,
         )
         gen_columns = {
@@ -465,6 +494,7 @@ def _add_refolded_structure_metrics(
     refolded_cfg = cfg_metric.get("refolded", {})
     compute_bioinformatics = refolded_cfg.get("bioinformatics", True)
     compute_tmol = refolded_cfg.get("tmol", True)
+    compute_rosetta = refolded_cfg.get("rosetta", False)
 
     df = compute_interface_metrics_on_refolded_structures(
         df=df,
@@ -473,6 +503,7 @@ def _add_refolded_structure_metrics(
         cfg=cfg,
         compute_bioinformatics=compute_bioinformatics,
         compute_tmol=compute_tmol,
+        compute_rosetta=compute_rosetta,
         show_progress=show_progress,
     )
 
@@ -989,6 +1020,15 @@ def main(cfg: DictConfig) -> None:
     for name, df in all_results.items():
         logger.info(f"  {name:16s}  {len(df)} rows  ->  {name}_results_{config_name}_{job_id}.csv")
     logger.info("=" * 70)
+
+    log_evaluation_results_to_wandb(
+        all_results=all_results,
+        cfg=cfg,
+        job_id=job_id,
+        evaluation_time=evaluation_time,
+        nsamples=nsamples,
+        config_name=config_name,
+    )
 
 
 if __name__ == "__main__":

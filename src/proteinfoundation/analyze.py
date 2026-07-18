@@ -985,7 +985,15 @@ def _get_interface_metric_columns(seq_type: str) -> list[str]:
         f"refolded_{seq_type}_binder_interface_hydrophobicity",
         f"refolded_{seq_type}_binder_interface_nres",
     ]
-    return ff_metrics + bio_metrics
+    rosetta_metrics = [
+        "generated_binder_rosetta_dG_separated",
+        "generated_binder_rosetta_dSASA_int",
+        "generated_binder_rosetta_sc_value",
+        f"refolded_{seq_type}_binder_rosetta_dG_separated",
+        f"refolded_{seq_type}_binder_rosetta_dSASA_int",
+        f"refolded_{seq_type}_binder_rosetta_sc_value",
+    ]
+    return ff_metrics + bio_metrics + rosetta_metrics
 
 
 def aggregate_interface_metrics_for_successful_samples(
