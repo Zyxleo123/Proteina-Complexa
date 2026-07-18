@@ -341,6 +341,10 @@ class StructureDataset(Dataset):
             return None
         # Convert to atom37
         data = atomarray_to_atom37(atom_array, sample_id=str(sample_id), atomworks_data=data)
+        # Stash the resolved file path (distinct from any `path` metadata column, which is
+        # excluded from propagation below since it equals `self.path_column`). Used e.g. by
+        # `CyclizationLabelTransform` to re-read CONECT records the atom-array loader discards.
+        data.file_path = str(path)
         # Propagate metadata columns (e.g. binder_chain_id for CPSea) in simple mode
         if not self._use_pipeline_mode:
             for col in row.index:

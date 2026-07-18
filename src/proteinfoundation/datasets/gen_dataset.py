@@ -12,6 +12,7 @@ from rdkit import Chem
 from torch.nn import functional as F
 from torch.utils.data import Dataset
 
+from proteinfoundation.cyclization.constants import NAME_TO_CYCLIZATION_TYPE, UNSPECIFIED
 from proteinfoundation.datasets.atomworks_ligand_transforms import get_af3_raw_molecule_features, get_laplacian_pe
 from proteinfoundation.nn.feature_factory.feature_utils import BOND_ORDER_MAP
 from proteinfoundation.utils.motif_utils import parse_motif, save_motif_csv
@@ -379,6 +380,27 @@ class MotifFeatures(ConditionalFeature):
         return result
 
 
+def _parse_cyclization_type_request(cyclization_type: str | None) -> int | None:
+    """Resolve a configured cyclization-type name to its conditioning index.
+
+    Accepts a name from the canonical vocabulary ("mainchain", "disulfide", "isopeptide"),
+    or "unspecified" / None to leave the choice to the model. Raises on an unknown name
+    rather than falling through to UNSPECIFIED: a typo'd type would otherwise look exactly
+    like a successful run whose conditioning did nothing.
+    """
+    if cyclization_type is None:
+        return None
+    name = str(cyclization_type).strip().lower()
+    if name in ("", "none", "null", "unspecified"):
+        return UNSPECIFIED
+    if name not in NAME_TO_CYCLIZATION_TYPE:
+        raise ValueError(
+            f"Unknown cyclization_type {cyclization_type!r}. "
+            f"Expected one of {sorted(NAME_TO_CYCLIZATION_TYPE)}, 'unspecified', or null."
+        )
+    return NAME_TO_CYCLIZATION_TYPE[name]
+
+
 class TargetFeatures(ConditionalFeature):
     """
     ConditionalFeature for generating target structural features for binder design.
@@ -413,11 +435,13 @@ class TargetFeatures(ConditionalFeature):
         target_hotspots: list[int] | None = None,
         binder_center: list[float] | None = None,
         pdb_id: str | None = None,
+        cyclization_type: str | None = None,
     ):
         super().__init__()
         self.task_name = task_name
         self.binder_gen_only = binder_gen_only
         self.input_spec = input_spec
+        self.cyclization_type = _parse_cyclization_type_request(cyclization_type)
 
         # Validate pdb_path exists with helpful error message
         if not os.path.exists(pdb_path):
@@ -598,6 +622,14 @@ To fix:
         result["atomistic_target"] = (
             False  # hasattr(self, "target_laplacian_pes") and self.target_laplacian_pes[index] is not None # whether to prepend target to the generated sequence
         )
+        # The cyclization type the denoiser is conditioned on. Everywhere else this key comes
+        # from a CPSea *label* (`transforms.py`), which a design run has no access to -- it starts
+        # from a target spec, not a dataset row. Without it, `CyclizationTypeSeqFeat` silently
+        # falls back to UNSPECIFIED, so a type-conditioned model designs with its conditioning
+        # inert and simply picks whichever chemistry it likes. Setting it here is what makes
+        # "design me a disulfide-cyclized binder" an instruction rather than a hope.
+        if self.cyclization_type is not None:
+            result["cyclization_type_cond"] = torch.tensor(self.cyclization_type, dtype=torch.long)
         return result
 
 

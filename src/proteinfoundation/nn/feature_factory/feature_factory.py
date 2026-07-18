@@ -25,6 +25,7 @@ from proteinfoundation.nn.feature_factory.pair_feats import (
     CrossSequenceOptionalCaPairDistancesPairFeat,
     CrossSequenceRelativeSequenceSeparationPairFeat,
     CrossSequenceXscBBCAPairwiseDistancesPairFeat,
+    CyclizationGraphPositionalPairFeat,
     HotspotMaskPairFeat,
     OptionalCaCoorsNanometersPairwiseDistancesPairFeat,
     RelativeResidueOrientationPairFeat,
@@ -37,6 +38,7 @@ from proteinfoundation.nn.feature_factory.seq_cond_feats import (
     ChainBreakPerResidueSeqFeat,
     ChainIdxSeqFeat,
     ContactTypeSeqFeat,
+    CyclizationTypeSeqFeat,
     FoldEmbeddingSeqFeat,
     HotspotMaskSeqFeat,
     IdxEmbeddingSeqFeat,
@@ -129,6 +131,10 @@ class FeatureFactory(torch.nn.Module):
                 - "stochastic_translation": Stochastic translation from centering
                 - "contact_type_seq": Contact composition features
 
+            Cyclization:
+                - "cyclization_type_emb": Desired cyclization type, broadcast over residues
+                  (requires CyclizationLabelTransform; UNSPECIFIED when absent)
+
         Pair features include:
             Distance features:
                 - "xt_bb_ca_pair_dists": Target backbone CA pairwise distances
@@ -172,6 +178,13 @@ class FeatureFactory(torch.nn.Module):
                 - "hotspot_idx_pair": Target hotspot pairwise features
                 - "contact_type_pair": Contact composition pairwise features
                 - "target_mask_pair": Target mask pairwise features
+
+            Cyclization:
+                - "cyclization_ring_pe": Geodesic distance on the cycle graph (chain +
+                  the REQUESTED closing edge) plus a closing-edge indicator, so the two
+                  ends of a macrocycle read as topological neighbours instead of L-1
+                  apart. Zero unless a cyclization is requested; endpoints fall back to
+                  the binder termini when unlabeled.
         """
         super().__init__()
         self.mode = mode
@@ -296,6 +309,10 @@ class FeatureFactory(torch.nn.Module):
             elif f == "contact_type_seq":
                 return ContactTypeSeqFeat(**kwargs)
 
+            # Cyclization features
+            elif f == "cyclization_type_emb":
+                return CyclizationTypeSeqFeat(**kwargs)
+
             # Special/utility features
             elif f == "zero_feat_seq":
                 return ZeroFeat(**kwargs)
@@ -362,6 +379,10 @@ class FeatureFactory(torch.nn.Module):
             # Chain and indexing features
             elif f == "chain_idx_pair":
                 return ChainIdxPairFeat(**kwargs)
+
+            # Cyclization features
+            elif f == "cyclization_ring_pe":
+                return CyclizationGraphPositionalPairFeat(**kwargs)
 
             # Design and contact features
             elif f == "hotspot_mask_pair":

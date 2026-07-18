@@ -262,9 +262,13 @@ class ProductSpaceFlowMatcher(L.LightningModule):
         Order when both are enabled: raw loss -> divide by dim -> multiply by weight.
 
         When either modification actually changes a modality's loss (dim-normalization enabled,
-        or that modality's weight != 1.0), the unmodified raw loss is also returned under the key
-        `f"{data_mode}_raw_justlog"` (excluded from the training loss sum via the `_justlog`
-        suffix, logged only) so raw vs. effective losses can be compared without ambiguity.
+        or that modality's weight != 1.0), the unmodified raw (still time-scaled) loss is also
+        returned under `f"{data_mode}_raw_justlog"` (excluded from the training loss sum via
+        the `_justlog` suffix, logged only) so raw vs. effective losses can be compared.
+
+        Always also returns `f"{data_mode}_unscaled_justlog"`: plain x1 MSE *before* the
+        `1/(1-t)^2` time reweight. Used by t-binned diagnostics; training still optimizes the
+        scaled loss under `data_mode`.
 
         Args:
             batch: Input batch containing x_1, x_0, t, mask, etc
@@ -281,7 +285,7 @@ class ProductSpaceFlowMatcher(L.LightningModule):
 
         loss = {}
         for data_mode in self.data_modes:
-            raw_loss = self.base_flow_matchers[data_mode].compute_fm_loss(
+            raw_loss, unscaled_loss = self.base_flow_matchers[data_mode].compute_fm_loss(
                 x_0=batch["x_0"][data_mode],
                 x_1=batch["x_1"][data_mode],
                 x_t=batch["x_t"][data_mode],
@@ -298,6 +302,7 @@ class ProductSpaceFlowMatcher(L.LightningModule):
             effective_loss = effective_loss * weight
 
             loss[data_mode] = effective_loss
+            loss[f"{data_mode}_unscaled_justlog"] = unscaled_loss
             if modifies_loss:
                 loss[f"{data_mode}_raw_justlog"] = raw_loss
         return loss

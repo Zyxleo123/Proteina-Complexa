@@ -119,6 +119,118 @@ class SequenceSeparationPairFeat(Feature):
         return feat
 
 
+class CyclizationGraphPositionalPairFeat(Feature):
+    """Cycle-aware graph positional encoding, shape [b, n, n, ring_sep_dim + 1].
+
+    ``SequenceSeparationPairFeat`` above tells the model that residues 0 and 11 of a
+    head-to-tail cyclized 12-mer are **11 apart**. In the macrocycle they are
+    covalently bonded -- topological distance **1**. The positional encoding is
+    actively lying about the topology, and it is precisely that lie which makes ring
+    closure hard: nothing in the representation says those two residues are
+    neighbours. This feature tells the truth, as the geodesic distance on the *cycle
+    graph* (the residue chain plus the closing edge), plus a channel marking the
+    closing edge itself.
+
+    **Conditioned on the REQUESTED cyclization, never a predicted one.** Feeding a
+    *predicted* cyclization back in would be fragile exactly where it matters: at
+    high noise / low `t` the prediction is wrong, so the graph would inject wrong
+    topology. That is not what this is. In a design setting the cyclization is not
+    discovered, it is *specified* ("give me a disulfide-cyclized 12-mer") -- so the
+    cycle graph is a conditioning input, constant across all `t`, with the same
+    status as the target and the hotspots. No feedback loop, and the low-`t` failure
+    mode never arises.
+
+    Resolution of the two inputs, in both training and design:
+      - **Endpoints**: ``cyclization_i``/``cyclization_j`` when the batch carries them
+        (the CPSea training labels); otherwise the binder termini, which is what every
+        native and generated cyclic peptide measured here actually closes.
+      - **Active**: ``cyclization_type_cond != UNSPECIFIED``. That key is what the
+        type-dropout handler rewrites and what the generation pipeline stamps, so
+        dropped rows, unlabeled rows, and unconditional sampling all correctly get the
+        all-zero feature -- the cycle graph and the type conditioning switch off
+        together, as one coherent request. Batches with no cyclization keys at all
+        (non-CPSea) are inactive throughout, so this is a no-op for them.
+    """
+
+    def __init__(self, ring_sep_dim=32, **kwargs):
+        # +1 for the closing-edge indicator channel.
+        super().__init__(dim=ring_sep_dim + 1)
+        self.ring_sep_dim = ring_sep_dim
+
+    def _resolve_active(self, batch, b, device):
+        """[b] bool: is a cyclization actually requested for this sample?"""
+        from proteinfoundation.cyclization.constants import UNSPECIFIED
+
+        if "cyclization_type_cond" in batch:
+            return batch["cyclization_type_cond"].to(device=device).long() != UNSPECIFIED
+        if "has_cyclization" in batch:
+            return batch["has_cyclization"].to(device=device).bool()
+        return torch.zeros(b, dtype=torch.bool, device=device)
+
+    def _resolve_endpoints(self, batch, mask, b, n, device):
+        """([b], [b]) long: closing-bond endpoints, defaulting to the binder termini."""
+        pos = torch.arange(n, device=device)[None, :].expand(b, n)
+        # First/last *valid* residue, rather than 0 and n-1, so right-padding can't
+        # put an endpoint on a padding token.
+        i = torch.where(mask, pos, torch.full_like(pos, n)).min(dim=1).values
+        j = torch.where(mask, pos, torch.full_like(pos, -1)).max(dim=1).values
+
+        if "cyclization_i" in batch and "cyclization_j" in batch:
+            ci = batch["cyclization_i"].to(device=device).long()
+            cj = batch["cyclization_j"].to(device=device).long()
+            # -1 is the "unknown label" sentinel; fall back to termini for those rows.
+            labeled = (ci >= 0) & (cj >= 0) & (ci < n) & (cj < n) & (ci != cj)
+            i = torch.where(labeled, ci, i)
+            j = torch.where(labeled, cj, j)
+
+        hi = max(n - 1, 0)
+        return i.clamp(0, hi), j.clamp(0, hi)
+
+    def forward(self, batch):
+        b, n = self.extract_bs_and_n(batch)
+        device = self.extract_device(batch)
+        if "mask" in batch:
+            mask = batch["mask"].bool()
+        else:
+            mask = torch.ones(b, n, dtype=torch.bool, device=device)
+
+        active = self._resolve_active(batch, b, device)  # [b]
+        i, j = self._resolve_endpoints(batch, mask, b, n, device)  # [b], [b]
+
+        # Chain topology is tensor order: the modelled sequence is the binder alone
+        # (the receptor is separate conditioning), a single contiguous chain, so
+        # |a - c| is exactly the number of peptide bonds between two residues.
+        pos = torch.arange(n, device=device)
+        a = pos[None, :, None].expand(b, n, n)
+        c = pos[None, None, :].expand(b, n, n)
+        chain_sep = (a - c).abs()  # [b, n, n]
+
+        # Geodesic on (chain + closing edge): either walk the chain directly, or
+        # detour through the closing bond in one of its two orientations.
+        ii, jj = i[:, None, None], j[:, None, None]
+        geodesic = torch.minimum(
+            chain_sep,
+            torch.minimum(
+                (a - ii).abs() + 1 + (c - jj).abs(),
+                (a - jj).abs() + 1 + (c - ii).abs(),
+            ),
+        )  # [b, n, n]
+
+        geo_onehot = torch.nn.functional.one_hot(
+            geodesic.clamp(min=0, max=self.ring_sep_dim - 1).long(),
+            num_classes=self.ring_sep_dim,
+        ).float()  # [b, n, n, ring_sep_dim]
+
+        # Which pair *is* the bond -- the type says what to build, this says where.
+        is_closing = (((a == ii) & (c == jj)) | ((a == jj) & (c == ii))).float()[..., None]
+
+        feat = torch.cat([geo_onehot, is_closing], dim=-1)  # [b, n, n, ring_sep_dim + 1]
+        # Inactive rows emit exactly zero rather than the plain chain separation:
+        # that information is already in `rel_seq_sep`, and zeroing keeps this feature
+        # purely a cyclization signal with a clean null for classifier-free guidance.
+        return feat * active[:, None, None, None].float()
+
+
 class XtBBCAPairwiseDistancesPairFeat(Feature):
     """Computes pairwise distances for CA backbone atoms and returns feature of shape [b, n, n, dim_pair_dist]."""
 

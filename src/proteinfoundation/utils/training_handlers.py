@@ -7,6 +7,8 @@ import random
 from collections.abc import Callable
 from typing import Any
 
+import torch
+
 from proteinfoundation.utils.fold_utils import mask_cath_code_by_level
 
 
@@ -148,6 +150,38 @@ def handle_motif_dropout(batch: dict, motif_dropout_rate: float) -> dict:
     return batch
 
 
+def handle_cyclization_type_dropout(batch: dict, dropout_rate: float) -> dict:
+    """
+    Randomly replace the desired-cyclization-type input with UNSPECIFIED.
+
+    This is what lets a single model serve both regimes: rows that keep their
+    gold type train the conditional ``p(i, j | type)``, while dropped rows train
+    the unconditional joint ``p(i, j, type)`` -- which both preserves the old
+    behavior as a special case and keeps cross-type negatives in the loss so the
+    head does not forget how to discriminate types. It also makes the
+    ``UNSPECIFIED`` embedding a usable null for classifier-free guidance.
+
+    Unlike ``handle_target_dropout`` (which drops for the whole batch), this drops
+    per-sample, so every step gets gradient from both objectives.
+
+    Args:
+        batch: Training batch, optionally with a `cyclization_type_cond` [B] tensor.
+        dropout_rate: Probability of replacing a sample's type with UNSPECIFIED.
+
+    Returns:
+        Modified batch.
+    """
+    if dropout_rate <= 0 or "cyclization_type_cond" not in batch:
+        return batch
+
+    from proteinfoundation.cyclization.constants import UNSPECIFIED
+
+    cond = batch["cyclization_type_cond"]
+    drop = torch.rand(cond.shape, device=cond.device) < dropout_rate
+    batch["cyclization_type_cond"] = torch.where(drop, torch.full_like(cond, UNSPECIFIED), cond)
+    return batch
+
+
 def handle_batch_conditioning(
     batch: dict,
     bs: int,
@@ -159,9 +193,9 @@ def handle_batch_conditioning(
     Apply all training-time conditioning handlers with safe config access.
 
     Handles CATH code conditioning, self-conditioning, target conditioning,
-    target dropout, folding/inverse folding, and recycling. Uses _safe_get for
-    all config values so missing keys default to disabled/zero and training
-    does not fail.
+    target dropout, cyclization-type dropout, folding/inverse folding, and
+    recycling. Uses _safe_get for all config values so missing keys default to
+    disabled/zero and training does not fail.
 
     Args:
         batch: Training batch.
@@ -169,7 +203,7 @@ def handle_batch_conditioning(
         training_cfg: Training config (OmegaConf or dict). Keys: fold_cond,
             mask_T_prob, mask_A_prob, mask_C_prob, target_cond, self_cond,
             n_recycle, p_folding_n_inv_folding_iters, target_dropout_rate,
-            motif_dropout_rate.
+            motif_dropout_rate, cyclization_type_dropout_rate.
         call_nn_fn: Function(batch, n_recycle) -> nn_out for self-conditioning.
         fm: Flow matcher with nn_out_to_clean_sample_prediction.
 
@@ -183,9 +217,13 @@ def handle_batch_conditioning(
     # target_cond = _safe_get(training_cfg, "target_cond", False)
     target_dropout_rate = _safe_get(training_cfg, "target_dropout_rate", 0.0)
     motif_dropout_rate = _safe_get(training_cfg, "motif_dropout_rate", 0.0)
+    cyclization_type_dropout_rate = _safe_get(training_cfg, "cyclization_type_dropout_rate", 0.0)
     n_recycle = handle_recycling(training_cfg)
 
     batch = handle_cath_code_cond(batch, bs, fold_cond, mask_T_prob, mask_A_prob, mask_C_prob)
+    # Must run before self-conditioning, so the inner NN call sees the same
+    # (possibly dropped) type the outer one will.
+    batch = handle_cyclization_type_dropout(batch, cyclization_type_dropout_rate)
     batch = handle_self_cond(batch, training_cfg, call_nn_fn, fm)
     # DEPRECATED: target conditioning is now handled via conditional features
     # in the data pipeline, not during the training step.

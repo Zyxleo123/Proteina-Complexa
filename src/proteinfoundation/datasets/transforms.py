@@ -214,6 +214,66 @@ class SegmentAwareResidueFeaturesTransform(BaseTransform):
         return graph
 
 
+class ShuffleTargetResidueOrderTransform(BaseTransform):
+    """Randomly permute tensor order among target residues only; binder order is unchanged.
+
+    Sanity-test transform for segment-aware feature construction. Segment metadata
+    (``segment_id``, ``pos_in_segment``, ``effective_chain_id``) is computed on the
+    original backbone/file order by ``SegmentAwareResidueFeaturesTransform`` and moves
+    with each residue when target rows are shuffled. With a correct segment-aware
+    feature pipeline, shuffling target tensor order must not re-introduce spurious
+    polymer adjacency in ``chain_idx`` / ``seq_sep`` features.
+
+    Must run after ``target_mask`` exists (post-crop) and before
+    ``ExtractTargetCoordinatesTransform``.
+    """
+
+    def __init__(self, enabled: bool = True):
+        self.enabled = enabled
+
+    def __call__(self, graph: Data) -> Data:
+        if not self.enabled:
+            graph.sanity_target_shuffled = False
+            return graph
+
+        if not hasattr(graph, "target_mask") or graph.target_mask is None:
+            logger.warning("ShuffleTargetResidueOrderTransform: target_mask missing, skipping shuffle")
+            graph.sanity_target_shuffled = False
+            return graph
+
+        target_residue_mask = graph.target_mask.sum(dim=-1).bool()
+        target_idx = torch.where(target_residue_mask)[0]
+        if target_idx.numel() <= 1:
+            graph.sanity_target_shuffled = False
+            return graph
+
+        perm = torch.randperm(target_idx.numel(), device=target_idx.device)
+        n = int(target_residue_mask.shape[0])
+        skip_keys = {
+            "num_nodes",
+            "sanity_target_shuffled",
+            "original_residue_count",
+            "binder_residue_count",
+            "target_residue_count",
+        }
+
+        for key in list(graph.keys()):
+            if key in skip_keys or key.startswith("target_"):
+                continue
+            val = getattr(graph, key)
+            if isinstance(val, torch.Tensor) and val.dim() > 0 and val.shape[0] == n:
+                subset = val[target_idx].clone()
+                val[target_idx] = subset[perm]
+            elif isinstance(val, list) and len(val) == n:
+                subset = [val[int(i)] for i in target_idx.tolist()]
+                shuffled = [subset[int(i)] for i in perm.tolist()]
+                for pos, new_val in zip(target_idx.tolist(), shuffled, strict=True):
+                    val[pos] = new_val
+
+        graph.sanity_target_shuffled = True
+        return graph
+
+
 class PaddingTransform(BaseTransform):
     def __init__(self, max_size=256, fill_value=0):
         self.max_size = max_size
@@ -571,6 +631,7 @@ class CroppingTransform2(BaseTransform):
         target_min_length: int = 50,
         enforce_target_min_length: bool = False,
         max_num_target_chains: int = -1,  # -1 for no limit
+        crop_binder: bool = True,
     ):
         """
         Args:
@@ -585,6 +646,10 @@ class CroppingTransform2(BaseTransform):
             enforce_target_min_length: whether to enforce the target chain to have at least target_min_length residues after cropping.
                 If True, target might have more chains than max_num_target_chains. Default is True.
             max_num_target_chains: the maximum number of target chains to include in the cropping, -1 for no limit. Default is -1.
+            crop_binder: whether the binder chain may itself be cropped to a random contiguous
+                subsequence. Must be False for covalently cyclic binders (CPSea): a contiguous
+                crop severs the macrocycle, silently turning a ring into an open fragment and
+                dropping its cyclization endpoints. Only the target is cropped when False.
         """
         self.crop_size = crop_size
         self.interface_threshold = interface_threshold
@@ -597,6 +662,7 @@ class CroppingTransform2(BaseTransform):
         self.target_min_length = target_min_length
         self.enforce_target_min_length = enforce_target_min_length
         self.max_num_target_chains = max_num_target_chains
+        self.crop_binder = crop_binder
         assert self.binder_min_length >= 2 * self.binder_padding_length + 1, (
             "binder_min_length must be >= 2 * binder_padding_length + 1"
         )
@@ -686,21 +752,25 @@ class CroppingTransform2(BaseTransform):
         if len(graph.chains) < self.crop_size:
             return graph
 
-        # Contiguous cropping on the binder chain
-        binder_length = int(torch.randint(self.binder_min_length, self.binder_max_length + 1, (1,))[0])
         binder_chain_start = chain_residue_ranges[binder_chain_id][0]
         binder_chain_end = chain_residue_ranges[binder_chain_id][1]
-        binder_left_length = int(
-            torch.randint(
-                self.binder_padding_length,
-                binder_length - self.binder_padding_length - 1 + 1,
-                (1,),
-            )[0]
-        )
-        binder_chain_crop_start = max(binder_chain_start, binder_seed_residue - binder_left_length)
-        binder_chain_crop_end = min(binder_chain_end + 1, binder_chain_crop_start + binder_length)
-        if binder_chain_crop_end == binder_chain_end + 1:
-            binder_chain_crop_start = max(binder_chain_start, binder_chain_crop_end - binder_length)
+        if self.crop_binder:
+            # Contiguous cropping on the binder chain
+            binder_length = int(torch.randint(self.binder_min_length, self.binder_max_length + 1, (1,))[0])
+            binder_left_length = int(
+                torch.randint(
+                    self.binder_padding_length,
+                    binder_length - self.binder_padding_length - 1 + 1,
+                    (1,),
+                )[0]
+            )
+            binder_chain_crop_start = max(binder_chain_start, binder_seed_residue - binder_left_length)
+            binder_chain_crop_end = min(binder_chain_end + 1, binder_chain_crop_start + binder_length)
+            if binder_chain_crop_end == binder_chain_end + 1:
+                binder_chain_crop_start = max(binder_chain_start, binder_chain_crop_end - binder_length)
+        else:
+            binder_chain_crop_start = binder_chain_start
+            binder_chain_crop_end = binder_chain_end + 1
         binder_chain_crop_idxs = torch.arange(binder_chain_crop_start, binder_chain_crop_end)
         selected_idxs[binder_chain_crop_idxs] = True
 
@@ -2748,6 +2818,105 @@ class FilterTargetResiduesTransform(BaseTransform):
         if hasattr(graph, "binder_residue_mask"):
             delattr(graph, "binder_residue_mask")
 
+        return graph
+
+
+class CyclizationLabelTransform(BaseTransform):
+    """Derives the single ground-truth cyclization edge label for CPSea binders.
+
+    This is a *label-only* transform: it never touches coordinates and does
+    not enforce any chemical geometry. It must run after
+    `FilterTargetResiduesTransform` so that `residue_pdb_idx` / `num_nodes`
+    already refer to the binder-local (0..L_b-1) residue set.
+
+    Sets on the graph:
+        cyclization_i, cyclization_j: int, binder-local residue indices
+            (sorted i < j), or -1 if unknown.
+        cyclization_type: int in {0=MAINCHAIN, 1=DISULFIDE, 2=ISOPEPTIDE}, or
+            -1 if unknown. This is the *supervision target*.
+        cyclization_type_cond: same value, but with UNSPECIFIED (3) instead of -1
+            for unlabeled samples. This is the *conditioning input* fed to the
+            network, so it must always be a valid embedding index.
+        has_cyclization: bool, False whenever the type/endpoints could not be
+            inferred safely (excluded from linkage loss downstream).
+
+    Ground truth `type` comes *exclusively* from `CONECT` records in the
+    preprocessed PDB (`graph.file_path`), classified by the identity of the
+    bonded atoms (e.g. CYS:SG<->CYS:SG => DISULFIDE, terminal N<->C =>
+    MAINCHAIN, LYS:NZ<->acid/amide side chain => ISOPEPTIDE). Residue type
+    and terminal position alone are never sufficient to assign a type. The
+    dataset metadata `cyclization_type` string column (coarser, and itself
+    just a summary of the same CONECT records) is used only as a diagnostic
+    cross-check, not to assign `i`/`j`/`type`. See
+    `proteinfoundation.cyclization.parse_labels.infer_cyclization_label`.
+    """
+
+    def __init__(self, default_binder_chain_id: str = "B", log_every: int = 200):
+        self.default_binder_chain_id = default_binder_chain_id
+        self.log_every = log_every
+        self._counts: Counter = Counter()
+        self._type_counts: Counter = Counter()
+
+    def __call__(self, graph: Data) -> Data:
+        from proteinfoundation.cyclization.constants import (
+            CYCLIZATION_TYPE_TO_NAME,
+            NO_CYCLIZATION_INDEX,
+            UNSPECIFIED,
+        )
+        from proteinfoundation.cyclization.parse_labels import infer_cyclization_label
+
+        binder_chain_id = getattr(graph, "binder_chain_id", None) or self.default_binder_chain_id
+        cyclization_type_hint = getattr(graph, "cyclization_type", None)
+        peptide_length_hint = getattr(graph, "peptide_length", None)
+        pdb_path = getattr(graph, "file_path", None)
+        residue_pdb_idx = getattr(graph, "residue_pdb_idx", None)
+
+        label = {
+            "i": NO_CYCLIZATION_INDEX,
+            "j": NO_CYCLIZATION_INDEX,
+            "type": NO_CYCLIZATION_INDEX,
+            "has_cyclization": False,
+            "reason": "no_residue_pdb_idx",
+        }
+        if residue_pdb_idx is not None and len(residue_pdb_idx) >= 2:
+            try:
+                label = infer_cyclization_label(
+                    pdb_path=str(pdb_path) if pdb_path is not None else None,
+                    residue_pdb_idx=residue_pdb_idx,
+                    binder_length_hint=peptide_length_hint,
+                    binder_chain_id=str(binder_chain_id),
+                    cyclization_type_hint=(str(cyclization_type_hint) if cyclization_type_hint is not None else None),
+                )
+            except Exception as e:  # noqa: BLE001 - never let a bad label crash data loading
+                logger.warning(f"CyclizationLabelTransform failed for {getattr(graph, 'id', '?')}: {e}")
+                label = {
+                    "i": NO_CYCLIZATION_INDEX,
+                    "j": NO_CYCLIZATION_INDEX,
+                    "type": NO_CYCLIZATION_INDEX,
+                    "has_cyclization": False,
+                    "reason": f"exception:{type(e).__name__}",
+                }
+
+        graph.cyclization_i = int(label["i"])
+        graph.cyclization_j = int(label["j"])
+        graph.cyclization_type = int(label["type"])
+        graph.has_cyclization = bool(label["has_cyclization"])
+        # Conditioning input: unlabeled samples become UNSPECIFIED rather than -1,
+        # since this indexes an embedding table.
+        graph.cyclization_type_cond = int(label["type"]) if graph.has_cyclization else UNSPECIFIED
+
+        self._counts["total"] += 1
+        if graph.has_cyclization:
+            self._counts["labeled"] += 1
+            self._type_counts[CYCLIZATION_TYPE_TO_NAME.get(graph.cyclization_type, "unknown")] += 1
+        else:
+            self._counts["missing"] += 1
+        if self.log_every > 0 and self._counts["total"] % self.log_every == 0:
+            logger.info(
+                f"[CyclizationLabelTransform] sanity total={self._counts['total']} "
+                f"labeled={self._counts['labeled']} missing={self._counts['missing']} "
+                f"types={dict(self._type_counts)}"
+            )
         return graph
 
 

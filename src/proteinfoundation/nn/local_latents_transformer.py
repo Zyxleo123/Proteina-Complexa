@@ -85,6 +85,7 @@ class LocalLatentsTransformer(torch.nn.Module):
                     enable_motif=concat_config.get("enable_motif", False),
                     enable_target=concat_config.get("enable_target", False),
                     enable_ligand=concat_config.get("enable_ligand", False),
+                    dim_pair_out=kwargs["pair_repr_dim"],
                     **kwargs,
                 )
                 from loguru import logger

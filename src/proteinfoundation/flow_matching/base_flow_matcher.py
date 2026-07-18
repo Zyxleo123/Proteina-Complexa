@@ -174,7 +174,7 @@ class BaseFlowMatcher:
         t: torch.Tensor,
         x_1_pred: torch.Tensor,
         loss_t_clamp: float = 1.0,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Computes flow matching loss per element in the batch.
 
@@ -191,7 +191,10 @@ class BaseFlowMatcher:
                 use such a reweighting can ignore this.
 
         Returns:
-            Loss per batch element, shape [b]
+            Tuple (scaled_loss, unscaled_loss) per batch element, each shape [b].
+            Scaled is what training optimizes; unscaled is plain reconstruction error
+            before any 1/(1-t)^2 (or similar) reweight. Implementations that don't
+            time-reweight may return the same tensor twice.
         """
         raise NotImplementedError(ABS_CLASS_ERR_MSG)
 

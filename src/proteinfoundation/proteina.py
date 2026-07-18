@@ -1,4 +1,5 @@
 import copy
+import math
 import os
 import random
 from functools import partial
@@ -10,8 +11,26 @@ from jaxtyping import Float
 from lightning.pytorch.utilities.rank_zero import rank_zero_only
 from loguru import logger
 from omegaconf import OmegaConf
+from torchmetrics import MeanMetric
 
+from proteinfoundation.eval.ae_reconstruction_eval import (
+    run_ae_reconstruction_eval,
+    run_four_way_decode_eval,
+)
+from proteinfoundation.cyclization.inference import attach_cyclization_prediction
+from proteinfoundation.eval.cyclic_reconstruction_metrics import (
+    CYCLIC_METRIC_COUNT_FOR_SUFFIX,
+    NM_TO_ANG,
+    cyclic_geometry_metrics,
+)
+from proteinfoundation.eval.cyclic_reconstruction_metrics import CYCLIC_COUNT_SUFFIXES
+from proteinfoundation.eval.sampled_binder_metrics import (
+    CYCLIC_PRED_ONLY_SUFFIXES,
+    atom37_mask_from_aatype,
+    sampled_binder_metrics,
+)
 from proteinfoundation.flow_matching.product_space_flow_matcher import ProductSpaceFlowMatcher
+from proteinfoundation.logging.metric_schema import finalize_metrics, init_metric_dict
 from proteinfoundation.nn.genie2 import Genie2Denoiser
 from proteinfoundation.utils.file_utils import create_dir as _create_dir
 from proteinfoundation.utils.sample_utils import add_clean_samples, sample_formatting
@@ -48,6 +67,41 @@ from proteinfoundation.utils.fold_utils import extract_cath_code_from_batch
 from proteinfoundation.utils.pdb_utils import write_prot_to_pdb
 
 create_dir = rank_zero_only(_create_dir)
+
+
+def _index_pytree(obj, idx: torch.Tensor, batch_size: int):
+    """Recursively indexes every batch-first tensor in a (possibly nested) dict along dim 0.
+
+    Used to build a "sub-batch"/"sub-nn_out" restricted to the samples in one `t` bin, so
+    diagnostics that are otherwise only computed once per whole batch (e.g. the four-way
+    decode eval) can be re-run per bin. Only tensors whose leading dim equals `batch_size`
+    are indexed; everything else (scalars, strings, already batch-size-independent tensors)
+    is passed through unchanged.
+    """
+    if torch.is_tensor(obj):
+        if obj.dim() >= 1 and obj.shape[0] == batch_size:
+            return obj[idx]
+        return obj
+    if isinstance(obj, dict):
+        return {k: _index_pytree(v, idx, batch_size) for k, v in obj.items()}
+    return obj
+
+
+def _cyclic_metric_weight(key: str, metrics: dict[str, float], default: int) -> float:
+    """Epoch-aggregation weight for one logged metric.
+
+    Cyclic metrics are averages over only the examples of their cyclization family (see
+    `cyclic_geometry_metrics`), so weighting them by the full batch size overweights
+    batches that happened to contain few -- or, worse, credits a batch that contained
+    none. Weight each by its family's `n_valid_*` count instead, which
+    `cyclic_geometry_metrics` emits under the same prefix. Everything else keeps the
+    batch size.
+    """
+    prefix, _, suffix = key.rpartition("/")
+    count_suffix = CYCLIC_METRIC_COUNT_FOR_SUFFIX.get(suffix)
+    if count_suffix is None:
+        return default
+    return float(metrics.get(f"{prefix}/{count_suffix}", default))
 
 
 class Proteina(L.LightningModule):
@@ -116,6 +170,30 @@ class Proteina(L.LightningModule):
             if self.autoencoder is not None:
                 cfg_exp.product_flowmatcher.local_latents.dim = self.latent_dim
 
+            # AE reconstruction diagnostic (Part 2) and four-way decode diagnostic (Part 3):
+            # cyclic-geometry-aware reconstruction metrics logged during validation to isolate
+            # whether low latent/bb_ca loss corresponds to good decoded (cyclic) geometry, and
+            # whether failures come from the decoder, predicted Ca, predicted latent, or both.
+            # Default ON whenever an autoencoder is configured (opt-out via
+            # `++reconstruction_eval_enabled=false` / `++four_way_decode_eval_enabled=false`);
+            # both are no-ops (never called) when `self.autoencoder is None`.
+            self.reconstruction_eval_enabled = bool(cfg_exp.get("reconstruction_eval_enabled", True))
+            self.four_way_decode_eval_enabled = bool(cfg_exp.get("four_way_decode_eval_enabled", True))
+            self._ae_source_logged = False
+
+        # SAMPLING validation (`validation_step_generate`). Everything above is teacher-forced --
+        # `x_t` is built from the true `x_1`, so the model is handed most of the answer and can look
+        # healthy while its ODE-integrated samples are garbage. This is the only metric group that
+        # scores what the model actually generates. Off by default (it costs an ODE integration).
+        self.val_gen_cfg = cfg_exp.get("val_generation", None)
+        self.val_gen_enabled = bool(self.val_gen_cfg.get("enabled", False)) if self.val_gen_cfg else False
+        self._val_gen_sampler_warned = False
+
+        # NaN-safe epoch aggregation for metrics that are legitimately NaN on some steps (empty
+        # t-bins, absent cyclization chemistries, ...). See `log_nan_safe` for why `self.log`'s
+        # `reduce_fx` cannot do this. Populated lazily, keyed by sanitized metric name.
+        self._nan_mean_metrics = torch.nn.ModuleDict()
+
         self.fm = ProductSpaceFlowMatcher(cfg_exp)
 
         # Neural network
@@ -141,6 +219,128 @@ class Proteina(L.LightningModule):
 
         # For autoguidance, overridden in `self.configure_inference`
         self.nn_ag = None
+
+        self._init_cyclization_head(cfg_exp)
+        self._init_cyclization_bond_loss(cfg_exp)
+
+    def _init_cyclization_head(self, cfg_exp):
+        """Optionally builds the CPSea cyclization-linkage prediction head.
+
+        This is a classifier-only auxiliary head (see `proteinfoundation.cyclization`):
+        it predicts the single cyclization edge `(i, j, type)` of a cyclic peptide
+        binder. Entirely opt-in via `cyclization.enabled` and isolated from the rest
+        of the model -- disabled by default, so it never changes existing behavior.
+        """
+        cyclization_cfg = cfg_exp.get("cyclization", None) or {}
+        self.cyclization_enabled = bool(cyclization_cfg.get("enabled", False))
+        self.cyclization_loss_weight = float(cyclization_cfg.get("loss_weight", 0.1))
+        self.cyclization_detach_link_inputs = bool(cyclization_cfg.get("detach_link_inputs", True))
+        self.cyclization_force_gold_valid = bool(cyclization_cfg.get("force_gold_valid", True))
+        self.cyclization_allow_asn_gln_isopeptide = bool(cyclization_cfg.get("allow_asn_gln_isopeptide", True))
+        # CPSea cyclizes between the termini in 520/520 sampled binders, all three types. Holding
+        # every type to that pair (as MAINCHAIN already is) removes the inference-time escape hatch
+        # that let disulfide/isopeptide argmax onto whichever pair was already closest to a bond.
+        self.cyclization_terminal_only = bool(cyclization_cfg.get("terminal_only", False))
+        self.cyclization_type_conditioning = bool(cyclization_cfg.get("type_conditioning", False))
+        self.cyclization_target_type = self._resolve_cyclization_target_type(cyclization_cfg.get("target_type", None))
+        self.cyclization_head = None
+        if not self.cyclization_enabled:
+            return
+
+        if "local_latents" not in cfg_exp.product_flowmatcher or getattr(self, "autoencoder", None) is None:
+            raise ValueError(
+                "cyclization.enabled=true requires the 'local_latents' data mode with an "
+                "autoencoder (decoded AA probabilities are used as head input)."
+            )
+
+        from proteinfoundation.cyclization import CyclizationLinkHead
+
+        hidden_dim = int(cyclization_cfg.get("hidden_dim", 256))
+        single_dim = self.latent_dim + 20  # predicted clean local latent + decoded AA probabilities
+        self.cyclization_head = CyclizationLinkHead(single_dim=single_dim, hidden_dim=hidden_dim)
+        logger.info(
+            f"Cyclization link head enabled (single_dim={single_dim}, hidden_dim={hidden_dim}, "
+            f"loss_weight={self.cyclization_loss_weight}, detach_link_inputs={self.cyclization_detach_link_inputs}, "
+            f"type_conditioning={self.cyclization_type_conditioning}, target_type={self.cyclization_target_type})"
+        )
+
+        if self.cyclization_type_conditioning:
+            self._warn_on_vacuous_type_conditioning(cfg_exp)
+
+    def _init_cyclization_bond_loss(self, cfg_exp):
+        """Optionally enables the two-sided closing-bond distance loss.
+
+        Complementary to, and independent of, the linkage head: the head cannot
+        *perceive* whether the bond closes (it is a classifier over endpoints), and
+        nothing else in the objective says the bond *length* matters. Opt-in via
+        `cyclization.bond_loss.enabled`; off by default, so existing runs are
+        unchanged.
+        """
+        bond_cfg = (cfg_exp.get("cyclization", None) or {}).get("bond_loss", None) or {}
+        self.cyclization_bond_loss_enabled = bool(bond_cfg.get("enabled", False))
+        self.cyclization_bond_loss_weight = float(bond_cfg.get("loss_weight", 0.05))
+        self.cyclization_bond_loss_t_lower = float(bond_cfg.get("t_lower_lim", 0.5))
+        if not self.cyclization_bond_loss_enabled:
+            return
+
+        if "local_latents" not in cfg_exp.product_flowmatcher or getattr(self, "autoencoder", None) is None:
+            raise ValueError(
+                "cyclization.bond_loss.enabled=true requires the 'local_latents' data mode with an "
+                "autoencoder: the bond distance only exists once the predicted latents are decoded "
+                "to all-atom coordinates."
+            )
+        logger.info(
+            f"Cyclization bond loss enabled (loss_weight={self.cyclization_bond_loss_weight}, "
+            f"t_lower_lim={self.cyclization_bond_loss_t_lower})"
+        )
+
+    def _warn_on_vacuous_type_conditioning(self, cfg_exp):
+        """Warns about the two ways type conditioning silently degrades into a no-op."""
+        # 1. Without `cyclization_type_emb` in the denoiser's conditioning features, the
+        #    requested type reaches the head but never the flow model -- so generation is
+        #    still cyclization-blind and can emit a sequence that cannot support the request.
+        feats_cond_seq = list(cfg_exp.nn.get("feats_cond_seq", []) or [])
+        if "cyclization_type_emb" not in feats_cond_seq:
+            logger.warning(
+                "cyclization.type_conditioning=true but 'cyclization_type_emb' is not in "
+                f"nn.feats_cond_seq ({feats_cond_seq}). The requested type will condition the "
+                "linkage head but NOT the denoiser, so the model may generate sequences that "
+                "cannot support it. Use configs/nn/local_latents_score_nn_640M_binder_cyc.yaml."
+            )
+
+        # 2. Every CPSea row carries a real type, so dropout is the only source of UNSPECIFIED
+        #    rows -- at 0.0 the null token is never trained and the head loses its cross-type
+        #    negatives, so it stops being able to discriminate types at all.
+        dropout = float(cfg_exp.get("training", {}).get("cyclization_type_dropout_rate", 0.0) or 0.0)
+        if dropout <= 0:
+            logger.warning(
+                "cyclization.type_conditioning=true but training.cyclization_type_dropout_rate=0. "
+                "The UNSPECIFIED token will never be trained and the head will see no cross-type "
+                "negatives. Set it to ~0.15 unless you deliberately want a conditional-only model."
+            )
+
+    @staticmethod
+    def _resolve_cyclization_target_type(target_type):
+        """Resolves the inference-time `cyclization.target_type` config value to an int index.
+
+        Accepts a name ("disulfide"), an int, or None/"unspecified" meaning "no type
+        requested" (which reproduces the unconditional joint behavior).
+        """
+        from proteinfoundation.cyclization.constants import NAME_TO_CYCLIZATION_TYPE
+
+        if target_type is None:
+            return None
+        if isinstance(target_type, str):
+            key = target_type.strip().lower()
+            if key in ("", "null", "none", "unspecified", "any"):
+                return None
+            if key not in NAME_TO_CYCLIZATION_TYPE:
+                raise ValueError(
+                    f"Unknown cyclization.target_type '{target_type}'. "
+                    f"Expected one of {sorted(NAME_TO_CYCLIZATION_TYPE)} or null."
+                )
+            return NAME_TO_CYCLIZATION_TYPE[key]
+        return int(target_type)
 
     def load_autoencoder(self, cfg_exp, freeze_params=True):
         """Loads autoencoder, if required."""
@@ -338,6 +538,19 @@ class Proteina(L.LightningModule):
         self.log_losses(bs=bs, losses=losses, log_prefix=log_prefix, batch=batch)
         train_loss = sum([torch.mean(losses[k]) for k in losses if "_justlog" not in k])
 
+        cyclization_metrics = {}
+        cyclization_loss_value = None
+        if self.cyclization_enabled:
+            cyclization_loss, cyclization_metrics = self.compute_cyclization_loss(
+                batch, nn_out, log_prefix=log_prefix, bs=bs
+            )
+            cyclization_loss_value = float(cyclization_loss.detach().item())
+            train_loss = train_loss + self.cyclization_loss_weight * cyclization_loss
+
+        if getattr(self, "cyclization_bond_loss_enabled", False):
+            bond_loss, _ = self.compute_cyclization_bond_loss(batch, nn_out, log_prefix=log_prefix, bs=bs)
+            train_loss = train_loss + self.cyclization_bond_loss_weight * bond_loss
+
         # Joint AE training: anchor the (now trainable) autoencoder with its own recon+KL
         # objective so the encoder cannot collapse the flow target `z` into something trivial.
         # The flow loss above already backprops into the encoder via x_1["local_latents"].
@@ -375,6 +588,16 @@ class Proteina(L.LightningModule):
             self.update_n_log_nsamples_processed(bs)
             self.log_nparams()
 
+        if val_step:
+            self.log_unified_validation_metrics(
+                batch=batch,
+                nn_out=nn_out,
+                losses=losses,
+                cyclization_metrics=cyclization_metrics,
+                cyclization_loss_value=cyclization_loss_value,
+                bs=bs,
+            )
+
         return train_loss
 
     def log_losses(
@@ -400,10 +623,13 @@ class Proteina(L.LightningModule):
             )
 
             if k in self.fm.data_modes and self.cfg_exp.get("log_t_binned_losses", False):
+                # Prefer pre-1/(1-t)^2 x1 MSE so mid-t bins are readable without undoing
+                # the time weight by hand. Falls back to the scaled loss if unscaled is absent.
+                unscaled_key = f"{k}_unscaled_justlog"
                 self.log_t_binned_loss(
                     bs=bs,
                     data_mode=k,
-                    per_sample_loss=losses[k],
+                    per_sample_loss=losses.get(unscaled_key, losses[k]),
                     batch=batch,
                     log_prefix=log_prefix,
                 )
@@ -441,6 +667,49 @@ class Proteina(L.LightningModule):
                     add_dataloader_idx=False,
                 )
 
+    def log_nan_safe(self, key: str, value, bs: int, on_step: bool) -> None:
+        """`self.log` for metrics whose per-step value is legitimately NaN sometimes.
+
+        Several diagnostics here are NaN by design on some steps: a t-bin with no samples in it, a
+        cyclization chemistry absent from the batch, an interface metric with no target. NaN (not 0)
+        is the honest value -- 0 would silently drag the average toward "perfect".
+
+        But NaN cannot be aggregated with `self.log`:
+          * `reduce_fx=torch.nanmean` raises MisconfigurationException -- Lightning only accepts
+            `reduce_fx` in {min, max, mean, sum} (logger_connector/result.py:_parse_reduce_fx).
+          * plain `mean` is worse than useless: a single NaN step poisons the whole epoch average.
+            With 5 t-bins at batch 6, some bin is empty in ~26% of steps, so essentially EVERY epoch
+            value would come out NaN.
+
+        Lightning's own error message gives the fix ("log a `torchmetrics.Metric` instance
+        instead"). `MeanMetric(nan_strategy="ignore")` *is* nanmean, and it performs its own
+        distributed sync -- hence `sync_dist=False`, or the value would be reduced twice.
+
+        Metrics are created lazily. That is safe under DDP: they carry buffers, not parameters, and
+        the key set is data-independent (fixed t-bins, fixed metric schema), so every rank ends up
+        creating the same ones in the same order. `metric_attribute` must be passed explicitly --
+        Lightning otherwise scans `named_modules()` to find the Metric it is being handed, and a
+        metric added to the ModuleDict *during* the step is not in the snapshot it searches, so it
+        raises "Could not find the LightningModule attribute for the torchmetrics.Metric logged".
+        """
+        safe = key.replace("/", "__").replace(".", "_")
+        if safe not in self._nan_mean_metrics:
+            self._nan_mean_metrics[safe] = MeanMetric(nan_strategy="ignore").to(self.device)
+        metric = self._nan_mean_metrics[safe]
+        metric(torch.as_tensor(value, dtype=torch.float32, device=self.device))
+        self.log(
+            key,
+            metric,
+            on_step=on_step,
+            on_epoch=True,
+            prog_bar=False,
+            logger=True,
+            batch_size=bs,
+            sync_dist=False,  # MeanMetric syncs itself; sync_dist=True would double-reduce.
+            add_dataloader_idx=False,
+            metric_attribute=f"_nan_mean_metrics.{safe}",
+        )
+
     def log_t_binned_loss(
         self,
         bs: int,
@@ -451,15 +720,13 @@ class Proteina(L.LightningModule):
     ):
         """Logs `per_sample_loss` for `data_mode` split into time bins (opt-in diagnostic).
 
-        Motivated by the FM loss's late-time reweighting (`1/(1-t)^2`): high average loss for a
-        modality can come from every t equally, or be concentrated near t -> 1. Binning tells
-        these apart. Default off (`log_t_binned_losses=false`), no effect on training.
+        Expects pre-scale (unweighted) x1 MSE when available via `*_unscaled_justlog`, so bin
+        curves are comparable across t without the `1/(1-t)^2` reweight. Default off
+        (`log_t_binned_losses=false`), no effect on training.
 
-        Note: if a bin has no samples in a given step, this logs 0 for that bin/step rather than
-        skipping the `self.log` call, so that DDP's `sync_dist` reduction always sees the same
-        set of logged keys across ranks every step (skipping conditionally could cause a
-        cross-rank mismatch/hang). This means bins are most meaningful aggregated (on_epoch) over
-        many steps/batches rather than read at a single step with a small batch size.
+        Empty bins log NaN (not 0) so WandB step curves and epoch `nanmean` aggregation are not
+        dragged toward zero by missing bins. Still calls `self.log` every step for every bin key
+        so DDP always sees a fixed key set (skipping keys would risk a cross-rank hang).
         """
         t_bins = list(self.cfg_exp.get("t_bins", [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]))
         t_vals = batch["t"][data_mode].detach()
@@ -468,18 +735,89 @@ class Proteina(L.LightningModule):
             is_last_bin = hi >= t_bins[-1]
             bin_mask = (t_vals >= lo) & (t_vals <= hi if is_last_bin else t_vals < hi)
             count = bin_mask.sum()
-            bin_loss = (loss_vals * bin_mask).sum() / count.clamp(min=1)
-            self.log(
-                f"{log_prefix}/loss_{data_mode}_t_{lo}_{hi}",
-                bin_loss,
-                on_step=True,
-                on_epoch=True,
-                prog_bar=False,
-                logger=True,
-                batch_size=bs,
-                sync_dist=True,
-                add_dataloader_idx=False,
+            if count > 0:
+                bin_loss = (loss_vals * bin_mask).sum() / count
+            else:
+                bin_loss = torch.tensor(float("nan"), device=loss_vals.device, dtype=loss_vals.dtype)
+            self.log_nan_safe(
+                f"{log_prefix}/loss_{data_mode}_t_{lo}_{hi}", bin_loss, bs=bs, on_step=True
             )
+
+    @torch.no_grad()
+    def log_t_binned_val_metrics(
+        self,
+        batch: dict,
+        nn_out: dict,
+        bs: int,
+        template_keys: list[str],
+    ) -> None:
+        """Re-runs the AE-recon / four-way-decode diagnostics restricted to each `t_bins` slice
+        of `batch["t"]["bb_ca"]`, so e.g. isopeptide-bond success rate for `decode_predca_predz`
+        can be read per noise level instead of averaged across the whole batch (which, under a
+        skewed t-distribution like `bb_ca`'s `mix_unif_beta`, mixes very-different-difficulty
+        samples into one number). Opt-in via `log_t_binned_val_metrics=true` (default off).
+
+        Logs under `val_t_{lo}_{hi}/...` (parallel to `val/...`).
+
+        Same empty-bin convention as `log_t_binned_loss` (NaN when a bin has no samples in
+        the step, so averages are not dragged toward 0), and for the same reason (DDP's
+        `sync_dist` needs the same set of logged keys every step across ranks). A bin that
+        rarely gets samples (e.g. bb_ca's `[0, 0.2)` under a beta skewed toward t=1) will show
+        gaps / NaNs rather than false zeros — check population before reading "low loss".
+
+        `template_keys` fixes the logged schema: pass the real `val/ae_recon*` /
+        `val/decode_*` / `val/flow_clean/*` keys produced for the full batch (computed by the
+        caller before this runs), so every bin logs exactly that key set every step.
+        """
+        if not template_keys:
+            return
+
+        t_bins = list(self.cfg_exp.get("t_bins", [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]))
+        t_vals = batch["t"]["bb_ca"].detach()
+        b = t_vals.shape[0]
+
+        sample_posterior = bool(self.cfg_exp.get("eval", {}).get("reconstruction", {}).get("sample_posterior", False))
+
+        for lo, hi in zip(t_bins[:-1], t_bins[1:]):
+            is_last_bin = hi >= t_bins[-1]
+            bin_mask = (t_vals >= lo) & (t_vals <= hi if is_last_bin else t_vals < hi)
+            idx = bin_mask.nonzero(as_tuple=True)[0]
+            bin_prefix = f"val_t_{lo}_{hi}"
+
+            if idx.numel() == 0:
+                bin_metrics = {bin_prefix + k[len("val") :]: float("nan") for k in template_keys}
+            else:
+                sub_batch = _index_pytree(batch, idx, b)
+                sub_nn_out = _index_pytree(nn_out, idx, b)
+
+                raw_metrics = {}
+                if getattr(self, "reconstruction_eval_enabled", False):
+                    raw_metrics.update(
+                        run_ae_reconstruction_eval(
+                            self.autoencoder,
+                            sub_batch,
+                            prefix=f"{bin_prefix}/ae_recon",
+                            sample_posterior=sample_posterior,
+                        )
+                    )
+                if getattr(self, "four_way_decode_eval_enabled", False):
+                    # run_four_way_decode_eval hardcodes its own "val/..." prefixes; rekey them
+                    # under bin_prefix instead (it doesn't take a prefix argument).
+                    for k, v in run_four_way_decode_eval(self.autoencoder, self.fm, sub_batch, sub_nn_out).items():
+                        raw_metrics[bin_prefix + k[len("val") :]] = v
+
+                # `template_keys` are namespaced "val/...". raw_metrics is namespaced under
+                # `bin_prefix` already (see rekeying above / the explicit prefix passed to
+                # run_ae_reconstruction_eval). Backfill anything missing (shouldn't normally
+                # happen) and drop unexpected keys so every step logs exactly `template_keys`,
+                # renamed under this bin's prefix.
+                bin_metrics = {
+                    bin_prefix + k[len("val") :]: float(raw_metrics.get(bin_prefix + k[len("val") :], float("nan")))
+                    for k in template_keys
+                }
+
+            for k, v in bin_metrics.items():
+                self.log_nan_safe(k, v, bs=bs, on_step=True)
 
     def log_latent_diagnostics(self, batch: dict, log_prefix: str):
         """Opt-in diagnostics for the local_latents AE target (`log_latent_diagnostics=true`).
@@ -562,6 +900,367 @@ class Proteina(L.LightningModule):
                 add_dataloader_idx=False,
             )
 
+    def compute_cyclization_loss(
+        self,
+        batch: dict,
+        nn_out: dict,
+        log_prefix: str,
+        bs: int,
+    ) -> tuple[torch.Tensor, dict]:
+        """Computes the CPSea cyclization-linkage CE loss for one training batch.
+
+        Safe no-op (returns zero loss) if the batch lacks cyclization fields
+        (e.g. a non-CPSea dataset), so mixed training never breaks. Always
+        uses the *ground-truth* AA sequence to build the validity mask; at
+        inference time `predict_cyclization` uses the predicted AA sequence.
+
+        When `cyclization.type_conditioning` is on, the requested type narrows the
+        validity mask to that type's slice, which turns the existing global softmax
+        into exactly `p(i, j | type)` -- restricting a softmax's support and
+        renormalizing *is* conditioning, so no change to the head or the loss itself
+        is needed. Rows dropped to UNSPECIFIED keep the full candidate set and so
+        still train the unconditional joint `p(i, j, type)`.
+        """
+        from proteinfoundation.cyclization.constants import NUM_CYCLIZATION_TYPES
+        from proteinfoundation.cyclization.loss import cyclization_link_loss
+        from proteinfoundation.cyclization.mask import build_cyclization_validity_mask
+
+        device = batch["mask"].device
+        required_keys = ("has_cyclization", "cyclization_i", "cyclization_j", "cyclization_type", "residue_type")
+        if any(k not in batch for k in required_keys):
+            return torch.zeros((), device=device), {}
+
+        binder_mask = batch["mask"]
+        has_cyclization = batch["has_cyclization"].to(device=device)
+        gold_i = batch["cyclization_i"].to(device=device).long()
+        gold_j = batch["cyclization_j"].to(device=device).long()
+        gold_type = batch["cyclization_type"].to(device=device).long()
+
+        x_1_pred = self.fm.nn_out_to_clean_sample_prediction(batch=batch, nn_out=nn_out)
+        ca_for_link = x_1_pred["bb_ca"]
+        z1_pred = x_1_pred["local_latents"]
+
+        detach = self.cyclization_detach_link_inputs
+        decode_ctx = torch.no_grad() if detach else torch.enable_grad()
+        with decode_ctx:
+            decoded = self.autoencoder.decode(z_latent=z1_pred, ca_coors_nm=ca_for_link, mask=binder_mask)
+        aa_probs = decoded["seq_logits"].softmax(dim=-1)
+
+        single_for_link = torch.cat([z1_pred, aa_probs], dim=-1)
+        if detach:
+            single_for_link = single_for_link.detach()
+            ca_for_link = ca_for_link.detach()
+
+        link_logits = self.cyclization_head(single_for_link, ca_for_link)
+
+        cond_type = None
+        if self.cyclization_type_conditioning and "cyclization_type_cond" in batch:
+            cond_type = batch["cyclization_type_cond"].to(device=device).long()
+
+        gt_aa = batch["residue_type"].to(device=device).long()
+        valid_mask = build_cyclization_validity_mask(
+            aa=gt_aa,
+            binder_mask=binder_mask,
+            gold_i=gold_i.clamp(min=0),
+            gold_j=gold_j.clamp(min=0),
+            gold_type=gold_type.clamp(min=0, max=NUM_CYCLIZATION_TYPES - 1),
+            force_gold_valid=self.cyclization_force_gold_valid,
+            allow_asn_gln_isopeptide=self.cyclization_allow_asn_gln_isopeptide,
+            cond_type=cond_type,
+            terminal_only=self.cyclization_terminal_only,
+        )
+
+        loss, metrics = cyclization_link_loss(
+            link_logits=link_logits,
+            valid_mask=valid_mask,
+            gold_i=gold_i,
+            gold_j=gold_j,
+            gold_type=gold_type,
+            has_cyclization=has_cyclization,
+        )
+
+        self.log(
+            f"{log_prefix}/loss_cyclization",
+            loss,
+            on_step=True,
+            on_epoch=True,
+            prog_bar=False,
+            logger=True,
+            batch_size=bs,
+            sync_dist=True,
+            add_dataloader_idx=False,
+        )
+        for name, value in metrics.items():
+            self.log(
+                f"{log_prefix}/cyclization_{name}",
+                value,
+                on_step=True,
+                on_epoch=True,
+                prog_bar=False,
+                logger=True,
+                batch_size=bs,
+                sync_dist=True,
+                add_dataloader_idx=False,
+            )
+
+        return loss, metrics
+
+    def _bond_loss_t_weight(self, batch: dict) -> torch.Tensor:
+        """[b] weight in [0, 1] that switches the bond loss off at low flow time.
+
+        The bond distance is read off the *predicted clean structure*, which is
+        meaningless at high noise -- penalising it there would be supervising the
+        model's own noise. Weight ramps linearly from `t_lower_lim` to 1.
+
+        Takes the MIN over modalities rather than `bb_ca` alone: an anchor atom needs
+        both a clean Ca trace and clean local latents to be placed, so a sample that
+        is clean in one modality and noisy in the other still has no usable bond.
+        """
+        ts = [batch["t"][dm] for dm in self.fm.data_modes if dm in batch["t"]]
+        t = ts[0] if len(ts) == 1 else torch.stack(ts, dim=0).min(dim=0).values  # [b]
+        lo = self.cyclization_bond_loss_t_lower
+        return torch.clamp((t - lo) / max(1.0 - lo, 1e-6), min=0.0, max=1.0)
+
+    def compute_cyclization_bond_loss(
+        self,
+        batch: dict,
+        nn_out: dict,
+        log_prefix: str,
+        bs: int,
+    ) -> tuple[torch.Tensor, dict]:
+        """Computes the two-sided closing-bond distance loss for one training batch.
+
+        Safe no-op (zero loss) if the batch lacks cyclization fields, so mixed
+        training never breaks.
+
+        Unlike the linkage head's decode, this one runs **with gradients**: the whole
+        point is for the penalty to reach the flow model's predicted latents and Ca
+        trace. The autoencoder being frozen does not prevent that -- frozen params
+        still pass gradient through to their inputs.
+
+        Chemistry (`seq_tokens`) and atom presence come from the *decoded prediction*,
+        not the ground truth, so they agree with the coordinates they gate: an SG-SG
+        distance is only supervised where the model actually put two cysteines. The
+        endpoints and type, by contrast, are the requested/ground-truth cyclization.
+        """
+        from proteinfoundation.cyclization.bond_loss import cyclization_bond_loss
+        from proteinfoundation.eval.cyclic_reconstruction_metrics import extract_cyclization_metadata
+
+        device = batch["mask"].device
+        cyclization_metadata = extract_cyclization_metadata(batch)
+        if cyclization_metadata is None:
+            return torch.zeros((), device=device), {}
+
+        binder_mask = batch["mask"]
+        x_1_pred = self.fm.nn_out_to_clean_sample_prediction(batch=batch, nn_out=nn_out)
+        decoded = self.autoencoder.decode(
+            z_latent=x_1_pred["local_latents"],
+            ca_coors_nm=x_1_pred["bb_ca"],
+            mask=binder_mask,
+        )
+
+        loss, metrics = cyclization_bond_loss(
+            pred_atom37=decoded["coors_nm"],
+            atom37_mask=decoded["atom_mask"].bool() & binder_mask.bool()[..., None],
+            seq_tokens=decoded["residue_type"].long(),
+            cyclization_metadata=cyclization_metadata,
+            t_weight=self._bond_loss_t_weight(batch),
+        )
+
+        self.log(
+            f"{log_prefix}/loss_cyclization_bond",
+            loss,
+            on_step=True,
+            on_epoch=True,
+            prog_bar=False,
+            logger=True,
+            batch_size=bs,
+            sync_dist=True,
+            add_dataloader_idx=False,
+        )
+        for name, value in metrics.items():
+            # NaN-by-design when the batch holds no supervisable bond. Log the key on
+            # every rank regardless (DDP reduces over a shared key set) but with zero
+            # weight, so one inapplicable batch cannot poison the epoch mean.
+            v = float(value)
+            is_nan = math.isnan(v)
+            self.log(
+                f"{log_prefix}/cyclization_bond_{name}",
+                0.0 if is_nan else v,
+                on_step=True,
+                on_epoch=True,
+                prog_bar=False,
+                logger=True,
+                batch_size=0 if is_nan else bs,
+                sync_dist=True,
+                add_dataloader_idx=False,
+            )
+
+        return loss, metrics
+
+    @torch.no_grad()
+    def log_unified_validation_metrics(
+        self,
+        batch: dict,
+        nn_out: dict,
+        losses: dict[str, torch.Tensor],
+        cyclization_metrics: dict,
+        cyclization_loss_value: float | None,
+        bs: int,
+    ) -> None:
+        """Logs the uniform `val/...` metric schema (see `proteinfoundation.logging.metric_schema`).
+
+        Purely additive: every metric already logged elsewhere in `training_step` (the
+        `validation_loss/...` keys) is untouched. This method only adds new keys under the
+        `val/...` namespace so that every run -- regardless of AE source, frozen/joint AE,
+        cyclization head on/off, or whether the reconstruction/four-way-decode diagnostics are
+        enabled -- logs the exact same set of validation metric keys (unavailable ones as NaN,
+        per `finalize_metrics`), which is what makes cross-run W&B comparisons meaningful.
+
+        No-op if no autoencoder is configured (non-`local_latents` pipelines), since none of the
+        AE/cyclic-geometry diagnostics apply there and their absence there is not part of the
+        comparison this schema is meant to support.
+        """
+        if getattr(self, "autoencoder", None) is None:
+            return
+
+        metrics = init_metric_dict()
+
+        if "local_latents" in losses:
+            metrics["val/loss/latent"] = float(torch.mean(losses["local_latents"]).item())
+        if "bb_ca" in losses:
+            metrics["val/loss/bb_ca"] = float(torch.mean(losses["bb_ca"]).item())
+        if cyclization_metrics:
+            metrics["val/cyclization/acc"] = float(cyclization_metrics.get("top1_exact_acc", float("nan")))
+        if cyclization_loss_value is not None:
+            metrics["val/cyclization/ce"] = cyclization_loss_value
+
+        if getattr(self, "reconstruction_eval_enabled", False):
+            sample_posterior = bool(
+                self.cfg_exp.get("eval", {}).get("reconstruction", {}).get("sample_posterior", False)
+            )
+            metrics.update(
+                run_ae_reconstruction_eval(
+                    self.autoencoder, batch, prefix="val/ae_recon", sample_posterior=sample_posterior
+                )
+            )
+
+        if getattr(self, "four_way_decode_eval_enabled", False):
+            metrics.update(run_four_way_decode_eval(self.autoencoder, self.fm, batch, nn_out))
+
+        if self.cfg_exp.get("log_t_binned_val_metrics", False):
+            binned_template_keys = [
+                k
+                for k in metrics
+                if k.startswith("val/ae_recon") or k.startswith("val/decode_") or k.startswith("val/flow_clean/")
+            ]
+            self.log_t_binned_val_metrics(
+                batch=batch,
+                nn_out=nn_out,
+                bs=bs,
+                template_keys=binned_template_keys,
+            )
+
+        metrics = finalize_metrics(metrics)
+
+        for k, v in metrics.items():
+            v = float(v)
+            # A metric is NaN when this batch held no example of its kind -- most batches
+            # contain no disulfide-cyclized binder (~10% of CPSea), and cyclic metrics are
+            # NaN-by-design when inapplicable. Lightning accumulates `value * batch_size`
+            # into the epoch mean, so a single NaN makes the whole epoch NaN: that is why
+            # disulfide_bond_success and mainchain_cn_bond_success have always read NaN at
+            # epoch level while their per-step values were fine.
+            #
+            # Give the inapplicable batch zero weight rather than dropping the key. The key
+            # must still be logged on every rank and every step -- under sync_dist/DDP the
+            # ranks reduce over a shared key set, and a rank that skips a key desynchronises
+            # the collective. Weight, not membership, is what varies.
+            weight = _cyclic_metric_weight(k, metrics, default=bs)
+            is_nan = math.isnan(v)
+            self.log(
+                k,
+                0.0 if is_nan else v,
+                on_step=True,
+                on_epoch=True,
+                prog_bar=False,
+                logger=True,
+                batch_size=0 if is_nan else weight,
+                sync_dist=True,
+                add_dataloader_idx=False,
+            )
+
+        if not self._ae_source_logged:
+            self._ae_source_logged = True
+            try:
+                self.logger.experiment.config.update(
+                    {
+                        "ae_source": self.cfg_exp.get("ae_source", "unknown"),
+                        "ae_frozen": bool(getattr(self, "freeze_autoencoder", True)),
+                        "has_cyclization_head": bool(getattr(self, "cyclization_enabled", False)),
+                        "reconstruction_eval_enabled": bool(getattr(self, "reconstruction_eval_enabled", False)),
+                        "four_way_decode_eval_enabled": bool(getattr(self, "four_way_decode_eval_enabled", False)),
+                    },
+                    allow_val_change=True,
+                )
+            except Exception:
+                # Best-effort only (e.g. no WandbLogger attached, smoke tests with log_wandb=False).
+                pass
+
+    def apply_cyclization_type_conditioning(self, batch: dict, bs: int) -> dict:
+        """Stamps the requested cyclization type onto a generation batch, in place.
+
+        No-op unless `cyclization.type_conditioning` is on, so the unconditional
+        generation path is untouched. A batch that already carries a per-sample
+        `cyclization_type_cond` (e.g. a CPSea val batch) keeps it -- the config's
+        `target_type` only supplies a value where the data has none.
+        """
+        if not getattr(self, "cyclization_type_conditioning", False):
+            return batch
+        if "cyclization_type_cond" in batch:
+            return batch
+
+        from proteinfoundation.cyclization.constants import UNSPECIFIED
+
+        type_idx = self.cyclization_target_type
+        if type_idx is None:
+            type_idx = UNSPECIFIED
+        batch["cyclization_type_cond"] = torch.full(
+            (bs,), int(type_idx), dtype=torch.long, device=batch["mask"].device
+        )
+        return batch
+
+    @torch.no_grad()
+    def predict_cyclization(self, batch: dict) -> dict:
+        """Runs a single generation pass and predicts the cyclization edge for each sample.
+
+        Uses the *predicted* AA sequence (never ground truth) to build the validity
+        mask. Standalone utility usable for CPSea binder-cyclization inspection;
+        see `single_pass_generation.py` for the wired-in `predict_step` path.
+
+        The requested type (if any) comes from `cyclization.target_type`.
+
+        Returns:
+            Dict with `pred_cyclization_i/j/type/confidence` tensors, each [B], plus
+            `cyclization_type_satisfied` ([B] bool) when type conditioning is on.
+        """
+        if self.cyclization_head is None:
+            raise RuntimeError("Cyclization head is not enabled (set cyclization.enabled=true)")
+
+        from proteinfoundation.cyclization.inference import predict_cyclization_from_clean
+
+        # `generate` stamps `cyclization_type_cond` into the batch, so read it back from
+        # there rather than re-deriving it -- the head must see exactly what the denoiser saw.
+        gen_samples = self.generate(batch)
+        cond_type = batch.get("cyclization_type_cond") if self.cyclization_type_conditioning else None
+        return predict_cyclization_from_clean(
+            self,
+            ca=gen_samples["bb_ca"],
+            z_latent=gen_samples["local_latents"],
+            mask=batch["mask"],
+            cond_type=cond_type,
+        )
+
     def log_train_loss_n_prog_bar(self, b: int, train_loss: torch.Tensor):
         self.log(
             "train_loss",
@@ -642,9 +1341,190 @@ class Proteina(L.LightningModule):
 
     def validation_step_data(self, batch: dict, batch_idx: int):
         """Evaluates the training loss on validation data."""
+        # Sampling validation runs FIRST, on the pristine batch: `training_step` -> `corrupt_batch`
+        # writes x_1/x_0/x_t/t/mask into `batch` in place, and we want the generator to see the
+        # batch exactly as the design pipeline would.
+        if self.val_gen_enabled:
+            self.validation_step_generate(batch, batch_idx)
         with torch.no_grad():
             loss = self.training_step(batch, batch_idx=-1)
             self.validation_output_data.append(loss.item())
+
+    @torch.no_grad()
+    def validation_step_generate(self, batch: dict, batch_idx: int) -> None:
+        """Integrates the ODE from t=0 on a real val complex and scores what comes out.
+
+        This is the only validation signal here that is NOT teacher-forced. Every other logged
+        metric (flow loss, t-binned loss, `run_four_way_decode_eval`) builds `x_t` by interpolating
+        the *true* `x_1` with noise, so the model is always handed a real interpolant and most of
+        the answer with it; `decode_gtca_*` goes further and hands the decoder the native Ca trace.
+        Sampling never sees a true interpolant -- it consumes its own accumulated output. A model
+        can therefore sit at a healthy loss, post 100% teacher-forced sequence recovery, and still
+        emit garbage when integrated, and *no* teacher-forced metric can reveal that. Hence this.
+
+        Cheap on purpose -- single-pass: one ODE integration, no search, no lookahead, no AF2, no
+        MPNN, no folding. Scores reference-free geometry (see `eval/sampled_binder_metrics.py`)
+        plus cyclization bond closure on the sampled structure.
+
+        This is only worth its GPU time if it samples the way the DESIGN pipeline samples --
+        otherwise it predicts the behaviour of a sampler nobody runs. Point
+        `val_generation.design_sampling` at `configs/pipeline/model_sampling.yaml` (via a
+        Hydra default, so the two cannot drift) and this uses design's exact schedules,
+        `sampling_mode`, noise scales and centering.
+
+        The fallback (`generation.model["ode"]`) is NOT equivalent and is warned about: the
+        `generation` group is Proteina's *unconditional monomer* validation config, whose
+        `ode` block sets `bb_ca.center_every_step=True`. Forcing the sample's CoM to zero is
+        right for a monomer centred on itself and **wrong for a binder**: CPSea centres on the
+        TARGET (`CenteringTransform(center_mode="target")`, `zero_com_noise=False`), so the
+        binder legitimately sits off-origin at its binding site, and zero-CoM-ing it every
+        step drags it to the receptor's centre -- off the training manifold -- at every step.
+
+        Config (`val_generation` block, all optional):
+            enabled     bool, default False.
+            n_batches   how many val batches to sample (default 2). Each costs an ODE integration.
+            n_repeat    samples per complex (default 4). >1 enables the `div/*` mode-collapse
+                        readout -- the spread across repeats of the SAME target.
+            design_sampling  the design pipeline's sampling config (`args` + `model`). Strongly
+                        preferred; see above.
+            nsteps      ODE steps. Default: the design sampler's. Lower only to make a smoke
+                        run cheap -- it is itself a design-alignment knob.
+            self_cond   default: the design sampler's.
+        """
+        vg = self.val_gen_cfg
+        if batch_idx >= int(vg.get("n_batches", 2)):
+            return
+        if "local_latents" not in self.cfg_exp.product_flowmatcher or self.autoencoder is None:
+            return
+
+        design = vg.get("design_sampling", None)
+        if design is not None:
+            sampler_args, sampling_model_args = design.args, design.model
+            n_recycle = int(design.get("n_recycle", 0))
+        else:
+            sampler_args, sampling_model_args = self.cfg_exp.generation.args, self.cfg_exp.generation.model["ode"]
+            n_recycle = 0
+            if not self._val_gen_sampler_warned:
+                self._val_gen_sampler_warned = True
+                logger.warning(
+                    "val_generation has no `design_sampling` block, falling back to "
+                    "generation.model['ode'] -- the UNCONDITIONAL MONOMER sampler. For a binder "
+                    "model this is not merely untuned, it is wrong: bb_ca.center_every_step=True "
+                    "zero-CoMs the binder every ODE step, but CPSea centres on the TARGET so the "
+                    "binder belongs off-origin. Expect blown-up geometry that says nothing about "
+                    "the model. Add `- /pipeline/model_sampling@val_generation.design_sampling` "
+                    "to the config's defaults list."
+                )
+
+        n_repeat = max(1, int(vg.get("n_repeat", 4)))
+        nsteps = vg.get("nsteps", None)
+        nsteps = int(sampler_args.nsteps if nsteps is None else nsteps)
+        self_cond = vg.get("self_cond", None)
+        self_cond = bool(sampler_args.self_cond if self_cond is None else self_cond)
+
+        # CPSea batches carry no `mask` before `corrupt_batch`; `full_simulation` would then fall
+        # back to `torch.ones(...)` (product_space_flow_matcher.py:785) and denoise PADDING as if it
+        # were real residues. Resolve it explicitly, the same way `AutoEncoder.encode` does.
+        mask = batch["mask"].bool() if "mask" in batch else batch["coord_mask"][..., 1].bool()
+
+        # repeat_interleave (not repeat): `sampled_binder_metrics` div/* assumes repeats of one
+        # complex are CONTIGUOUS, and will otherwise silently compare different complexes.
+        gen_batch = {
+            k: (v.repeat_interleave(n_repeat, dim=0) if torch.is_tensor(v) and v.dim() >= 1 else v)
+            for k, v in batch.items()
+            # x_1/x_0/x_t/t are stale interpolation state if this batch was already corrupted;
+            # full_simulation sets its own. Drop them so nothing downstream reads the wrong x_t.
+            if k not in ("x_1", "x_0", "x_t", "t", "x_sc")
+        }
+        gen_mask = mask.repeat_interleave(n_repeat, dim=0)
+        gen_batch["mask"] = gen_mask
+        bs, n = gen_mask.shape
+
+        self.apply_cyclization_type_conditioning(gen_batch, bs=bs)
+
+        gen_samples = self.fm.full_simulation(
+            batch=gen_batch,
+            predict_for_sampling=partial(self.predict_for_sampling, n_recycle=n_recycle),
+            nsteps=nsteps,
+            nsamples=bs,
+            n=n,
+            self_cond=self_cond,
+            sampling_model_args=sampling_model_args,
+            device=self.device,
+            guidance_w=float(sampler_args.get("guidance_w", 1.0)),
+            # Autoguidance stays off regardless of what design requests: it needs a second
+            # ("bad model") checkpoint that validation has no way to load.
+            ag_ratio=0.0,
+        )
+
+        sample_prots = sample_formatting(
+            x=gen_samples,
+            extra_info={"mask": gen_mask},
+            ret_mode="coors37_n_aatype",
+            data_modes=list(self.cfg_exp.product_flowmatcher),
+            autoencoder=self.autoencoder,
+        )
+        # UNITS: `sample_formatting(ret_mode="coors37_n_aatype")` returns ANGSTROM -- it applies
+        # `nm_to_ang` internally (sample_utils.format_sample_local_latents) because its other
+        # consumers write PDBs, which are in Angstrom. Everything below wants NANOMETERS:
+        # `sampled_binder_metrics` documents nm and compares against CA_CA_NM=0.3835 (and is handed
+        # `coords_nm`/`x_target`, which really are nm), and `cyclic_geometry_metrics` multiplies its
+        # input by NM_TO_ANG itself. Feeding Angstrom through pinned geom/ca_ca_viol_frac at 1.0,
+        # inflated every cyc/*_dist_A tenfold, and silently compared Angstrom against nm in the
+        # place/* and iface/* groups. Convert exactly once, here, at the boundary.
+        aatype = sample_prots["residue_type"]
+        coors = sample_prots["coors"] / NM_TO_ANG  # [b, n, 37, 3], nm
+
+        gt_coors = gen_batch.get("coords_nm")
+        metrics = sampled_binder_metrics(
+            coors=coors,
+            aatype=aatype,
+            mask=gen_mask,
+            gt_coors=gt_coors,
+            x_target=gen_batch.get("x_target"),
+            target_mask=gen_batch.get("target_mask"),
+            target_hotspot_mask=gen_batch.get("target_hotspot_mask"),
+            n_repeat=n_repeat,
+            prefix="val_gen",
+        )
+
+        # Cyclization closure on the SAMPLED structure: the model's own predicted (i, j, type) and
+        # its own sequence's chemistry. This is the number that reads ~45% teacher-forced and has
+        # never been measured on an actual sample.
+        cyc = attach_cyclization_prediction(self, gen_samples, gen_batch, dict(sample_prots))
+        if "pred_cyclization_i" in cyc:
+            meta = {
+                "i": cyc["pred_cyclization_i"].long(),
+                "j": cyc["pred_cyclization_j"].long(),
+                "type": cyc["pred_cyclization_type"].long(),
+                "has_cyclization": torch.ones_like(cyc["pred_cyclization_i"], dtype=torch.bool),
+            }
+            raw = cyclic_geometry_metrics(
+                pred_atom37=coors,
+                gt_atom37=coors,  # only the *_gt_A / *_abs_err_A keys read this; we drop those below
+                atom37_mask=atom37_mask_from_aatype(aatype) & gen_mask[..., None],
+                seq_tokens=aatype.long(),
+                cyclization_metadata=meta,
+                prefix="val_gen/cyc",
+            )
+            metrics.update({f"val_gen/cyc/{s}": raw[f"val_gen/cyc/{s}"] for s in CYCLIC_PRED_ONLY_SUFFIXES})
+            if "cyclization_type_satisfied" in cyc:
+                metrics["val_gen/cyc/type_satisfied"] = float(
+                    cyc["cyclization_type_satisfied"].float().mean().item()
+                )
+        else:
+            # Counts are a tally, not a measurement: "no examples" is 0, never NaN (a NaN count
+            # would be indistinguishable from an unmeasured rate). Rates stay NaN.
+            for s in CYCLIC_PRED_ONLY_SUFFIXES:
+                metrics[f"val_gen/cyc/{s}"] = 0.0 if s in CYCLIC_COUNT_SUFFIXES else float("nan")
+            metrics["val_gen/cyc/type_satisfied"] = float("nan")
+
+        # NaN (not 0) for inapplicable metrics -- e.g. isopeptide closure in a batch with no
+        # isopeptides. 0 would read as "nothing closes", which is a different claim from "not
+        # measurable here". `log_nan_safe` aggregates over the epoch while skipping the NaNs, and
+        # logs the same key set every step so DDP never sees a rank-dependent schema.
+        for k, v in metrics.items():
+            self.log_nan_safe(k, float(v), bs=bs, on_step=False)
 
     def validation_step_lens(self, batch: dict, batch_idx: int):
         """
@@ -822,6 +1702,12 @@ class Proteina(L.LightningModule):
         # Derive nsamples and n from mask shape
         mask = batch["mask"]
         nsamples, n = mask.shape
+
+        # Design-task batches carry no cyclization label, so the requested type has to be
+        # stamped in here for `cyclization_type_emb` to read. Done in `generate` rather than
+        # in a single search algorithm so every search path (single-pass, beam, MCTS) is
+        # conditioned identically.
+        self.apply_cyclization_type_conditioning(batch, bs=nsamples)
 
         gen_samples = self.fm.full_simulation(
             batch=batch,

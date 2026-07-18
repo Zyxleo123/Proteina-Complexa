@@ -6,6 +6,7 @@ import torch
 from loguru import logger
 from torch_scatter import scatter_mean
 
+from proteinfoundation.cyclization.constants import NUM_CYCLIZATION_COND_TYPES, UNSPECIFIED
 from proteinfoundation.nn.feature_factory.base_feature import Feature
 from proteinfoundation.nn.feature_factory.feature_utils import (
     get_index_embedding,
@@ -412,3 +413,35 @@ class ContactTypeSeqFeat(Feature):
                 logger.warning("No contact in batch, returning zeros for ContactTypeSeqFeat")
                 self._has_logged = True
             return torch.zeros((b, n, 4), device=device)
+
+
+class CyclizationTypeSeqFeat(Feature):
+    """Embeds the desired cyclization type, broadcast over residues: [b, n, cyc_emb_dim].
+
+    This is what makes "generate me a disulfide-cyclized binder" mean something: the
+    type is a *global* per-sample label, so it belongs in the conditioning vector that
+    modulates every layer (like `fold_emb`), not in the per-residue token representation.
+    The denoiser learns to honor it purely through the flow-matching loss, since the
+    type is informative about the clean sample (e.g. a disulfide implies two cysteines).
+
+    A missing `cyclization_type_cond` key falls back to UNSPECIFIED, so non-CPSea
+    datasets and unconditional inference keep working unchanged.
+    """
+
+    def __init__(self, cyc_emb_dim, **kwargs):
+        super().__init__(dim=cyc_emb_dim)
+        self.embedding = torch.nn.Embedding(NUM_CYCLIZATION_COND_TYPES, cyc_emb_dim)
+        self._has_logged = False
+
+    def forward(self, batch):
+        b, n = self.extract_bs_and_n(batch)
+        device = self.extract_device(batch)
+        if "cyclization_type_cond" in batch:
+            cond_type = batch["cyclization_type_cond"].long().to(device)  # [b]
+        else:
+            if not self._has_logged:
+                logger.warning("No cyclization_type_cond in batch, using UNSPECIFIED for CyclizationTypeSeqFeat")
+                self._has_logged = True
+            cond_type = torch.full((b,), UNSPECIFIED, dtype=torch.long, device=device)
+        emb = self.embedding(cond_type)  # [b, cyc_emb_dim]
+        return emb[:, None, :].expand(b, n, -1)  # [b, n, cyc_emb_dim]

@@ -222,7 +222,7 @@ class RDNFlowMatcher(BaseFlowMatcher):
         t: Float[Tensor, "*"],
         nn_out: dict[str, Float[Tensor, "* n d"]],
         loss_t_clamp: float = 1.0,
-    ) -> Float[Tensor, "*"]:
+    ) -> tuple[Float[Tensor, "*"], Float[Tensor, "*"]]:
         """
         Computes flow matching loss per element in the batch.
 
@@ -246,7 +246,9 @@ class RDNFlowMatcher(BaseFlowMatcher):
                 clamping (default, preserves old behavior).
 
         Returns:
-            Loss per element in the batch, shape [*]
+            Tuple of (scaled_loss, unscaled_loss), each shape [*].
+            `scaled_loss` is x1 MSE * 1/(1-t_clamp)^2 (used for training).
+            `unscaled_loss` is plain x1 MSE before the time reweight (diagnostics).
         """
         nn_out = self.nn_out_add_clean_sample_prediction(
             x_t=x_t,
@@ -256,11 +258,14 @@ class RDNFlowMatcher(BaseFlowMatcher):
         )
         nres = torch.sum(mask, dim=-1)  # [*]
         err = (x_1 - nn_out["x_1"]) * mask[..., None]  # [*, n, d]
-        loss = torch.sum(err**2, dim=(-1, -2)) / nres  # [*]
+        # Unscaled x1 MSE (sum over residue dims, mean over residues). Training still
+        # backprops the time-reweighted form below; callers that need a readable
+        # per-t diagnostic (e.g. t-binned logging) use the second return.
+        loss_unscaled = torch.sum(err**2, dim=(-1, -2)) / nres  # [*]
         t_for_w = torch.clamp(t, max=loss_t_clamp)
         total_loss_w = 1.0 / ((1.0 - t_for_w) ** 2 + 1e-5)
-        loss = loss * total_loss_w  # [*]
-        return loss
+        loss = loss_unscaled * total_loss_w  # [*]
+        return loss, loss_unscaled
 
     def nn_out_add_guided_simulation_tensor(
         self,
