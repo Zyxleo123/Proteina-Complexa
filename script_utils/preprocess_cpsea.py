@@ -24,9 +24,11 @@ import argparse
 import gzip
 import hashlib
 import json
+import multiprocessing
 import os
 import sys
 from collections import Counter
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -491,6 +493,54 @@ def verify_output_pdb(output_path: Path, audit: StructureAudit) -> dict:
     }
 
 
+def process_one(job: tuple[str, Path, str, str, int, int, Path]) -> tuple[StructureAudit, dict | None, dict | None]:
+    """Worker: process, write, and verify a single structure. Runs in a subprocess."""
+    stem, source_path, cluster_id, split, peptide_min, peptide_max, out_dir = job
+    atoms, conect_pairs, audit = process_structure(source_path, stem, peptide_min, peptide_max)
+    audit.cluster_id = cluster_id
+    audit.split = split
+
+    if audit.status != "ok":
+        logger.warning(f"REJECTED {stem}: {audit.reject_reason}")
+        return audit, None, None
+
+    out_path = out_dir / "processed" / audit.split / f"{stem}.pdb"
+    write_pdb(out_path, atoms, conect_pairs, stem)
+    audit.output_path = str(out_path.resolve())
+
+    v = verify_output_pdb(out_path, audit)
+    if not v["atoms_match"] or not v["conect_match"]:
+        logger.error(
+            f"OUTPUT VERIFY FAIL {stem}: atoms={v['on_disk_atoms']}/{audit.output_atoms} "
+            f"conect={v['on_disk_conect_pairs']}/{audit.conect_pairs_kept}"
+        )
+        audit.status = "rejected"
+        audit.reject_reason = "output_verify_failed"
+        return audit, None, v
+
+    logger.info(
+        f"OK {stem} | split={audit.split} | atoms {audit.input_atoms}->{audit.output_atoms} "
+        f"(−H:{audit.removed_hydrogen} −cap:{audit.removed_cap}) | "
+        f"CONECT {audit.conect_pairs_input}->{audit.conect_pairs_kept} "
+        f"(dropped_removed:{audit.conect_pairs_dropped_removed_atom}) | "
+        f"peptide={audit.peptide_length} cyclization={audit.cyclization_type} | "
+        f"coord_delta={audit.coord_max_delta_A:.2e}Å"
+    )
+    metadata_row = {
+        "example_id": stem,
+        "path": audit.output_path,
+        "binder_chain_id": "B",
+        "cluster_id": cluster_id,
+        "split": audit.split,
+        "peptide_length": audit.peptide_length,
+        "receptor_length": audit.receptor_length,
+        "cyclization_type": audit.cyclization_type,
+        "source_path": audit.source_path,
+        "conect_pairs_kept": audit.conect_pairs_kept,
+    }
+    return audit, metadata_row, v
+
+
 def default_cpsea_root() -> Path:
     return Path(os.environ.get("CPSEA_DATA_PATH", "/zfsauton/scratch/yixiz/CPSea/CPSea_PDB"))
 
@@ -528,6 +578,12 @@ def main():
     parser.add_argument("--val-frac", type=float, default=0.05)
     parser.add_argument("--seed", type=int, default=42, help="Random seed for cluster splits (reproducible)")
     parser.add_argument("--limit", type=int, default=None, help="Process at most N structures (smoke tests)")
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=max(1, (os.cpu_count() or 1) - 1),
+        help="Number of worker processes (default: cpu_count - 1). Use 1 to disable multiprocessing.",
+    )
     args = parser.parse_args()
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
@@ -597,63 +653,39 @@ def main():
     all_cluster_ids = [cluster_map.get(stem, stem) for stem, _ in inputs]
     split_map = assign_cluster_splits(all_cluster_ids, args.train_frac, args.val_frac, args.seed)
 
+    jobs = [
+        (
+            stem,
+            source_path,
+            cluster_map.get(stem, stem),
+            split_map.get(cluster_map.get(stem, stem), "train"),
+            args.peptide_min_length,
+            args.peptide_max_length,
+            args.out_dir,
+        )
+        for stem, source_path in inputs
+    ]
+
     audits: list[StructureAudit] = []
     metadata_rows: list[dict] = []
     verify_rows: list[dict] = []
 
-    for stem, source_path in inputs:
-        atoms, conect_pairs, audit = process_structure(
-            source_path, stem, args.peptide_min_length, args.peptide_max_length
-        )
-        cluster_id = cluster_map.get(stem, stem)
-        audit.cluster_id = cluster_id
-        audit.split = split_map.get(cluster_id, "train")
+    logger.info(f"Using {args.workers} worker process(es)")
+    if args.workers <= 1:
+        results = (process_one(job) for job in jobs)
+    else:
+        chunksize = max(1, len(jobs) // (args.workers * 20))
+        ctx = multiprocessing.get_context("fork")
+        with ProcessPoolExecutor(max_workers=args.workers, mp_context=ctx) as executor:
+            results = list(executor.map(process_one, jobs, chunksize=chunksize))
 
-        if audit.status != "ok":
-            logger.warning(f"REJECTED {stem}: {audit.reject_reason}")
-            audits.append(audit)
-            continue
-
-        out_path = args.out_dir / "processed" / audit.split / f"{stem}.pdb"
-        write_pdb(out_path, atoms, conect_pairs, stem)
-        audit.output_path = str(out_path.resolve())
-
-        v = verify_output_pdb(out_path, audit)
-        verify_rows.append(v)
-        if not v["atoms_match"] or not v["conect_match"]:
-            logger.error(
-                f"OUTPUT VERIFY FAIL {stem}: atoms={v['on_disk_atoms']}/{audit.output_atoms} "
-                f"conect={v['on_disk_conect_pairs']}/{audit.conect_pairs_kept}"
-            )
-            audit.status = "rejected"
-            audit.reject_reason = "output_verify_failed"
-            audits.append(audit)
-            continue
-
-        logger.info(
-            f"OK {stem} | split={audit.split} | atoms {audit.input_atoms}->{audit.output_atoms} "
-            f"(−H:{audit.removed_hydrogen} −cap:{audit.removed_cap}) | "
-            f"CONECT {audit.conect_pairs_input}->{audit.conect_pairs_kept} "
-            f"(dropped_removed:{audit.conect_pairs_dropped_removed_atom}) | "
-            f"peptide={audit.peptide_length} cyclization={audit.cyclization_type} | "
-            f"coord_delta={audit.coord_max_delta_A:.2e}Å"
-        )
+    for audit, metadata_row, v in results:
         audits.append(audit)
-        metadata_rows.append(
-            {
-                "example_id": stem,
-                "path": audit.output_path,
-                "binder_chain_id": "B",
-                "cluster_id": cluster_id,
-                "split": audit.split,
-                "peptide_length": audit.peptide_length,
-                "receptor_length": audit.receptor_length,
-                "cyclization_type": audit.cyclization_type,
-                "source_path": audit.source_path,
-                "conect_pairs_kept": audit.conect_pairs_kept,
-                "config_hash": config_hash,
-            }
-        )
+        if v is not None:
+            verify_rows.append(v)
+        if metadata_row is not None:
+            metadata_row["config_hash"] = config_hash
+            metadata_rows.append(metadata_row)
 
     # Write audit CSVs
     audit_rows = [audit_to_row(a) for a in audits]
