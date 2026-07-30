@@ -81,6 +81,8 @@ class AF2RewardModel(BaseRewardModel):
         use_initial_atom_pos: bool = False,
         seed: int = 0,
         device_id: int | None = None,
+        cyclic_offset: bool = False,
+        cyclization_type: str | None = None,
     ) -> None:
         """Initialize the AF2RewardModel.
 
@@ -95,6 +97,12 @@ class AF2RewardModel(BaseRewardModel):
             use_initial_atom_pos: Whether to use initial atom positions.
             seed: Random seed for reproducibility.
             device_id: GPU device ID to use. If None, auto-detects current CUDA device.
+            cyclic_offset: If True, wrap the binder's sequence offset around the ring so
+                AF2 refolds a macrocycle instead of a linear peptide (see
+                `evaluation.cyclic_offset`). Off by default, so existing runs are
+                bit-identical. Only takes effect for linkage types where the wrap is
+                chemically valid; `cyclic_offset_applied` records whether it did.
+            cyclization_type: Requested linkage type, used to decide the above.
         """
         if device_id is None:
             device_id = torch.cuda.current_device() if torch.cuda.is_available() else 0
@@ -125,6 +133,12 @@ class AF2RewardModel(BaseRewardModel):
         self.device = jax.devices("gpu")[device_id]
         self.seed = seed
         self.rng = random.Random(seed)
+        self.cyclic_offset = cyclic_offset
+        self.cyclization_type = cyclization_type
+        # Whether the wrap was actually applied on the most recent call. Distinct from the
+        # request: it stays False for side-chain linkages, and downstream metrics must be
+        # labelled with this, not with `cyclic_offset`.
+        self.cyclic_offset_applied = False
 
         # Initialize the AF2 model
         self.model = mk_afdesign_model(
@@ -263,6 +277,19 @@ class AF2RewardModel(BaseRewardModel):
                     prep_kwargs["rm_template_ic"] = False
 
                 self.model.prep_inputs(**prep_kwargs)
+
+            # Must sit between prep_inputs (which builds _inputs) and run (which consumes
+            # the offset). A no-op unless explicitly enabled AND the linkage is one whose
+            # closing bond is the backbone peptide bond.
+            self.cyclic_offset_applied = False
+            if self.cyclic_offset:
+                from proteinfoundation.evaluation.cyclic_offset import apply_cyclic_offset
+
+                self.cyclic_offset_applied = apply_cyclic_offset(
+                    af_model=self.model,
+                    binder_len=len(seq),
+                    linkage_type=self.cyclization_type,
+                )
 
             self.model.set_opt(
                 hard=False,

@@ -104,3 +104,8 @@ tests/test_eval_generated/
 .vscode-server/
 .claude.json*
 params
+
+# Peptide-interface surface caches and their QA renders (scripts/extract_peptide_surfaces.py,
+# script_utils/qa_peptide_surfaces.py). Regenerable from the dataset; the HTML views are
+# ~2.5 MB each because plotly.js is inlined so they open offline.
+surfaces/

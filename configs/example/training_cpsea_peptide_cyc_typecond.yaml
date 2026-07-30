@@ -227,6 +227,8 @@ log:
   checkpoint_every_n_steps: null
   last_ckpt_every_n_steps: 1500
   save_extra_checkpoints: false
+  # Resume training from last.ckpt but log into a fresh WandB run instead of re-attaching
+  wandb_force_new_run: false
 
 seed: 42
 

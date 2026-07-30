@@ -256,6 +256,8 @@ def compute_binder_metrics(
                 is_target_ligand=is_target_ligand,
                 num_redesign_seqs=num_redesign_seqs,
                 fixed_residues_override=fixed_residues_override,
+                cyclic_offset=cfg_metric.get("cyclic_offset", False),
+                cyclization_type=cfg_metric.get("cyclization_type", None),
             )
 
             # Save raw stats

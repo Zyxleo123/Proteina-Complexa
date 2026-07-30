@@ -58,6 +58,16 @@ dev = [
     "ruff>=0.15.0",
     "ipdb",
 ]
+# Peptide-interface molecular-surface extraction (scripts/extract_peptide_surfaces.py).
+# Kept out of the base install: pymol-open-source is a ~30 MB wheel that nothing in
+# training or inference imports, and the extractor is a one-off preprocessing pass.
+# `proteinfoundation.surface` raises a SurfaceExtractionError with an install hint if
+# either is missing, so a base install fails loudly rather than mysteriously.
+#   uv pip install -e ".[surface]"
+surface = [
+    "pymol-open-source>=3.0",
+    "trimesh>=4.0",
+]
 
 [project.scripts]
 complexa = "proteinfoundation.cli.cli_runner:main"

@@ -586,6 +586,20 @@ def _allocate_budget(
     return binder_pad, group_pads
 
 
+# Fixed-M peptide-surface fields and other sample-level tensors that must NOT be
+# binder-padded (their leading dim is not num_nodes).
+_SAMPLE_LEVEL_TENSOR_KEYS = frozenset(
+    {
+        "surface_xyz",
+        "surface_normals",
+        "surface_mask",
+        "surface_distance",
+        "global_rotation",
+        "center_offset",
+    }
+)
+
+
 def structure_collate_fn(
     batch: list[Data | None],
     pad_max_total_tokens: int | None = None,
@@ -673,6 +687,26 @@ def structure_collate_fn(
         value_list = [getattr(sample, key) for sample in batch]
 
         try:
+            # Sample-level tensors (surface point clouds, stashed rigid params): stack
+            # without binder padding. Surface clouds pad along M to the batch max.
+            if key in _SAMPLE_LEVEL_TENSOR_KEYS or (
+                isinstance(key, str) and key.startswith("surface_") and torch.is_tensor(value_list[0])
+            ):
+                if all(torch.is_tensor(v) for v in value_list):
+                    if key.startswith("surface_") and value_list[0].dim() >= 1:
+                        m_pad = max(v.shape[0] for v in value_list)
+                        collated = _pad_and_stack(
+                            key,
+                            value_list,
+                            m_pad,
+                            sample_lengths=[v.shape[0] for v in value_list],
+                        )
+                    else:
+                        collated = torch.stack(value_list)
+                    if collated is not None:
+                        result[key] = collated
+                continue
+
             group_name = next(
                 (n for n, g in groups.items() if key in g["fields"]),
                 None,

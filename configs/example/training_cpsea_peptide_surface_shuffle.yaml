@@ -1,0 +1,167 @@
+# @package _global_
+# Oracle surface experiment — shuffled-surface control (same capacity as oracle).
+#
+# Distinguishes useful surface conditioning from gains caused merely by extra
+# parameters. Must underperform the correct-oracle arm on the Stage-5 suite.
+
+run_name: cpsea_peptide_surface_shuffle
+
+hardware:
+  ncpus_per_task_train_: 4
+  ncpus_per_task_prepro_: 4
+  accelerator: gpu
+  ngpus_per_node_: 1
+  nnodes_: 1
+
+defaults:
+  - /nn: local_latents_score_nn_160M_binder
+  - /nn/scale: none
+  - /generation: validation_local_latents
+  - /dataset/unified: cpsea_peptide_surface_shuffle
+  # Design-pipeline sampler for ODE validation (center_every_step=False). Without this,
+  # validation_step_generate falls back to the unconditional monomer ode and shreds binders.
+  - /pipeline/model_sampling@val_generation.design_sampling
+  - _self_
+
+pretrain_ckpt_path: ${oc.env:CKPT_PATH}/complexa.ckpt
+autoencoder_ckpt_path: ${oc.env:CPSEA_AE_CKPT_PATH}
+
+freeze_autoencoder: true
+ae_reg_weight: 1.0
+
+nn:
+  enable_surface: true
+  surface:
+    num_points: 96
+    gate_layers: [3, 7, 11]
+    rbf_n: 16
+    pair_dim: 256
+  # --- v4 cyclization recipe (identical in every surface arm, so the surface contrast is
+  # the only thing that differs). Head starts RANDOM, as in v3/v4 -- complexa.ckpt has none.
+  #
+  # cyclization_type_emb MUST stay LAST in feats_cond_seq, and cyclization_ring_pe LAST in
+  # feats_pair_repr: those lists are the column order of the concats feeding
+  # cond_factory.linear_out / pair_repr_builder.init_repr_factory.linear_out, which
+  # _splice_pretrained_weights (train.py) warm-starts by copying complexa.ckpt's leading
+  # columns and zero-padding the rest. Appending last keeps the pretrained columns aligned
+  # and makes the new features contribute exactly zero at init. Reordering corrupts the splice.
+  # (Surface conditioning enters through the separate gated `nn.surface` module, not these
+  # lists, so the two features do not interact here.)
+  feats_cond_seq: ["time_emb_bb_ca", "time_emb_local_latents", "cyclization_type_emb"]
+  cyc_emb_dim: 256  # match the 160M trunk's dim_cond / t_emb_dim / idx_emb_dim
+  feats_pair_repr: ["rel_seq_sep", "xt_bb_ca_pair_dists", "x_sc_bb_ca_pair_dists", "optional_ca_pair_dist", "chain_idx_pair", "hotspot_mask_pair", "cyclization_ring_pe"]
+  ring_sep_dim: 32  # one-hot geodesic bins; >> any binder length here (16-mer -> geodesic <= 8)
+
+# Non-teacher-forced ODE validation. Shuffle should look worse than oracle on
+# val_gen/surface/* and usually on val_gen/place/* / iface/* if surface is used.
+val_generation:
+  enabled: true
+  n_batches: 2
+  n_repeat: 4
+  nsteps: null      # inherit design_sampling (400)
+  self_cond: null
+
+product_flowmatcher:
+  bb_ca:
+    zero_com_noise: False
+    guidance_enabled: true
+    dim: 3
+  local_latents:
+    zero_com_noise: False
+    guidance_enabled: True
+    dim: null
+
+loss:
+  t_distribution:
+    bb_ca:
+      name: mix_unif_beta
+      p1: 1.9
+      p2: 1.0
+      p3: 0.02
+    local_latents:
+      name: uniform
+      p1: 1.0
+      p2: 1.0
+    shared_groups: []
+
+force_precision_f32: True
+
+training:
+  n_recycle: 0
+  motif_conditioning: False
+  self_cond: True
+  fold_cond: False
+  target_cond: False
+  mask_T_prob: 0.5
+  mask_A_prob: 0.5
+  mask_C_prob: 0.5
+  fold_label_sample_ratio: [0.5, 0.1, 0.15, 0.25]
+  p_folding_n_inv_folding_iters: 0.15
+  # Every CPSea row carries a real cyclization type, so dropout is the ONLY source of
+  # UNSPECIFIED rows. At 0.0 the null token would never be trained and the head would lose
+  # its cross-type negatives.
+  cyclization_type_dropout_rate: 0.15
+
+# v4 recipe verbatim (training_cpsea_peptide_cyc_typecond.yaml). Shared by all surface arms.
+# This is what makes val_gen/cyc/* a real measurement: with cyclization off the whole group
+# logs n_valid_* = 0 / rates = NaN, and even with the head on but no ring PE + bond loss,
+# sampled mainchain closure sat at 0% -- a floor no surface signal could move.
+cyclization:
+  enabled: true
+  loss_weight: 0.1
+  hidden_dim: 256
+  detach_link_inputs: true
+  force_gold_valid: true
+  allow_asn_gln_isopeptide: true
+  type_conditioning: true
+  target_type: null  # inference only; set at generation time
+  # Endpoints are a constant on CPSea (520/520 sampled binders cyclize between the termini,
+  # all three types), so free (i, j) choice was an escape hatch, not expressiveness.
+  terminal_only: true
+  # Supervise the closing-bond DISTANCE, not just its (i, j, type) classification.
+  # Two-sided/flat-bottom: zero penalty inside the acceptance window, quadratic outside on
+  # BOTH sides, so the ring cannot optimise into a FUSED state.
+  bond_loss:
+    enabled: true
+    loss_weight: 0.05
+    t_lower_lim: 0.5
+
+lora:
+  r: null
+  lora_alpha: 32.0
+  lora_dropout: 0.0
+  train_bias: none
+
+dataset:
+  datamodule:
+    batch_size: 4
+    num_workers: 4
+
+opt:
+  lr: 0.0001
+  warmup_steps: 0
+  max_epochs: 20
+  accumulate_grad_batches: 1
+  skip_nan_grad: True
+  grad_and_weight_analysis: False
+  dist_strategy: auto
+  # Integer = every N optimizer steps (Lightning). SLURM launcher may override.
+  val_check_interval: 500
+  limit_train_batches: 1.0
+
+log:
+  wandb_project: cpsea_peptide_surface
+  log_wandb: True
+  log_every_n_steps: 10
+  checkpoint: True
+  checkpoint_every_n_steps: null
+  last_ckpt_every_n_steps: 1500
+  save_extra_checkpoints: false
+
+seed: 42
+
+ema:
+  decay: 0.999
+  validate_original_weights: False
+  every_n_steps: 1
+  cpu_offload: False

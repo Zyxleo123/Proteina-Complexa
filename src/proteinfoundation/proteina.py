@@ -29,6 +29,7 @@ from proteinfoundation.eval.sampled_binder_metrics import (
     atom37_mask_from_aatype,
     sampled_binder_metrics,
 )
+from proteinfoundation.eval.surface_metrics import batch_surface_agreement_from_ca
 from proteinfoundation.flow_matching.product_space_flow_matcher import ProductSpaceFlowMatcher
 from proteinfoundation.logging.metric_schema import finalize_metrics, init_metric_dict
 from proteinfoundation.nn.genie2 import Genie2Denoiser
@@ -189,6 +190,13 @@ class Proteina(L.LightningModule):
         self.val_gen_enabled = bool(self.val_gen_cfg.get("enabled", False)) if self.val_gen_cfg else False
         self._val_gen_sampler_warned = False
 
+        # Optional aux: pull predicted binder CA toward the conditioned surface patch.
+        # Useful as a gate-opening lever when zero-init keeps ∂L/∂Δ = g ≈ 0.
+        surf_loss_cfg = cfg_exp.get("surface_loss", None) or {}
+        self.surface_loss_enabled = bool(surf_loss_cfg.get("enabled", False))
+        self.surface_loss_weight = float(surf_loss_cfg.get("loss_weight", 0.1))
+        self.surface_loss_t_lower = float(surf_loss_cfg.get("t_lower_lim", 0.5))
+
         # NaN-safe epoch aggregation for metrics that are legitimately NaN on some steps (empty
         # t-bins, absent cyclization chemistries, ...). See `log_nan_safe` for why `self.log`'s
         # `reduce_fx` cannot do this. Populated lazily, keyed by sanitized metric name.
@@ -294,6 +302,22 @@ class Proteina(L.LightningModule):
             f"t_lower_lim={self.cyclization_bond_loss_t_lower})"
         )
 
+        # Angle/dihedral terms ride on the SAME decoded structure as the distance term.
+        # Decoding is the expensive part of this loss, so computing them here rather than
+        # in a second pass makes the extra geometry supervision nearly free. They are
+        # nested under bond_loss for that reason: without the decode there is nothing to
+        # measure, so they cannot be enabled independently of it.
+        geom_cfg = bond_cfg.get("geometry", None) or {}
+        self.cyclization_geometry_enabled = bool(geom_cfg.get("enabled", False))
+        self.cyclization_geometry_weight = float(geom_cfg.get("loss_weight", 0.05))
+        self.cyclization_geometry_w_angle = float(geom_cfg.get("w_angle", 1.0))
+        self.cyclization_geometry_w_dihedral = float(geom_cfg.get("w_dihedral", 1.0))
+        if self.cyclization_geometry_enabled:
+            logger.info(
+                f"Cyclization linkage-geometry loss enabled (loss_weight={self.cyclization_geometry_weight}, "
+                f"w_angle={self.cyclization_geometry_w_angle}, w_dihedral={self.cyclization_geometry_w_dihedral})"
+            )
+
     def _warn_on_vacuous_type_conditioning(self, cfg_exp):
         """Warns about the two ways type conditioning silently degrades into a no-op."""
         # 1. Without `cyclization_type_emb` in the denoiser's conditioning features, the
@@ -363,10 +387,24 @@ class Proteina(L.LightningModule):
                 param.requires_grad = False
         return autoencoder, autoencoder.latent_dim
 
+    def _surface_param_ids(self) -> set[int]:
+        """Parameter ids belonging to the optional surface encoder / cross-attn stack."""
+        nn = getattr(self, "nn", None)
+        if nn is None or not getattr(nn, "enable_surface", False):
+            return set()
+        ids: set[int] = set()
+        for mod_name in ("surface_encoder", "binder_surface_pair_feats", "surface_cross_layers"):
+            mod = getattr(nn, mod_name, None)
+            if mod is None:
+                continue
+            ids.update(id(p) for p in mod.parameters())
+        return ids
+
     def configure_optimizers(self):
         base_lr = self.cfg_exp.opt.lr
         ae_lr = self.cfg_exp.get("ae_lr", None)
         ae_lr_scale = self.cfg_exp.get("ae_lr_scale", None)
+        surface_lr_scale = self.cfg_exp.get("surface_lr_scale", None)
 
         ae = getattr(self, "autoencoder", None)
         use_separate_ae_lr = (
@@ -374,32 +412,53 @@ class Proteina(L.LightningModule):
             and not getattr(self, "freeze_autoencoder", True)
             and (ae_lr is not None or ae_lr_scale is not None)
         )
+        surface_ids = self._surface_param_ids()
+        use_surface_lr = surface_lr_scale is not None and len(surface_ids) > 0
+        trainable = [p for p in self.parameters() if p.requires_grad]
 
-        if use_separate_ae_lr:
-            # Joint training with a dedicated (typically smaller) AE learning rate: the AE can
-            # still adapt from its own recon/KL loss (see `training_step`) without moving as
-            # fast as the flow model, which may help preserve AE reconstruction quality/KL while
-            # still letting the flow shape the latent target somewhat. Default (both None) keeps
-            # the historical single-optimizer, single-lr behavior exactly.
-            ae_param_ids = {id(p) for p in ae.parameters()}
-            ae_params = [p for p in self.parameters() if p.requires_grad and id(p) in ae_param_ids]
-            other_params = [p for p in self.parameters() if p.requires_grad and id(p) not in ae_param_ids]
-            resolved_ae_lr = float(ae_lr) if ae_lr is not None else base_lr * float(ae_lr_scale)
-            logger.info(f"Using separate AE optimizer LR: {resolved_ae_lr} (flow/other params LR: {base_lr})")
-            optimizer = torch.optim.Adam(
-                [
-                    {"params": other_params, "lr": base_lr},
-                    {"params": ae_params, "lr": resolved_ae_lr},
-                ]
-            )
+        if use_separate_ae_lr or use_surface_lr:
+            # Optional dedicated LRs for AE and/or surface stack. Default (both off) keeps the
+            # historical single-optimizer, single-lr behavior exactly.
+            ae_param_ids = {id(p) for p in ae.parameters()} if use_separate_ae_lr else set()
+            ae_params = [p for p in trainable if id(p) in ae_param_ids]
+            surface_params = [
+                p for p in trainable if id(p) in surface_ids and id(p) not in ae_param_ids
+            ]
+            other_params = [
+                p for p in trainable if id(p) not in ae_param_ids and id(p) not in surface_ids
+            ]
+            groups: list[dict] = []
+            if other_params:
+                groups.append({"params": other_params, "lr": base_lr})
+            if surface_params:
+                if use_surface_lr:
+                    surf_lr = base_lr * float(surface_lr_scale)
+                    logger.info(
+                        f"Using separate surface optimizer LR: {surf_lr} "
+                        f"(scale={surface_lr_scale} × base_lr={base_lr}, n_params={len(surface_params)})"
+                    )
+                    groups.append({"params": surface_params, "lr": surf_lr})
+                elif groups:
+                    groups[0]["params"].extend(surface_params)
+                else:
+                    groups.append({"params": surface_params, "lr": base_lr})
+            if use_separate_ae_lr and ae_params:
+                resolved_ae_lr = (
+                    float(ae_lr) if ae_lr is not None else base_lr * float(ae_lr_scale)
+                )
+                logger.info(
+                    f"Using separate AE optimizer LR: {resolved_ae_lr} (flow/other params LR: {base_lr})"
+                )
+                groups.append({"params": ae_params, "lr": resolved_ae_lr})
+            optimizer = torch.optim.Adam(groups)
         else:
-            optimizer = torch.optim.Adam([p for p in self.parameters() if p.requires_grad], lr=base_lr)
+            optimizer = torch.optim.Adam(trainable, lr=base_lr)
 
         # Optional linear LR warmup (0 -> lr over warmup_steps, then constant). Helps when
         # finetuning pretrained weights onto an out-of-distribution data regime (e.g. short
         # cyclic peptides). Backward compatible: warmup_steps<=0 keeps the bare Adam optimizer.
         # When separate param groups are used, the same multiplier is applied to every group,
-        # preserving the base_lr/ae_lr ratio throughout warmup.
+        # preserving the base_lr/ae_lr (and surface) ratio throughout warmup.
         warmup_steps = int(self.cfg_exp.opt.get("warmup_steps", 0) or 0)
         if warmup_steps <= 0:
             return optimizer
@@ -537,6 +596,7 @@ class Proteina(L.LightningModule):
 
         self.log_losses(bs=bs, losses=losses, log_prefix=log_prefix, batch=batch)
         train_loss = sum([torch.mean(losses[k]) for k in losses if "_justlog" not in k])
+        self.log_surface_gates(bs=bs, log_prefix=log_prefix)
 
         cyclization_metrics = {}
         cyclization_loss_value = None
@@ -550,6 +610,10 @@ class Proteina(L.LightningModule):
         if getattr(self, "cyclization_bond_loss_enabled", False):
             bond_loss, _ = self.compute_cyclization_bond_loss(batch, nn_out, log_prefix=log_prefix, bs=bs)
             train_loss = train_loss + self.cyclization_bond_loss_weight * bond_loss
+
+        if getattr(self, "surface_loss_enabled", False):
+            surf_loss = self.compute_surface_attraction_loss(batch, nn_out, log_prefix=log_prefix, bs=bs)
+            train_loss = train_loss + self.surface_loss_weight * surf_loss
 
         # Joint AE training: anchor the (now trainable) autoencoder with its own recon+KL
         # objective so the encoder cannot collapse the flow target `z` into something trivial.
@@ -666,6 +730,117 @@ class Proteina(L.LightningModule):
                     sync_dist=True,
                     add_dataloader_idx=False,
                 )
+
+    def compute_surface_attraction_loss(
+        self,
+        batch: dict,
+        nn_out: dict,
+        log_prefix: str,
+        bs: int,
+    ) -> torch.Tensor:
+        """Symmetric soft-Chamfer between predicted clean binder CA and surface points (nm).
+
+        Applied only for samples with ``t_bb_ca >= t_lower_lim`` (prediction is noise below that).
+        Gives the zero-init gate a nonzero dL/dg even when the FM loss alone leaves g shut.
+        """
+        if "surface_xyz" not in batch or "surface_mask" not in batch:
+            z = torch.zeros((), device=self.device, dtype=torch.float32)
+            self.log(
+                f"{log_prefix}/surface_attraction",
+                z,
+                on_step=True,
+                on_epoch=True,
+                prog_bar=False,
+                logger=True,
+                batch_size=bs,
+                sync_dist=True,
+                add_dataloader_idx=False,
+            )
+            return z
+
+        x_1_pred = self.fm.nn_out_to_clean_sample_prediction(batch=batch, nn_out=nn_out)
+        ca = x_1_pred["bb_ca"]  # [B, N, 3] nm
+        binder_mask = batch["mask"].bool() if "mask" in batch else batch["coord_mask"][..., 1].bool()
+        surf = batch["surface_xyz"]
+        smask = batch["surface_mask"].bool()
+
+        dist = (ca[:, :, None, :] - surf[:, None, :, :]).norm(dim=-1)  # [B, N, M]
+        dist = dist.masked_fill(~smask[:, None, :], 1e6)
+        dist = dist.masked_fill(~binder_mask[:, :, None], 1e6)
+        d_bs = dist.min(dim=-1).values  # [B, N]
+        d_sb = dist.min(dim=1).values  # [B, M]
+
+        per_b = (d_bs * binder_mask).sum(-1) / binder_mask.sum(-1).clamp_min(1)
+        per_s = (d_sb * smask).sum(-1) / smask.sum(-1).clamp_min(1)
+        per = 0.5 * (per_b + per_s)
+
+        t = batch["t"]["bb_ca"]
+        if t.dim() > 1:
+            t = t.reshape(t.shape[0], -1)[:, 0]
+        active = (t >= self.surface_loss_t_lower).to(dtype=per.dtype)
+        # If no sample is active, return 0 (no spurious grad) but still log the raw Chamfer.
+        denom = active.sum().clamp_min(1.0)
+        loss = (per * active).sum() / denom
+
+        self.log(
+            f"{log_prefix}/surface_attraction",
+            loss.detach(),
+            on_step=True,
+            on_epoch=True,
+            prog_bar=False,
+            logger=True,
+            batch_size=bs,
+            sync_dist=True,
+            add_dataloader_idx=False,
+        )
+        self.log(
+            f"{log_prefix}/surface_attraction_raw",
+            per.mean().detach(),
+            on_step=True,
+            on_epoch=True,
+            prog_bar=False,
+            logger=True,
+            batch_size=bs,
+            sync_dist=True,
+            add_dataloader_idx=False,
+        )
+        return loss
+
+    def log_surface_gates(self, bs: int, log_prefix: str) -> None:
+        """Log zero-init surface cross-attn gates (`g` in ``h ← h + g·Δ``).
+
+        If these stay ~0, surface conditioning is inert and all arms look like baseline.
+        """
+        nn = getattr(self, "nn", None)
+        layers = getattr(nn, "surface_cross_layers", None) if nn is not None else None
+        if not layers:
+            return
+        abs_vals = []
+        for name, layer in layers.items():
+            g = float(layer.gate.detach().float().item())
+            abs_vals.append(abs(g))
+            self.log(
+                f"{log_prefix}/surface_gate/layer_{name}",
+                g,
+                on_step=True,
+                on_epoch=True,
+                prog_bar=False,
+                logger=True,
+                batch_size=bs,
+                sync_dist=True,
+                add_dataloader_idx=False,
+            )
+        self.log(
+            f"{log_prefix}/surface_gate/abs_mean",
+            float(sum(abs_vals) / len(abs_vals)),
+            on_step=True,
+            on_epoch=True,
+            prog_bar=False,
+            logger=True,
+            batch_size=bs,
+            sync_dist=True,
+            add_dataloader_idx=False,
+        )
 
     def log_nan_safe(self, key: str, value, bs: int, on_step: bool) -> None:
         """`self.log` for metrics whose per-step value is legitimately NaN sometimes.
@@ -1059,13 +1234,32 @@ class Proteina(L.LightningModule):
             mask=binder_mask,
         )
 
+        decoded_mask = decoded["atom_mask"].bool() & binder_mask.bool()[..., None]
+        decoded_seq = decoded["residue_type"].long()
+        t_weight = self._bond_loss_t_weight(batch)
+
         loss, metrics = cyclization_bond_loss(
             pred_atom37=decoded["coors_nm"],
-            atom37_mask=decoded["atom_mask"].bool() & binder_mask.bool()[..., None],
-            seq_tokens=decoded["residue_type"].long(),
+            atom37_mask=decoded_mask,
+            seq_tokens=decoded_seq,
             cyclization_metadata=cyclization_metadata,
-            t_weight=self._bond_loss_t_weight(batch),
+            t_weight=t_weight,
         )
+
+        if getattr(self, "cyclization_geometry_enabled", False):
+            from proteinfoundation.cyclization.linkage_geometry import linkage_geometry_loss
+
+            geom_loss, geom_metrics = linkage_geometry_loss(
+                pred_atom37=decoded["coors_nm"],
+                atom37_mask=decoded_mask,
+                seq_tokens=decoded_seq,
+                cyclization_metadata=cyclization_metadata,
+                w_angle=self.cyclization_geometry_w_angle,
+                w_dihedral=self.cyclization_geometry_w_dihedral,
+                t_weight=t_weight,
+            )
+            loss = loss + self.cyclization_geometry_weight * geom_loss
+            metrics.update({f"geom_{k}": v for k, v in geom_metrics.items()})
 
         self.log(
             f"{log_prefix}/loss_cyclization_bond",
@@ -1487,6 +1681,20 @@ class Proteina(L.LightningModule):
             n_repeat=n_repeat,
             prefix="val_gen",
         )
+
+        # Surface agreement on the ODE sample (oracle / shuffle arms). Teacher-forced FM loss
+        # cannot see whether the integrated binder lands on the conditioned patch; this can.
+        if "surface_xyz" in gen_batch and "surface_mask" in gen_batch:
+            metrics.update(
+                batch_surface_agreement_from_ca(
+                    ca_nm=coors[:, :, 1, :],
+                    binder_mask=gen_mask,
+                    surface_xyz_nm=gen_batch["surface_xyz"],
+                    surface_mask=gen_batch["surface_mask"],
+                    surface_normals=gen_batch.get("surface_normals"),
+                    prefix="val_gen/surface",
+                )
+            )
 
         # Cyclization closure on the SAMPLED structure: the model's own predicted (i, j, type) and
         # its own sequence's chemistry. This is the number that reads ~45% teacher-forced and has

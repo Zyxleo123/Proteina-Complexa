@@ -181,11 +181,20 @@ def run_af_eval(
     binder_length: int,
     binder_chain: str = "B",
     sequence_type_list: list[Literal["mpnn", "mpnn_fixed", "self"]] | None = None,
+    cyclic_offset: bool = False,
+    cyclization_type: str | None = None,
 ):
     """Run AF2-Multimer refolding evaluation for generated binders.
 
     For each sequence in *binder_sequences*, predicts the complex
     structure with AF2 and returns per-sequence confidence statistics.
+
+    When *cyclic_offset* is set (and *cyclization_type* is one the wrap is valid
+    for), the binder's pairwise sequence offset is wrapped around the ring so AF2
+    folds a macrocycle rather than a linear peptide -- otherwise every confidence
+    metric here describes a molecule whose closing bond has been silently cut. See
+    `proteinfoundation.evaluation.cyclic_offset`. Off by default: existing
+    evaluations are unchanged.
 
     The underlying AF2 model is cached across calls (keyed on
     architecture-affecting settings in *advanced_settings*).  The first
@@ -225,6 +234,18 @@ def run_af_eval(
                 binder_len=binder_length,
                 rm_target_seq=advanced_settings["rm_template_seq_predict"],
                 rm_target_sc=advanced_settings["rm_template_sc_predict"],
+            )
+
+        # After prep_inputs (which builds _inputs) and before any predict call. Done once
+        # per design rather than per sequence: prep_inputs is what installs the offset and
+        # it is not re-run inside the sequence loop below.
+        if cyclic_offset:
+            from proteinfoundation.evaluation.cyclic_offset import apply_cyclic_offset
+
+            apply_cyclic_offset(
+                af_model=complex_prediction_model,
+                binder_len=binder_length,
+                linkage_type=cyclization_type,
             )
 
         save_location = "AF2"

@@ -1,0 +1,76 @@
+# CPSea peptide dataset with oracle peptide-interface surface caches attached.
+#
+# Identical to cpsea_peptide.yaml except AttachPeptideSurfaceTransform runs after
+# segment detection (Å frame) and before nm / rotation / centering, which keep the
+# surface aligned with binder CA. Requires precomputed caches:
+#   python scripts/extract_peptide_surfaces.py --dataset-config ... --output-dir <surface_dir>
+#
+# CPSEA_SURFACE_DIR is REQUIRED — there is deliberately no default. It used to fall back
+# to surfaces/cpsea_sample100, so any launcher that forgot to export it silently trained on
+# the ~90-complex smoke set and then died on the first row without a cache.
+# Full data:  export CPSEA_SURFACE_DIR=$PROTEINA_ZFS_PATH/surfaces/cpsea
+#
+# Local sample100 smoke (opt in explicitly):
+#   CPSEA_SURFACE_DIR=${PWD}/surfaces/cpsea_sample100 \
+#   ... ++dataset.datamodule.metadata_file=${PWD}/CPSea_data/preprocessed_sample100/metadata/cpsea_train.parquet
+#       ++dataset.datamodule.val_metadata_file=${PWD}/CPSea_data/preprocessed_sample100/metadata/cpsea_val.parquet
+
+datamodule:
+  _target_: proteinfoundation.datasets.structure_data.StructureDataModule
+  metadata_file: ${oc.env:CPSEA_DATA_PATH}/preprocessed/metadata/cpsea_train.parquet
+  val_metadata_file: ${oc.env:CPSEA_DATA_PATH}/preprocessed/metadata/cpsea_val.parquet
+  base_dir: ""
+  batch_size: 6
+  num_workers: 8
+  path_column: path
+  id_column: example_id
+  pin_memory: true
+  use_parse: false
+
+  columns_to_load:
+    - example_id
+    - path
+    - binder_chain_id
+    - cluster_id
+    - peptide_length
+    - cyclization_type
+
+  atom37_transforms:
+    - _target_: proteinfoundation.datasets.transforms.SegmentAwareResidueFeaturesTransform
+      cn_break_cutoff: 2.0
+      segment_fix_level: full
+    - _target_: proteinfoundation.datasets.transforms.AttachPeptideSurfaceTransform
+      surface_dir: ${oc.env:CPSEA_SURFACE_DIR}
+      num_points: 96
+      require_surface: true
+    - _target_: proteinfoundation.datasets.transforms.CoordsToNanometers
+    - _target_: proteinfoundation.datasets.transforms.GlobalRotationTransform
+    - _target_: proteinfoundation.datasets.transforms.CroppingTransform2
+      crop_size: 256
+      interface_threshold: 8.0
+      dist_mode: "bb_ca"
+      data_mode: "all-atom"
+      crop_binder: false
+      binder_min_length: 5
+      binder_max_length: 16
+      binder_padding_length: 0
+      target_min_length: 30
+      target_spatial_crop_threshold: 15.0
+      max_num_target_chains: -1
+    - _target_: proteinfoundation.datasets.transforms.ContactTransform
+      cutoff: 8.0
+      min_perc: 0.0
+      max_perc: 0.2
+      contact_prob: 1.0
+      contact_dropout_prob: 0.5
+      hotspot_dropout_prob: 0.5
+    - _target_: proteinfoundation.datasets.transforms.OpenFoldFrameTransform
+    - _target_: proteinfoundation.datasets.transforms.ChainBreakPerResidueTransform
+    - _target_: proteinfoundation.datasets.transforms.CenteringTransform
+      center_mode: "target"
+      data_mode: "all-atom"
+    - _target_: proteinfoundation.datasets.transforms.ExtractTargetCoordinatesTransform
+      compact_mode: true
+    - _target_: proteinfoundation.datasets.transforms.FilterTargetResiduesTransform
+    - _target_: proteinfoundation.datasets.transforms.CyclizationLabelTransform
+      default_binder_chain_id: "B"

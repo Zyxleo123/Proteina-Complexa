@@ -305,7 +305,11 @@ class GlobalRotationTransform(BaseTransform):
     """Modifies the global rotation of the atom37 representation randomly.
 
     Should be used as the first transform in the pipeline that modifies coordinates in order to keep
-    e.g. frame construction or other things consistent down the pipeline."""
+    e.g. frame construction or other things consistent down the pipeline.
+
+    Stashes ``graph.global_rotation`` (the right-multiply matrix applied to row vectors) and
+    applies the same rotation to any attached peptide surface points *and* normals.
+    """
 
     def __init__(self, rotation_strategy: Literal["uniform"] = "uniform"):
         self.rotation_strategy = rotation_strategy
@@ -315,8 +319,13 @@ class GlobalRotationTransform(BaseTransform):
             rot = sample_uniform_rotation(dtype=graph.coords_nm.dtype, device=graph.coords_nm.device)
         else:
             raise ValueError(f"Rotation strategy {self.rotation_strategy} not supported")
+        graph.global_rotation = rot
         graph.coords_nm = torch.matmul(graph.coords_nm, rot)  # [n, 37, 3] * [3, 3] -> [n, 37, 3]
         # masked coords will still be 0
+        if hasattr(graph, "surface_xyz") and graph.surface_xyz is not None:
+            graph.surface_xyz = torch.matmul(graph.surface_xyz, rot)
+        if hasattr(graph, "surface_normals") and graph.surface_normals is not None:
+            graph.surface_normals = torch.matmul(graph.surface_normals, rot)
         return graph
 
 
@@ -452,10 +461,148 @@ class GlobalTranslationTransform(BaseTransform):
 
 
 class CoordsToNanometers(BaseTransform):
-    """Gets cordinates in nanometers."""
+    """Gets cordinates in nanometers.
+
+    Also converts attached peptide-surface coordinates / receptor distances from Å to nm
+    when present (normals are directions and are left unchanged).
+    """
 
     def __call__(self, graph: Data) -> Data:
         graph.coords_nm = ang_to_nm(graph.coords)
+        if hasattr(graph, "surface_xyz") and graph.surface_xyz is not None:
+            graph.surface_xyz = ang_to_nm(graph.surface_xyz)
+        if hasattr(graph, "surface_distance") and graph.surface_distance is not None:
+            graph.surface_distance = ang_to_nm(graph.surface_distance)
+        return graph
+
+
+class AttachPeptideSurfaceTransform(BaseTransform):
+    """Load a precomputed peptide-interface surface cache onto the sample.
+
+    Reads a cache via ``resolve_cache_path(surface_dir, example_id)`` (sharded
+    ``hh/hh/*.surface.npz`` or legacy flat layout; see
+    ``proteinfoundation.surface.peptide_surface``) and attaches the fixed-size sampled
+    interface point cloud in the source PDB's Angstrom frame. Downstream
+    ``CoordsToNanometers`` / ``GlobalRotationTransform`` / ``CenteringTransform`` keep it
+    aligned with binder CA.
+
+    Args:
+        surface_dir: Directory of ``*.surface.npz`` caches.
+        num_points: Expected sample count ``M`` (default 96). Caches with a different
+            ``sample_count`` are rejected when ``require_surface`` is True.
+        require_surface: If True (default), missing/invalid caches raise. If False,
+            attaches an all-masked zero cloud so the batch schema stays uniform.
+    """
+
+    def __init__(
+        self,
+        surface_dir: str,
+        num_points: int = 96,
+        require_surface: bool = True,
+    ):
+        self.surface_dir = Path(surface_dir)
+        self.num_points = int(num_points)
+        self.require_surface = bool(require_surface)
+
+    def _example_id(self, graph: Data) -> str:
+        for key in ("example_id", "id"):
+            if hasattr(graph, key) and getattr(graph, key) is not None:
+                return str(getattr(graph, key))
+        raise ValueError("AttachPeptideSurfaceTransform needs graph.example_id or graph.id")
+
+    def _empty(self, dtype=torch.float32) -> tuple[torch.Tensor, ...]:
+        m = self.num_points
+        xyz = torch.zeros(m, 3, dtype=dtype)
+        normals = torch.zeros(m, 3, dtype=dtype)
+        mask = torch.zeros(m, dtype=torch.bool)
+        dist = torch.zeros(m, dtype=dtype)
+        return xyz, normals, mask, dist
+
+    def __call__(self, graph: Data) -> Data:
+        from proteinfoundation.surface.peptide_surface import (
+            EXTRACTOR_VERSION,
+            is_cache_valid,
+            load_surface_cache,
+            resolve_cache_path,
+        )
+
+        example_id = self._example_id(graph)
+        cache_path = resolve_cache_path(self.surface_dir, example_id)
+
+        if not is_cache_valid(
+            cache_path,
+            num_points=self.num_points,
+            version=EXTRACTOR_VERSION,
+        ):
+            if self.require_surface:
+                raise FileNotFoundError(
+                    f"Missing or invalid surface cache for {example_id}: {cache_path}"
+                )
+            xyz, normals, mask, dist = self._empty()
+        else:
+            surface = load_surface_cache(cache_path)
+            xyz = torch.from_numpy(np.asarray(surface.sampled_xyz, dtype=np.float32))
+            normals = torch.from_numpy(np.asarray(surface.sampled_normals, dtype=np.float32))
+            mask = torch.from_numpy(np.asarray(surface.sampled_valid_mask, dtype=bool))
+            dist = torch.from_numpy(
+                np.asarray(surface.sampled_receptor_distance, dtype=np.float32)
+            )
+            if xyz.shape[0] != self.num_points:
+                raise ValueError(
+                    f"Surface cache {cache_path} has M={xyz.shape[0]}, expected {self.num_points}"
+                )
+
+        graph.surface_xyz = xyz
+        graph.surface_normals = normals
+        graph.surface_mask = mask
+        graph.surface_distance = dist
+        return graph
+
+
+class ShufflePeptideSurfaceTransform(BaseTransform):
+    """Replace the attached surface with one from a different complex (oracle control).
+
+    Must run after ``AttachPeptideSurfaceTransform``. Picks another ``*.surface.npz`` from
+    the same directory (deterministically from ``seed`` + example id so a given sample
+    always gets the same wrong surface across workers of one epoch setup; change ``seed``
+    to reshuffle).
+    """
+
+    def __init__(self, surface_dir: str, num_points: int = 96, seed: int = 0):
+        self.surface_dir = Path(surface_dir)
+        self.num_points = int(num_points)
+        self.seed = int(seed)
+        self._cache_ids: list[str] | None = None
+
+    def _ids(self) -> list[str]:
+        if self._cache_ids is None:
+            # ``Path("foo.surface.npz").stem`` is ``foo.surface``; strip the suffix explicitly.
+            self._cache_ids = sorted(
+                p.name[: -len(".surface.npz")] for p in self.surface_dir.glob("*.surface.npz")
+            )
+        return self._cache_ids
+
+    def __call__(self, graph: Data) -> Data:
+        from proteinfoundation.surface.peptide_surface import load_surface_cache
+
+        ids = self._ids()
+        if len(ids) < 2:
+            raise RuntimeError(f"Need >=2 surface caches in {self.surface_dir} to shuffle")
+
+        own = str(getattr(graph, "example_id", getattr(graph, "id", "")))
+        rng = np.random.default_rng(self.seed + (hash(own) % (2**31)))
+        choices = [i for i in ids if i != own] or ids
+        other = choices[int(rng.integers(len(choices)))]
+        surface = load_surface_cache(self.surface_dir / f"{other}.surface.npz")
+        graph.surface_xyz = torch.from_numpy(np.asarray(surface.sampled_xyz, dtype=np.float32))
+        graph.surface_normals = torch.from_numpy(
+            np.asarray(surface.sampled_normals, dtype=np.float32)
+        )
+        graph.surface_mask = torch.from_numpy(np.asarray(surface.sampled_valid_mask, dtype=bool))
+        graph.surface_distance = torch.from_numpy(
+            np.asarray(surface.sampled_receptor_distance, dtype=np.float32)
+        )
+        graph.surface_shuffled_from = other
         return graph
 
 
@@ -948,6 +1095,9 @@ class CroppingTransform2(BaseTransform):
     def _crop_graph(self, graph: Data, crop_idxs: torch.Tensor) -> Data:
         num_residues = graph.coords.size(0)
         for key, value in graph:
+            # Peptide-surface tensors are fixed-M point clouds, not per-residue features.
+            if isinstance(key, str) and key.startswith("surface_"):
+                continue
             if torch.is_tensor(value) and value.dim() > 0 and value.size(0) == num_residues:
                 graph[key] = value[crop_idxs]
             elif isinstance(value, list) and len(value) == num_residues:
@@ -1926,6 +2076,8 @@ class CenteringTransform(BaseTransform):
             masked_mean += translation
             graph.stochastic_translation = translation
         # substract the mean of that chain from all coordinates
+        # Stash the translation so auxiliary point clouds (peptide surfaces) can share the frame.
+        graph.center_offset = masked_mean.detach().reshape(-1)  # [3]
         if self.data_mode == "bb_ca":
             graph["coords_nm"] -= masked_mean
             graph["coords_nm"] = graph["coords_nm"] * graph["coord_mask"][..., None]
@@ -1933,6 +2085,13 @@ class CenteringTransform(BaseTransform):
             graph["coords_nm"] = graph["coords_nm"].flatten(0, 1) - masked_mean
             graph["coords_nm"] = graph["coords_nm"].view(original_coords_shape)
             graph["coords_nm"] = graph["coords_nm"] * graph["coord_mask"][..., None]
+        if hasattr(graph, "surface_xyz") and graph.surface_xyz is not None:
+            # Normals are directions: translate points only.
+            graph.surface_xyz = graph.surface_xyz - graph.center_offset
+            if hasattr(graph, "surface_mask") and graph.surface_mask is not None:
+                graph.surface_xyz = graph.surface_xyz * graph.surface_mask.to(
+                    dtype=graph.surface_xyz.dtype
+                )[..., None]
         return graph
 
 
@@ -2768,6 +2927,9 @@ class FilterTargetResiduesTransform(BaseTransform):
         for attr_name in list(graph.keys()):
             # Skip target-related features (they should remain at full length for conditioning)
             if "target" in attr_name.lower():
+                continue
+            # Peptide-surface point clouds are fixed-M, not residue-aligned.
+            if attr_name.startswith("surface_"):
                 continue
 
             attr_value = getattr(graph, attr_name)

@@ -2,6 +2,7 @@ import einops
 import torch
 from loguru import logger
 
+from proteinfoundation.cyclization.constants import MAINCHAIN, NUM_CYCLIZATION_TYPES, UNSPECIFIED
 from proteinfoundation.nn.feature_factory.base_feature import Feature
 from proteinfoundation.nn.feature_factory.feature_utils import (
     bin_and_one_hot,
@@ -152,9 +153,64 @@ class CyclizationGraphPositionalPairFeat(Feature):
         (non-CPSea) are inactive throughout, so this is a no-op for them.
     """
 
-    def __init__(self, ring_sep_dim=32, **kwargs):
-        # +1 for the closing-edge indicator channel.
-        super().__init__(dim=ring_sep_dim + 1)
+    def __init__(
+        self,
+        ring_sep_dim=32,
+        typed_edge=False,
+        link_direction=False,
+        cyclic_offset_dim=0,
+        **kwargs,
+    ):
+        """Optional channels are all OFF by default and APPENDED, never inserted.
+
+        Append-only matters for two reasons. `feats_pair_repr` is the column order of the
+        concat feeding `pair_repr_builder.init_repr_factory.linear_out`, which
+        `_splice_pretrained_weights` warm-starts by copying a checkpoint's leading columns
+        and zero-padding the rest. Since `cyclization_ring_pe` is required to sit LAST in
+        that list, appending here keeps every pre-existing column aligned -- so a run can
+        warm-start from a checkpoint trained without these channels and begin numerically
+        identical to it, with the new columns contributing exactly zero.
+
+        With every flag off, `dim` and the emitted tensor are bit-identical to before.
+
+        Args:
+            ring_sep_dim: Geodesic one-hot bins on the cycle graph.
+            typed_edge: Add a 3-way chemistry one-hot (MAINCHAIN / DISULFIDE / ISOPEPTIDE)
+                on the closing edge. Without it the pair representation is type-AGNOSTIC:
+                it says two residues are ring-adjacent but not what bond joins them, so the
+                chemistry has to reach a pairwise geometric decision indirectly, from the
+                global `cyclization_type_emb` conditioning vector. That matters because the
+                bond lengths differ -- mainchain C-N and isopeptide NZ-C are both ~1.33 A
+                while disulfide SG-SG is ~2.05 A -- and disulfide is the observed laggard.
+                NONE is encoded as the zero vector (every non-closing pair), so no channel
+                is spent on it and the all-zero null for classifier-free guidance survives.
+            link_direction: Split the symmetric closing-edge indicator into two directed
+                channels (i->j and j->i). Isopeptide is chemically asymmetric (a Lys NZ
+                donor bonded to an Asp/Asn carbonyl acceptor), so an undirected edge cannot
+                express which end is which. This gives the model the orientation; it does
+                NOT identify donor from acceptor, which would need residue identities the
+                request does not carry (see the note in the class docstring about never
+                conditioning on predictions).
+            cyclic_offset_dim: If > 0, add a signed cyclic sequence-offset one-hot with
+                this many bins, active for MAINCHAIN only. Kept distinct from the unsigned
+                geodesic so an ablation can tell which of the two actually carries the
+                signal. Only head-to-tail makes the termini true backbone neighbours; for a
+                side-chain linkage a signed backbone wrap would assert a peptide bond that
+                does not exist.
+        """
+        self.typed_edge = bool(typed_edge)
+        self.link_direction = bool(link_direction)
+        self.cyclic_offset_dim = int(cyclic_offset_dim or 0)
+
+        dim = ring_sep_dim + 1  # geodesic one-hot + closing-edge indicator
+        if self.typed_edge:
+            dim += NUM_CYCLIZATION_TYPES
+        if self.link_direction:
+            dim += 2
+        if self.cyclic_offset_dim:
+            dim += self.cyclic_offset_dim
+
+        super().__init__(dim=dim)
         self.ring_sep_dim = ring_sep_dim
 
     def _resolve_active(self, batch, b, device):
@@ -166,6 +222,20 @@ class CyclizationGraphPositionalPairFeat(Feature):
         if "has_cyclization" in batch:
             return batch["has_cyclization"].to(device=device).bool()
         return torch.zeros(b, dtype=torch.bool, device=device)
+
+    def _resolve_type(self, batch, b, device):
+        """[b] long: the REQUESTED chemistry, or UNSPECIFIED.
+
+        Same source and same status as `_resolve_active` -- the request, never a
+        prediction -- so this is constant across `t` and cannot feed a wrong topology back
+        in at high noise. Rows without a usable request are left UNSPECIFIED and are
+        zeroed by the `active` gate anyway.
+        """
+        if "cyclization_type_cond" in batch:
+            return batch["cyclization_type_cond"].to(device=device).long()
+        if "cyclization_type" in batch:
+            return batch["cyclization_type"].to(device=device).long()
+        return torch.full((b,), UNSPECIFIED, dtype=torch.long, device=device)
 
     def _resolve_endpoints(self, batch, mask, b, n, device):
         """([b], [b]) long: closing-bond endpoints, defaulting to the binder termini."""
@@ -222,9 +292,54 @@ class CyclizationGraphPositionalPairFeat(Feature):
         ).float()  # [b, n, n, ring_sep_dim]
 
         # Which pair *is* the bond -- the type says what to build, this says where.
-        is_closing = (((a == ii) & (c == jj)) | ((a == jj) & (c == ii))).float()[..., None]
+        fwd_edge = (a == ii) & (c == jj)  # [b, n, n]
+        rev_edge = (a == jj) & (c == ii)
+        is_closing_bool = fwd_edge | rev_edge
+        is_closing = is_closing_bool.float()[..., None]
 
-        feat = torch.cat([geo_onehot, is_closing], dim=-1)  # [b, n, n, ring_sep_dim + 1]
+        channels = [geo_onehot, is_closing]  # base: always emitted, in this order
+
+        # --- optional channels, appended in a FIXED order (see __init__) ---
+        if self.typed_edge:
+            cyc_type = self._resolve_type(batch, b, device)  # [b]
+            # UNSPECIFIED (and any out-of-range value) must not index the one-hot; those
+            # rows are inactive anyway, so clamp and let the `active` gate zero them.
+            in_range = (cyc_type >= 0) & (cyc_type < NUM_CYCLIZATION_TYPES)
+            type_onehot = torch.nn.functional.one_hot(
+                cyc_type.clamp(0, NUM_CYCLIZATION_TYPES - 1), num_classes=NUM_CYCLIZATION_TYPES
+            ).float()  # [b, NUM_CYCLIZATION_TYPES]
+            type_onehot = type_onehot * in_range[:, None].float()
+            # Placed ONLY on the closing edge: a chemistry label smeared over every pair
+            # would say "this complex is a disulfide", which the global type embedding
+            # already says. The point here is "THIS bond is a disulfide".
+            typed = type_onehot[:, None, None, :] * is_closing_bool[..., None].float()
+            channels.append(typed)  # [b, n, n, NUM_CYCLIZATION_TYPES]
+
+        if self.link_direction:
+            channels.append(torch.stack([fwd_edge.float(), rev_edge.float()], dim=-1))
+
+        if self.cyclic_offset_dim:
+            # Signed shortest displacement around the ring, distinct from the unsigned
+            # geodesic above. `chain_sep` is |a - c|; the signed linear offset is (a - c).
+            linear = a - c  # [b, n, n]
+            length = mask.long().sum(dim=1).clamp(min=1)[:, None, None]  # [b, 1, 1]
+            abs_lin = linear.abs()
+            # Strict '>' leaves the exactly-antipodal tie on the linear branch, so even
+            # ring lengths resolve deterministically instead of flipping between calls.
+            wrapped = torch.where(
+                abs_lin > (length // 2),
+                -torch.sign(linear) * (length - abs_lin),
+                linear,
+            )
+            half = self.cyclic_offset_dim // 2
+            bins = torch.arange(-half, -half + self.cyclic_offset_dim, device=device)
+            offset_onehot = (wrapped.clamp(min=int(bins[0]), max=int(bins[-1]))[..., None] == bins).float()
+            # MAINCHAIN only: a signed BACKBONE wrap asserts the termini are peptide-bonded,
+            # which is true exactly when the closing bond is that peptide bond.
+            is_mainchain = (self._resolve_type(batch, b, device) == MAINCHAIN).float()
+            channels.append(offset_onehot * is_mainchain[:, None, None, None])
+
+        feat = torch.cat(channels, dim=-1)  # [b, n, n, self.dim]
         # Inactive rows emit exactly zero rather than the plain chain separation:
         # that information is already in `rel_seq_sep`, and zeroing keeps this feature
         # purely a cyclization signal with a clean null for classifier-free guidance.

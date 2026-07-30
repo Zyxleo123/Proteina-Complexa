@@ -378,6 +378,80 @@ def run_monomer_evaluation(
     return df
 
 
+def _resolve_requested_cyclization_type(cfg: DictConfig, cfg_metric: DictConfig) -> str | None:
+    """The macrocycle chemistry the generator was ASKED for, or None if nothing was requested.
+
+    Without this, `binder_cyc_type_satisfied` is never computed and closure gets scored
+    against whatever the model happened to build -- which cannot distinguish "did what it
+    was told" from "did something else that also closed".
+
+    Three sources, most specific first:
+
+    1. ``metric.cyclization_type`` -- an explicit override for this evaluation.
+    2. The generation-side dataset config, when the full pipeline config is in scope.
+    3. The targets dict, keyed by ``dataset.task_name``.
+
+    (2) and (3) cannot drift: `binder_generate.yaml` sets its value by ``oc.select`` on the
+    very same targets-dict entry that (3) reads, so they are one source with two spellings.
+
+    This previously read only (2), under a blanket ``contextlib.suppress(Exception)``. The
+    evaluation config has no ``dataloader`` key at all, so that lookup raised on every run
+    and was silently swallowed -- returning None even when the command line had explicitly
+    passed ``++metric.cyclization_type=isopeptide``. A miss is now logged rather than
+    hidden, because "no type was requested" and "the lookup is broken" produce identical
+    downstream data and must not be indistinguishable.
+    """
+    explicit = cfg_metric.get("cyclization_type", None)
+    if explicit:
+        return str(explicit)
+
+    try:
+        value = cfg.dataloader.dataset.conditional_features[0].get("cyclization_type")
+        if value:
+            return str(value)
+    except Exception:  # noqa: BLE001 - shape differs between pipeline and standalone eval configs
+        pass
+
+    task_name = None
+    for path in (("dataset", "task_name"), ("generation", "task_name"), ("task_name",)):
+        with contextlib.suppress(Exception):
+            node = cfg
+            for key in path:
+                node = node[key]
+            if node:
+                task_name = str(node)
+                break
+
+    if task_name:
+        # Where the targets dict lands depends on how it was composed
+        # (`- /targets/targets_dict@dataset` puts it at dataset.target_dict_cfg).
+        for holder in (
+            ("dataset", "target_dict_cfg"),
+            ("target_dict_cfg",),
+            ("generation", "target_dict_cfg"),
+            ("dataset",),
+        ):
+            with contextlib.suppress(Exception):
+                node = cfg
+                for key in holder:
+                    node = node[key]
+                value = node[task_name].get("cyclization_type")
+                if value:
+                    logger.info(
+                        f"Resolved requested cyclization type {str(value)!r} for {task_name} "
+                        f"from {'.'.join(holder)}"
+                    )
+                    return str(value)
+
+    logger.warning(
+        f"No requested cyclization type resolved (task_name={task_name}). Closure will be scored "
+        "against the OBSERVED chemistry, so `binder_cyc_type_satisfied` stays null and "
+        "per-linkage breakdowns are not valid. Set `metric.cyclization_type` or add "
+        "`cyclization_type` to the target's entry in the targets dict."
+    )
+    return None
+
+
 def _add_pre_refolding_metrics(
     cfg: DictConfig,
     df: pd.DataFrame,
@@ -417,12 +491,8 @@ def _add_pre_refolding_metrics(
     compute_cyclization = pre_refolding_cfg.get("cyclization", False)
 
     # The type the generator was told to build, so closure can be scored against the
-    # request rather than against whatever the model happened to produce. Lives on the
-    # generation-side dataset config (see `binder_generate.yaml`), which is where it was
-    # set; re-deriving it here would let the two disagree silently.
-    cyclization_type = None
-    with contextlib.suppress(Exception):
-        cyclization_type = cfg.dataloader.dataset.conditional_features[0].get("cyclization_type")
+    # request rather than against whatever the model happened to produce.
+    cyclization_type = _resolve_requested_cyclization_type(cfg, cfg_metric)
 
     enabled = []
     if compute_bioinformatics:

@@ -1,0 +1,48 @@
+{
+  "success_thresholds": {
+    "pLDDT": {
+      "threshold": 0.3496,
+      "op": ">=",
+      "scale": 1.0,
+      "column_prefix": "complex"
+    },
+    "i_pAE": {
+      "threshold": 21.4179,
+      "op": "<=",
+      "scale": 31.0,
+      "column_prefix": "complex"
+    },
+    "scRMSD_ca": {
+      "threshold": 3.6187,
+      "op": "<",
+      "scale": 1.0,
+      "column_prefix": "binder"
+    }
+  },
+  "calibration_report": {
+    "pLDDT": {
+      "n_natives": 5,
+      "native_min": 0.368,
+      "native_median": 0.615,
+      "native_max": 0.781,
+      "worst_native": 0.368,
+      "derived_threshold_raw": 0.3496
+    },
+    "i_pAE": {
+      "n_natives": 5,
+      "native_min": 0.2,
+      "native_median": 0.457,
+      "native_max": 0.658,
+      "worst_native": 0.658,
+      "derived_threshold_raw": 0.6909
+    },
+    "scRMSD_ca": {
+      "n_natives": 5,
+      "native_min": 1.6073,
+      "native_median": 2.2384,
+      "native_max": 3.4464,
+      "worst_native": 3.4464,
+      "derived_threshold_raw": 3.6187
+    }
+  }
+}

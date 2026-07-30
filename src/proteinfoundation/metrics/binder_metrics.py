@@ -40,6 +40,8 @@ def run_binder_eval(
     binder_chain: str = None,  # If none, use the last chain id in the refolded complex
     num_redesign_seqs: int = None,  # If none, default to 8 for protein targets, 1 for ligand targets
     fixed_residues_override: list[str] | None = None,
+    cyclic_offset: bool = False,
+    cyclization_type: str | None = None,
 ) -> dict[str, list[dict[str, dict]]]:
     """Evaluates protein binder designs using inverse folding models and folding models.
 
@@ -274,6 +276,10 @@ def run_binder_eval(
             "binder_length": binder_length,
             "binder_chain": binder_chain,
             "sequence_type_list": sequence_types_list,  # added this to save the type in the file name
+            # Fold the binder as a macrocycle rather than a linear chain. Only reaches
+            # ColabDesign: RF3 has its own topology handling and is not patched here.
+            "cyclic_offset": cyclic_offset,
+            "cyclization_type": cyclization_type,
         }
     elif model_name == "RF3":
         from proteinfoundation.utils.rf3_model import run_rf3_eval

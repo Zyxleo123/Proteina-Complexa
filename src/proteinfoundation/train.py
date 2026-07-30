@@ -515,7 +515,13 @@ def main(cfg_exp) -> None:
     if cfg_exp.log.log_wandb and not nolog:
         wandb_project = cfg_exp.log.wandb_project
         wandb_entity = cfg_exp.log.get("wandb_entity", None)
-        if resuming_training:
+        # `log.wandb_force_new_run=true` keeps the training resume (optimizer state, global step)
+        # but logs into a fresh WandB run instead of re-attaching to the interrupted one. The new
+        # id is persisted, so later auto-resumes follow the new run rather than the abandoned one.
+        force_new_wandb_run = cfg_exp.log.get("wandb_force_new_run", False)
+        if resuming_training and force_new_wandb_run:
+            log_info("log.wandb_force_new_run=true — resuming training into a NEW WandB run")
+        if resuming_training and not force_new_wandb_run:
             wandb_id = _load_wandb_run_id(ckpt_path_store, run_name)
             if not wandb_id:
                 raise RuntimeError(

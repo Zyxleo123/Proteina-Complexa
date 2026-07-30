@@ -121,6 +121,31 @@ def bin_pairwise_distances(x, min_dist, max_dist, dim):
     return bin_and_one_hot(pair_dists_nm, bin_limits)  # [b, n, n, pair_dist_dim]
 
 
+def soft_rbf(
+    distances: torch.Tensor,
+    n_bins: int = 16,
+    d_min: float = 0.1,
+    d_max: float = 5.0,
+    sigma2: float = 0.1,
+) -> torch.Tensor:
+    """Gaussian RBF encoding of distances (soft alternative to one-hot bins).
+
+    Args:
+        distances: Arbitrary leading shape ``[...]`` of pairwise distances (nm).
+        n_bins: Number of Gaussian kernels.
+        d_min / d_max: Center range in the same units as ``distances``.
+        sigma2: Kernel bandwidth (variance).
+
+    Returns:
+        Tensor of shape ``[..., n_bins]``.
+    """
+    centers = torch.linspace(d_min, d_max, n_bins, device=distances.device, dtype=distances.dtype)
+    # Broadcast centers over all leading dims.
+    expand = (1,) * distances.dim() + (n_bins,)
+    centers = centers.view(*expand)
+    return torch.exp(-((distances.unsqueeze(-1) - centers) ** 2) / sigma2)
+
+
 def bin_and_one_hot(tensor, bin_limits):
     """
     Converts a tensor of shape [*] to a tensor of shape [*, d] using the given bin limits.

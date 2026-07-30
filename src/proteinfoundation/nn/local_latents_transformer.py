@@ -177,6 +177,48 @@ class LocalLatentsTransformer(torch.nn.Module):
             torch.nn.Linear(self.token_dim, 3, bias=False),
         )
 
+        # Optional oracle peptide-interface surface conditioning. Zero-init gates keep
+        # pretrained receptor-only checkpoints bit-identical until the gates open.
+        surface_cfg = kwargs.get("surface", {}) or {}
+        self.enable_surface = bool(kwargs.get("enable_surface", False))
+        self.surface_gate_layers = tuple(surface_cfg.get("gate_layers", [3, 7, 11]))
+        if self.enable_surface:
+            from proteinfoundation.nn.surface.encoder import (
+                BinderSurfacePairFeatures,
+                GatedSurfaceCrossAttention,
+                SurfaceEncoder,
+            )
+
+            rbf_n = int(surface_cfg.get("rbf_n", 16))
+            pair_dim = int(surface_cfg.get("pair_dim", kwargs["pair_repr_dim"]))
+            gate_init = float(surface_cfg.get("gate_init", 0.0))
+            self.surface_encoder = SurfaceEncoder(
+                token_dim=self.token_dim,
+                pair_dim=pair_dim,
+                nheads=kwargs["nheads"],
+                rbf_n=rbf_n,
+                use_qkln=self.use_qkln,
+            )
+            self.binder_surface_pair_feats = BinderSurfacePairFeatures(
+                pair_dim=pair_dim, rbf_n=rbf_n
+            )
+            self.surface_cross_layers = torch.nn.ModuleDict(
+                {
+                    str(i): GatedSurfaceCrossAttention(
+                        dim_token=self.token_dim,
+                        dim_pair=pair_dim,
+                        nheads=kwargs["nheads"],
+                        use_qkln=self.use_qkln,
+                        gate_init=gate_init,
+                    )
+                    for i in self.surface_gate_layers
+                }
+            )
+        else:
+            self.surface_encoder = None
+            self.binder_surface_pair_feats = None
+            self.surface_cross_layers = None
+
         # self.linear_out = torch.nn.Sequential(
         #     torch.nn.LayerNorm(self.token_dim),
         #     torch.nn.Linear(self.token_dim, kwargs["latent_dim"] + 3, bias=False),
@@ -265,6 +307,30 @@ class LocalLatentsTransformer(torch.nn.Module):
             target_mask = input["seq_target_mask"]
             target_rep = target_rep * target_mask[..., None]  # [b, n_target, token_dim]
 
+        # Surface conditioning: encode once; binder↔surface pair feats track noisy CA each step.
+        h_surface = None
+        binder_surface_pair = None
+        surface_mask = None
+        if self.enable_surface:
+            surface_xyz = input["surface_xyz"]
+            surface_normals = input["surface_normals"]
+            surface_mask = input["surface_mask"].bool()
+            surface_distance = input["surface_distance"]
+            h_surface = self.surface_encoder(
+                surface_xyz, surface_normals, surface_mask, surface_distance
+            )
+            t_bb = input["t"]["bb_ca"]
+            if t_bb.dim() > 1:
+                t_bb = t_bb.reshape(t_bb.shape[0], -1)[:, 0]
+            binder_surface_pair = self.binder_surface_pair_feats(
+                binder_xyz=input["x_t"]["bb_ca"],
+                surface_xyz=surface_xyz,
+                surface_normals=surface_normals,
+                binder_mask=orig_mask,
+                surface_mask=surface_mask,
+                t=t_bb,
+            )
+
         # if seqs.shape[1] != c.shape[1]: pdb has weird inter padding that we do not handle
         # Run trunk
         for i in range(self.nlayers):
@@ -275,6 +341,22 @@ class LocalLatentsTransformer(torch.nn.Module):
 
             # try:
             seqs = self.transformer_layers[i](seqs, pair_rep, c, mask)  # [b, n_extended, token_dim]
+
+            if (
+                self.enable_surface
+                and i in self.surface_gate_layers
+                and h_surface is not None
+            ):
+                # Update binder tokens only; leave concatenated target tokens untouched.
+                binder_tokens = seqs[:, :n_orig, :]
+                binder_tokens = self.surface_cross_layers[str(i)](
+                    binder_tokens,
+                    h_surface,
+                    binder_surface_pair,
+                    orig_mask,
+                    surface_mask,
+                )
+                seqs = torch.cat([binder_tokens, seqs[:, n_orig:, :]], dim=1)
 
             if self.update_pair_repr:
                 if i < self.nlayers - 1:

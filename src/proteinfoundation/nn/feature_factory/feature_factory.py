@@ -382,7 +382,16 @@ class FeatureFactory(torch.nn.Module):
 
             # Cyclization features
             elif f == "cyclization_ring_pe":
-                return CyclizationGraphPositionalPairFeat(**kwargs)
+                # Namespaced config keys, mapped explicitly rather than relying on the
+                # **kwargs passthrough: every feature receives the same kwargs, so an
+                # unprefixed name like `typed_edge` would be visible to all of them.
+                # All default OFF -- with them unset this is bit-identical to before.
+                return CyclizationGraphPositionalPairFeat(
+                    typed_edge=kwargs.get("cyclization_typed_edge", False),
+                    link_direction=kwargs.get("cyclization_link_direction", False),
+                    cyclic_offset_dim=kwargs.get("cyclization_cyclic_offset_dim", 0),
+                    **kwargs,
+                )
 
             # Design and contact features
             elif f == "hotspot_mask_pair":

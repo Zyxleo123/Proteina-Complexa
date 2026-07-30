@@ -1,0 +1,180 @@
+# @package _global_
+# Tiny overfit with oracle surfaces (16 complexes). Stage-4 integration check.
+#
+#   python script_utils/make_cpsea_overfit_subset.py --n 16
+#   python scripts/extract_peptide_surfaces.py --dataset-config ... --output-dir surfaces/cpsea_overfit16
+#   python -m proteinfoundation.train --config-name example/training_cpsea_peptide_surface_overfit \
+#     +single=true +nolog=true \
+#     ++dataset.datamodule.atom37_transforms.1.surface_dir=${PWD}/surfaces/cpsea_overfit16
+
+run_name: cpsea_peptide_surface_overfit16
+
+hardware:
+  ncpus_per_task_train_: 4
+  ncpus_per_task_prepro_: 4
+  accelerator: gpu
+  ngpus_per_node_: 1
+  nnodes_: 1
+
+defaults:
+  - /nn: local_latents_score_nn_160M_binder
+  - /generation: validation_local_latents
+  - /dataset/unified: cpsea_peptide_surface
+  - _self_
+
+pretrain_ckpt_path: ${oc.env:CKPT_PATH}/complexa.ckpt
+autoencoder_ckpt_path: ${oc.env:CPSEA_AE_CKPT_PATH}
+
+freeze_autoencoder: true
+ae_reg_weight: 1.0
+local_latent_target: mean
+
+nn:
+  enable_surface: true
+  surface:
+    num_points: 96
+    gate_layers: [3, 7, 11]
+    rbf_n: 16
+    pair_dim: 256
+  # --- v4 cyclization recipe (identical in every surface arm, so the surface contrast is
+  # the only thing that differs). Head starts RANDOM, as in v3/v4 -- complexa.ckpt has none.
+  #
+  # cyclization_type_emb MUST stay LAST in feats_cond_seq, and cyclization_ring_pe LAST in
+  # feats_pair_repr: those lists are the column order of the concats feeding
+  # cond_factory.linear_out / pair_repr_builder.init_repr_factory.linear_out, which
+  # _splice_pretrained_weights (train.py) warm-starts by copying complexa.ckpt's leading
+  # columns and zero-padding the rest. Appending last keeps the pretrained columns aligned
+  # and makes the new features contribute exactly zero at init. Reordering corrupts the splice.
+  # (Surface conditioning enters through the separate gated `nn.surface` module, not these
+  # lists, so the two features do not interact here.)
+  feats_cond_seq: ["time_emb_bb_ca", "time_emb_local_latents", "cyclization_type_emb"]
+  cyc_emb_dim: 256  # match the 160M trunk's dim_cond / t_emb_dim / idx_emb_dim
+  feats_pair_repr: ["rel_seq_sep", "xt_bb_ca_pair_dists", "x_sc_bb_ca_pair_dists", "optional_ca_pair_dist", "chain_idx_pair", "hotspot_mask_pair", "cyclization_ring_pe"]
+  ring_sep_dim: 32  # one-hot geodesic bins; >> any binder length here (16-mer -> geodesic <= 8)
+
+product_flowmatcher:
+  bb_ca:
+    zero_com_noise: False
+    guidance_enabled: true
+    dim: 3
+  local_latents:
+    zero_com_noise: False
+    guidance_enabled: True
+    dim: null
+
+loss:
+  t_distribution:
+    bb_ca:
+      name: mix_unif_beta
+      p1: 1.9
+      p2: 1.0
+      p3: 0.02
+      loss_t_clamp: 0.9
+    local_latents:
+      name: uniform
+      p1: 1.0
+      p2: 1.0
+      loss_t_clamp: 0.9
+    shared_groups: []
+
+force_precision_f32: True
+
+training:
+  n_recycle: 0
+  motif_conditioning: False
+  self_cond: False
+  fold_cond: False
+  target_cond: False
+  mask_T_prob: 0.0
+  mask_A_prob: 0.0
+  mask_C_prob: 0.0
+  fold_label_sample_ratio: [1.0, 0.0, 0.0, 0.0]
+  p_folding_n_inv_folding_iters: 0.0
+  cyclization_type_dropout_rate: 0.0
+
+# v4 recipe, matching the other surface arms so val_gen/cyc/* is measurable here too.
+# type dropout stays 0.0 (above): this arm deliberately zeroes every stochastic augmentation
+# so memorisation is clean, and it always conditions on the row's true type.
+cyclization:
+  enabled: true
+  loss_weight: 0.1
+  hidden_dim: 256
+  detach_link_inputs: true
+  force_gold_valid: true
+  allow_asn_gln_isopeptide: true
+  type_conditioning: true
+  target_type: null
+  terminal_only: true
+  bond_loss:
+    enabled: true
+    loss_weight: 0.05
+    t_lower_lim: 0.5
+
+dataset:
+  datamodule:
+    metadata_file: ${oc.env:CPSEA_DATA_PATH}/preprocessed/metadata/cpsea_train_overfit16.parquet
+    val_metadata_file: ${oc.env:CPSEA_DATA_PATH}/preprocessed/metadata/cpsea_train_overfit16.parquet
+    batch_size: 4
+    num_workers: 2
+    atom37_transforms:
+      - _target_: proteinfoundation.datasets.transforms.SegmentAwareResidueFeaturesTransform
+        cn_break_cutoff: 2.0
+        segment_fix_level: full
+      - _target_: proteinfoundation.datasets.transforms.AttachPeptideSurfaceTransform
+        surface_dir: ${oc.env:CPSEA_SURFACE_DIR}
+        num_points: 96
+        require_surface: true
+      - _target_: proteinfoundation.datasets.transforms.CoordsToNanometers
+      - _target_: proteinfoundation.datasets.transforms.CroppingTransform2
+        crop_size: 4096
+        interface_threshold: 8.0
+        dist_mode: "bb_ca"
+        data_mode: "all-atom"
+        crop_binder: false
+        binder_min_length: 5
+        binder_max_length: 16
+        binder_padding_length: 0
+        target_min_length: 30
+        target_spatial_crop_threshold: 15.0
+        max_num_target_chains: -1
+      - _target_: proteinfoundation.datasets.transforms.ContactTransform
+        cutoff: 8.0
+        min_perc: 1.0
+        max_perc: 1.0
+        contact_prob: 1.0
+        contact_dropout_prob: 0.0
+        hotspot_dropout_prob: 0.0
+      - _target_: proteinfoundation.datasets.transforms.OpenFoldFrameTransform
+      - _target_: proteinfoundation.datasets.transforms.ChainBreakPerResidueTransform
+      - _target_: proteinfoundation.datasets.transforms.CenteringTransform
+        center_mode: "target"
+        data_mode: "all-atom"
+      - _target_: proteinfoundation.datasets.transforms.ExtractTargetCoordinatesTransform
+        compact_mode: true
+      - _target_: proteinfoundation.datasets.transforms.FilterTargetResiduesTransform
+      - _target_: proteinfoundation.datasets.transforms.CyclizationLabelTransform
+        default_binder_chain_id: "B"
+
+opt:
+  lr: 0.0003
+  warmup_steps: 0
+  max_epochs: 2000
+  accumulate_grad_batches: 1
+  skip_nan_grad: True
+  dist_strategy: auto
+  val_check_interval: 999999
+  limit_train_batches: null
+
+log:
+  wandb_project: cpsea_peptide_surface
+  log_wandb: False
+  log_every_n_steps: 4
+  checkpoint: False
+
+seed: 0
+
+ema:
+  decay: 0.999
+  validate_original_weights: False
+  every_n_steps: 1
+  cpu_offload: False

@@ -54,6 +54,11 @@ METRIC_CASE_MAPPING = {
     # pTM variations
     "ptm": "pTM",
     "binder_ptm": "binder_pTM",
+    # Oracle peptide-surface agreement (proteinfoundation.eval.surface_metrics)
+    "surface_chamfer": "surface_chamfer",
+    "surface_normal_consistency": "surface_normal_consistency",
+    "surface_coverage_mean": "surface_coverage_mean",
+    "surface_coverage_max": "surface_coverage_max",
 }
 
 

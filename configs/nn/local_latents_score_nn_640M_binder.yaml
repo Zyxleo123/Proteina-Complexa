@@ -49,3 +49,10 @@ update_pair_repr: False
 update_pair_repr_every_n: 3
 use_tri_mult: False
 use_qkln: True
+
+enable_surface: false
+surface:
+  num_points: 96
+  gate_layers: [3, 7, 11]
+  rbf_n: 16
+  pair_dim: 512
