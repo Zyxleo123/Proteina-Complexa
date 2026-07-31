@@ -155,11 +155,14 @@ def score_cyclization(
             no atom mapping is re-derived here.
         near_window_margin_A: Optional override of `DEFAULT_NEAR_WINDOW_MARGIN_A`.
         gate_angle, gate_dihedral, gate_chirality, gate_clash: If True, require
-            that criterion to additionally pass for `success`. All default
-            False: the initial reward is closure/topology-distance only, per
-            the "score only cyclization/structural validity" requirement.
-            These let later experiments progressively tighten `success`
-            without changing the reward shape itself.
+            that criterion to additionally pass for `success`, AND zero
+            `reward` wherever it fails (so a `raw_bounded`-weighted replay
+            buffer -- see `replay.weighting` -- cannot assign a high weight to
+            a candidate an enabled gate has flagged as invalid; `success` and
+            `reward` must agree on which candidates are acceptable). All
+            default False: the initial reward is closure/topology-distance
+            only, per the "score only cyclization/structural validity"
+            requirement.
         clash_threshold_A: CA-CA distance below which a pair counts as a clash.
         angle_success_thresh, dihedral_success_thresh: Huber/circular-loss
             thresholds (see `linkage_geometry_terms`) below which the angle/
@@ -242,21 +245,26 @@ def score_cyclization(
     if gate_angle:
         angle_ok = (~geom_valid) | (angle_errors <= angle_success_thresh)
         success = success & angle_ok
+        reward = reward * angle_ok.float()
     if gate_dihedral:
         dihedral_ok = (~geom_valid) | (dihedral_error <= dihedral_success_thresh)
         success = success & dihedral_ok
+        reward = reward * dihedral_ok.float()
 
     chir_per_residue = _chirality_valid_per_residue(atom37, atom37_mask)  # [B, L]
     binder_bool = binder_mask.bool()
     chirality_valid = (~binder_bool | chir_per_residue).all(dim=-1)
     if gate_chirality:
         success = success & chirality_valid
+        reward = reward * chirality_valid.float()
 
     clash_count = _clash_count_per_sample(
         atom37, atom37_mask, binder_mask, threshold_A=clash_threshold_A
     )
     if gate_clash:
-        success = success & (clash_count == 0)
+        clash_ok = clash_count == 0
+        success = success & clash_ok
+        reward = reward * clash_ok.float()
 
     return {
         "reward": reward,

@@ -98,15 +98,18 @@ def _structure(link_type: int, perturb: torch.Tensor | None = None):
     seq = torch.zeros(1, 2, dtype=torch.long)
 
     if link_type == MAINCHAIN:
-        slots = [(0, CA_IDX, a), (0, C_IDX, b), (1, N_IDX, c), (1, CA_IDX, d)]
+        # Closing bond is C of the LAST residue (j=1, C-terminus) to N of the FIRST
+        # residue (i=0, N-terminus) -- see `_mainchain_atoms`. `a`/`b` sit on residue
+        # j, `c`/`d` sit on residue i.
+        slots = [(1, CA_IDX, a), (1, C_IDX, b), (0, N_IDX, c), (0, CA_IDX, d)]
     elif link_type == DISULFIDE:
         slots = [(0, CB_IDX, a), (0, SG_IDX, b), (1, SG_IDX, c), (1, CB_IDX, d)]
         seq[0, 0] = seq[0, 1] = AA_CYS
     else:
-        # donor lysine at residue 0 (CD, NZ), acceptor Asp at residue 1 (CG, CB)
-        from proteinfoundation.eval.cyclic_reconstruction_metrics import CD_IDX
+        # donor lysine at residue 0 (CE, NZ), acceptor Asp at residue 1 (CG, CB)
+        from proteinfoundation.eval.cyclic_reconstruction_metrics import CE_IDX
 
-        slots = [(0, CD_IDX, a), (0, NZ_IDX, b), (1, CG_IDX, c), (1, CB_IDX, d)]
+        slots = [(0, CE_IDX, a), (0, NZ_IDX, b), (1, CG_IDX, c), (1, CB_IDX, d)]
         seq[0, 0] = AA_LYS
         seq[0, 1] = AA_ASP
 
@@ -167,7 +170,7 @@ def test_loss_is_invariant_to_global_rotation_and_translation(link_type):
 
 def test_missing_atoms_are_masked_without_nans():
     atom37, mask, seq, meta = _structure(MAINCHAIN)
-    mask[0, 1, N_IDX] = False  # drop one defining atom
+    mask[0, 0, N_IDX] = False  # drop one defining atom (N sits on residue i=0)
     terms = linkage_geometry_terms(atom37, mask, seq, meta)
     assert not bool(terms["valid"][0])
     assert not torch.isnan(terms["angle"]).any()

@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import collections
 import json
+import os
 import random
 import statistics
 from dataclasses import dataclass, field
@@ -44,6 +45,25 @@ REQUIRED_ENTRY_FIELDS = (
 )
 
 DEFAULT_LENGTH_BIN_EDGES = (0, 8, 12, 16, 20, 10_000)
+
+
+def _detach_cpu(value):
+    """Recursively detaches tensors and moves them to CPU before storage.
+
+    Entries live in an in-memory deque across training steps (see module
+    docstring), so anything still attached to the live computation graph or
+    parked on the GPU would silently retain autograd history and device
+    memory for as long as it sits in the buffer -- collectors must not have
+    to remember to do this themselves.
+    """
+    if isinstance(value, torch.Tensor):
+        return value.detach().cpu()
+    if isinstance(value, dict):
+        return {k: _detach_cpu(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        cast = [_detach_cpu(v) for v in value]
+        return type(value)(cast) if isinstance(value, tuple) else cast
+    return value
 
 
 def length_bin(peptide_length: int, edges=DEFAULT_LENGTH_BIN_EDGES) -> int:
@@ -114,7 +134,7 @@ class ReplayBuffer:
                 "versions cannot be mixed in one buffer -- start a fresh "
                 "buffer (or rescore) instead."
             )
-        return entry
+        return {k: _detach_cpu(v) for k, v in entry.items()}
 
     def append(self, entries: list[dict]) -> None:
         """Appends entries (each a dict with `REQUIRED_ENTRY_FIELDS`), evicting oldest-first at `max_size`."""
@@ -198,17 +218,29 @@ class ReplayBuffer:
     # Save / load (sharded, lossless round trip)
     # ------------------------------------------------------------------
     def save(self, dir: str | Path) -> None:
+        """Writes a new snapshot without ever leaving `dir` in a half-written state.
+
+        New shards and the manifest are written under a fresh `.tmp-<pid>` prefix
+        first; only once every shard and the manifest have landed does this delete
+        the previous snapshot's files. A crash or `Ctrl-C` mid-save therefore either
+        leaves the old snapshot fully intact or the new one fully written, never a
+        directory with some old shards deleted and the new ones missing (which
+        `load()` would silently read as a truncated buffer).
+        """
         dir = Path(dir)
         dir.mkdir(parents=True, exist_ok=True)
-        for old_shard in dir.glob("shard_*.pt"):
-            old_shard.unlink()
+        old_shards = sorted(dir.glob("shard_*.pt"))
+        tmp_prefix = f".tmp-{os.getpid()}-"
 
         entries = list(self._entries)
         shard_files = []
+        tmp_paths = []
         for start in range(0, len(entries), self.shard_size):
             shard = entries[start : start + self.shard_size]
             shard_name = f"shard_{start // self.shard_size:06d}.pt"
-            torch.save(shard, dir / shard_name)
+            tmp_path = dir / f"{tmp_prefix}{shard_name}"
+            torch.save(shard, tmp_path)
+            tmp_paths.append((tmp_path, dir / shard_name))
             shard_files.append(shard_name)
 
         manifest = {
@@ -219,8 +251,20 @@ class ReplayBuffer:
             "n_entries": len(entries),
             "shard_files": shard_files,
         }
-        with open(dir / "manifest.json", "w") as f:
+        tmp_manifest = dir / f"{tmp_prefix}manifest.json"
+        with open(tmp_manifest, "w") as f:
             json.dump(manifest, f, indent=2)
+
+        # Everything new is safely on disk under the tmp prefix -- now atomically
+        # (per-file rename) promote it, then clear out whatever the old snapshot left.
+        for tmp_path, final_path in tmp_paths:
+            os.replace(tmp_path, final_path)
+        os.replace(tmp_manifest, dir / "manifest.json")
+
+        new_shard_names = set(shard_files)
+        for old_shard in old_shards:
+            if old_shard.name not in new_shard_names:
+                old_shard.unlink()
 
     @classmethod
     def load(cls, dir: str | Path, expected_reward_version: str | None = None) -> "ReplayBuffer":

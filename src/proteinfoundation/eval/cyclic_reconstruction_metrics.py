@@ -62,6 +62,7 @@ SG_IDX = get_atom_index("SG")
 NZ_IDX = get_atom_index("NZ")
 CG_IDX = get_atom_index("CG")
 CD_IDX = get_atom_index("CD")
+CE_IDX = get_atom_index("CE")
 
 
 def virtual_cb_from_backbone(
@@ -618,8 +619,10 @@ def per_sample_requested_bond_distance(
     and reduces to per-type logging means. This computes the single distance the
     sample's *requested* linkage actually calls for, un-reduced and differentiable,
     which is what an auxiliary bond loss needs. It reuses this module's atom-slot
-    constants, the identical anchor choices (mainchain C<->N with the min over both
-    orientations, disulfide SG<->SG gated on a CYS pair, isopeptide LYS:NZ<->ASP:CG
+    constants, the identical anchor choices (mainchain N(i)<->C(j), the single
+    head-to-tail orientation given `i`/`j` are the sorted first/last binder-local
+    indices -- matching what `evaluation.cyclization_pdb_metrics` measures on the
+    decoded PDB -- disulfide SG<->SG gated on a CYS pair, isopeptide LYS:NZ<->ASP:CG
     / GLU:CD), and the identical `*_BOND_WINDOW_A` acceptance windows -- so a loss
     built on this cannot drift away from the closure metric it is meant to move.
 
@@ -656,16 +659,18 @@ def per_sample_requested_bond_distance(
     aa_i = seq_tokens[batch_idx, i]
     aa_j = seq_tokens[batch_idx, j]
 
-    # ---- Mainchain (head-to-tail): C of one endpoint <-> N of the other ----
-    c_i, c_i_valid = _gather_atom(pred_atom37, mask_bool, i, C_IDX)
-    n_j, n_j_valid = _gather_atom(pred_atom37, mask_bool, j, N_IDX)
+    # ---- Mainchain (head-to-tail): N of the first (lower-index) endpoint <-> C of
+    # the last (higher-index) endpoint. `i < j` is guaranteed by the CPSea label
+    # convention (`parse_labels.py` sorts endpoints), so this is the single real
+    # closing bond -- not a min over both orientations, which would let a
+    # coincidentally-close but chemically meaningless C(i)-N(j) pair (both atoms
+    # already engaged in in-chain peptide bonds) masquerade as ring closure. This
+    # must match `evaluation.cyclization_pdb_metrics`, which measures the same
+    # N(first)-C(last) pair on the decoded PDB.
     n_i, n_i_valid = _gather_atom(pred_atom37, mask_bool, i, N_IDX)
     c_j, c_j_valid = _gather_atom(pred_atom37, mask_bool, j, C_IDX)
-    mainchain_dist = torch.minimum(
-        torch.linalg.norm(c_i - n_j, dim=-1),
-        torch.linalg.norm(n_i - c_j, dim=-1),
-    ) * NM_TO_ANG
-    mainchain_valid = c_i_valid & n_j_valid & n_i_valid & c_j_valid
+    mainchain_dist = torch.linalg.norm(n_i - c_j, dim=-1) * NM_TO_ANG
+    mainchain_valid = n_i_valid & c_j_valid
 
     # ---- Disulfide: SG-SG, both endpoints must be CYS ----
     sg_i, sg_i_valid = _gather_atom(pred_atom37, mask_bool, i, SG_IDX)

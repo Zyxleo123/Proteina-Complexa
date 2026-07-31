@@ -738,12 +738,22 @@ class Proteina(L.LightningModule):
         log_prefix: str,
         bs: int,
     ) -> torch.Tensor:
-        """Symmetric soft-Chamfer between predicted clean binder CA and surface points (nm).
+        """Symmetric soft-Chamfer between a predicted surface-facing proxy and surface points (nm).
+
+        Cα sits on the backbone, inside the molecule, not on its molecular surface -- pulling
+        it directly onto ``surface_xyz`` would drag the whole backbone (including the
+        binder's exposed-away residues) onto the interface. Cβ points from the backbone
+        toward the side chain/solvent and is a much closer proxy for "the atom facing the
+        surface." Since the predicted structure's real Cβ requires decoding through the
+        (frozen) autoencoder, this decodes ``x_1_pred`` to full Atom37 and reconstructs a
+        virtual Cβ from the decoded N/CA/C backbone frame (same formula used for glycine
+        elsewhere in this codebase, see ``eval.cyclic_reconstruction_metrics.get_cb_position``)
+        rather than comparing Cα.
 
         Applied only for samples with ``t_bb_ca >= t_lower_lim`` (prediction is noise below that).
         Gives the zero-init gate a nonzero dL/dg even when the FM loss alone leaves g shut.
         """
-        if "surface_xyz" not in batch or "surface_mask" not in batch:
+        if "surface_xyz" not in batch or "surface_mask" not in batch or getattr(self, "autoencoder", None) is None:
             z = torch.zeros((), device=self.device, dtype=torch.float32)
             self.log(
                 f"{log_prefix}/surface_attraction",
@@ -758,19 +768,38 @@ class Proteina(L.LightningModule):
             )
             return z
 
+        from proteinfoundation.eval.cyclic_reconstruction_metrics import (
+            CA_IDX,
+            C_IDX,
+            N_IDX,
+            virtual_cb_from_backbone,
+        )
+
         x_1_pred = self.fm.nn_out_to_clean_sample_prediction(batch=batch, nn_out=nn_out)
-        ca = x_1_pred["bb_ca"]  # [B, N, 3] nm
         binder_mask = batch["mask"].bool() if "mask" in batch else batch["coord_mask"][..., 1].bool()
+        decoded = self.autoencoder.decode(
+            z_latent=x_1_pred["local_latents"],
+            ca_coors_nm=x_1_pred["bb_ca"],
+            mask=binder_mask,
+        )
+        decoded_coors = decoded["coors_nm"]
+        decoded_mask = decoded["atom_mask"].bool()
+        backbone_ok = decoded_mask[..., N_IDX] & decoded_mask[..., CA_IDX] & decoded_mask[..., C_IDX]
+        cb = virtual_cb_from_backbone(
+            decoded_coors[..., N_IDX, :], decoded_coors[..., CA_IDX, :], decoded_coors[..., C_IDX, :]
+        )  # [B, N, 3] nm, surface-facing proxy
+
         surf = batch["surface_xyz"]
         smask = batch["surface_mask"].bool()
 
-        dist = (ca[:, :, None, :] - surf[:, None, :, :]).norm(dim=-1)  # [B, N, M]
+        cb_mask = binder_mask & backbone_ok
+        dist = (cb[:, :, None, :] - surf[:, None, :, :]).norm(dim=-1)  # [B, N, M]
         dist = dist.masked_fill(~smask[:, None, :], 1e6)
-        dist = dist.masked_fill(~binder_mask[:, :, None], 1e6)
+        dist = dist.masked_fill(~cb_mask[:, :, None], 1e6)
         d_bs = dist.min(dim=-1).values  # [B, N]
         d_sb = dist.min(dim=1).values  # [B, M]
 
-        per_b = (d_bs * binder_mask).sum(-1) / binder_mask.sum(-1).clamp_min(1)
+        per_b = (d_bs * cb_mask).sum(-1) / cb_mask.sum(-1).clamp_min(1)
         per_s = (d_sb * smask).sum(-1) / smask.sum(-1).clamp_min(1)
         per = 0.5 * (per_b + per_s)
 

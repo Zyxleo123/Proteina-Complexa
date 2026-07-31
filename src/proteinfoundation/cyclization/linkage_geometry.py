@@ -29,11 +29,13 @@ import torch
 from proteinfoundation.eval.cyclic_reconstruction_metrics import (
     AA_ASP,
     AA_CYS,
+    AA_GLU,
     AA_LYS,
     C_IDX,
     CA_IDX,
     CB_IDX,
     CD_IDX,
+    CE_IDX,
     CG_IDX,
     N_IDX,
     NZ_IDX,
@@ -99,12 +101,22 @@ def circular_loss(pred: torch.Tensor, ref: torch.Tensor, symmetric: bool = False
 
 
 def _mainchain_atoms(atom37, mask_bool, i, j):
-    """(a_i, b_i, b_j, a_j, valid) for CA(i)-C(i) : N(j)-CA(j)."""
-    ca_i, v1 = _gather_atom(atom37, mask_bool, i, CA_IDX)
-    c_i, v2 = _gather_atom(atom37, mask_bool, i, C_IDX)
-    n_j, v3 = _gather_atom(atom37, mask_bool, j, N_IDX)
-    ca_j, v4 = _gather_atom(atom37, mask_bool, j, CA_IDX)
-    return ca_i, c_i, n_j, ca_j, v1 & v2 & v3 & v4
+    """(a, b, c, d, valid) for CA(j)-C(j) : N(i)-CA(i).
+
+    `i`/`j` are the sorted first/last binder-local endpoint indices, so the real
+    head-to-tail closing bond is C of the LAST residue (j, C-terminus) to N of the
+    FIRST residue (i, N-terminus) -- the same orientation as every other in-chain
+    peptide bond (residue k's C to residue k+1's N), just wrapping around the ring.
+    This must match `per_sample_requested_bond_distance`'s N(i)-C(j) anchor and
+    `evaluation.cyclization_pdb_metrics`'s N(first)-C(last) measurement; building
+    CA(i)-C(i):N(j)-CA(j) instead would supervise a different, chemically
+    backwards pair (both atoms already engaged in their own in-chain bonds).
+    """
+    ca_j, v1 = _gather_atom(atom37, mask_bool, j, CA_IDX)
+    c_j, v2 = _gather_atom(atom37, mask_bool, j, C_IDX)
+    n_i, v3 = _gather_atom(atom37, mask_bool, i, N_IDX)
+    ca_i, v4 = _gather_atom(atom37, mask_bool, i, CA_IDX)
+    return ca_j, c_j, n_i, ca_i, v1 & v2 & v3 & v4
 
 
 def _disulfide_atoms(atom37, mask_bool, i, j, aa_i, aa_j):
@@ -117,7 +129,7 @@ def _disulfide_atoms(atom37, mask_bool, i, j, aa_i, aa_j):
 
 
 def _isopeptide_atoms(atom37, mask_bool, i, j, aa_i, aa_j):
-    """(CE/CD_lys, NZ_lys, C_acid, CG_acid, valid), orientation-resolved.
+    """(CE_lys, NZ_lys, C_acid, X_acid, valid), orientation-resolved.
 
     The isopeptide bond is directional -- a lysine NZ donor bonded to an Asp/Asn (or
     Glu/Gln) carbonyl acceptor -- and the label does not promise which of `i`/`j` is the
@@ -130,17 +142,26 @@ def _isopeptide_atoms(atom37, mask_bool, i, j, aa_i, aa_j):
     acid_idx = torch.where(lys_is_i, j, i)
     aa_acid = torch.where(lys_is_i, aa_j, aa_i)
 
-    # Lysine side chain: CD-NZ defines the angle at the donor (CE is not in the atom37
-    # slot table used here; CD is the nearest available proxy along the chain).
-    cd_lys, v1 = _gather_atom(atom37, mask_bool, lys_idx, CD_IDX)
+    # Lysine side chain: CE-NZ is the real bonded pair that defines the angle at the
+    # donor (CE IS present in the atom37 slot table -- index 19 -- so no CD proxy is
+    # needed; CD sits one bond further out, on the far side of CE, and is not bonded
+    # to NZ at all).
+    ce_lys, v1 = _gather_atom(atom37, mask_bool, lys_idx, CE_IDX)
     nz_lys, v2 = _gather_atom(atom37, mask_bool, lys_idx, NZ_IDX)
-    # Asp bonds through CG, Glu through CD.
-    acid_c = torch.where(aa_acid == AA_ASP, torch.full_like(acid_idx, CG_IDX), torch.full_like(acid_idx, CD_IDX))
+    # Asp's carbonyl carbon is CG (its other real neighbor is CB); Glu's is CD (its
+    # other real neighbor is CG, one bond further out than Asp's CB).
+    is_asp = aa_acid == AA_ASP
+    acid_c = torch.where(is_asp, torch.full_like(acid_idx, CG_IDX), torch.full_like(acid_idx, CD_IDX))
+    acid_x = torch.where(is_asp, torch.full_like(acid_idx, CB_IDX), torch.full_like(acid_idx, CG_IDX))
     c_acid, v3 = _gather_atom(atom37, mask_bool, acid_idx, acid_c)
-    cb_acid, v4 = _gather_atom(atom37, mask_bool, acid_idx, CB_IDX)
+    x_acid, v4 = _gather_atom(atom37, mask_bool, acid_idx, acid_x)
 
-    is_lys_pair = (aa_i == AA_LYS) | (aa_j == AA_LYS)
-    return cd_lys, nz_lys, c_acid, cb_acid, v1 & v2 & v3 & v4 & is_lys_pair
+    is_lys_pair = (
+        (aa_i == AA_LYS) & ((aa_j == AA_ASP) | (aa_j == AA_GLU))
+    ) | (
+        (aa_j == AA_LYS) & ((aa_i == AA_ASP) | (aa_i == AA_GLU))
+    )
+    return ce_lys, nz_lys, c_acid, x_acid, v1 & v2 & v3 & v4 & is_lys_pair
 
 
 def linkage_geometry_terms(

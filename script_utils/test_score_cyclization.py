@@ -64,22 +64,25 @@ def _linkage_meta(i: int, j: int, cyc_type: int, has_cyclization: bool = True):
 # Fixture builders: one per {linkage type} x {endpoint orientation}.
 # ---------------------------------------------------------------------------
 def _mainchain_fixture(dist_nm: float, i_is_first: bool = True):
-    """2-residue binder closing head-to-tail: N(i) <-> C(j)."""
+    """2-residue binder closing head-to-tail: N(i) <-> C(j), the single real orientation.
+
+    `i` is always the sorted first (N-terminal) index and `j` the last (C-terminal)
+    index (see `parse_labels.py`), so `per_sample_requested_bond_distance` measures
+    only N(i)<->C(j) -- not a min over both N/C pairings. `i_is_first=False` places
+    the atoms in the chemically REVERSED arrangement (N at the `j`-labelled residue,
+    C at the `i`-labelled residue) to verify that reversal is no longer scored as a
+    closure (see `test_reversed_mainchain_orientation_is_not_rewarded`).
+    """
     atom37, mask = _zeros_atom37(1, 2)
     aatype = _uniform_aa(1, 2)
     binder_mask = torch.ones(1, 2, dtype=torch.bool)
 
     lo, hi = (0, 1) if i_is_first else (1, 0)
-    # `per_sample_requested_bond_distance` takes the min over both N/C
-    # orientations, so it requires N *and* C present at *both* residues (see
-    # `mainchain_valid = c_i_valid & n_j_valid & n_i_valid & c_j_valid`).
     mask[0, :, N_IDX] = True
     mask[0, :, C_IDX] = True
     mask[0, :, CA_IDX] = True
     atom37[0, lo, N_IDX] = torch.tensor([0.0, 0.0, 0.0])
     atom37[0, hi, C_IDX] = torch.tensor([0.0, 0.0, dist_nm])
-    # The "other" (unrelated) N/C pair: placed far apart so it never becomes
-    # the min-distance orientation and corrupts the intended bond distance.
     atom37[0, hi, N_IDX] = torch.tensor([50.0, 0.0, 0.0])
     atom37[0, lo, C_IDX] = torch.tensor([50.0, 1.0, 0.0])
 
@@ -123,13 +126,30 @@ def _isopeptide_fixture(dist_nm: float, lys_is_first: bool = True, acid: str = "
 
 
 FIXTURE_MATRIX = {
+    # Mainchain has no "j_first" entry: `i`/`j` are sorted N-/C-terminal indices, so
+    # there is only one real orientation (see `_mainchain_fixture`); the reversed
+    # placement is covered separately by
+    # `test_reversed_mainchain_orientation_is_not_rewarded`.
     "mainchain_i_first": lambda: _mainchain_fixture(0.133, i_is_first=True),
-    "mainchain_j_first": lambda: _mainchain_fixture(0.133, i_is_first=False),
     "disulfide_i_first": lambda: _disulfide_fixture(0.205, i_is_first=True),
     "disulfide_j_first": lambda: _disulfide_fixture(0.205, i_is_first=False),
     "isopeptide_lys_first": lambda: _isopeptide_fixture(0.132, lys_is_first=True),
     "isopeptide_lys_second": lambda: _isopeptide_fixture(0.132, lys_is_first=False),
 }
+
+
+def test_reversed_mainchain_orientation_is_not_rewarded():
+    """A structure with N/C swapped relative to the i/j label must not score as closed.
+
+    Regression test for the orientation bug where `per_sample_requested_bond_distance`
+    took `min(C(i)-N(j), N(i)-C(j))`: a coincidentally-close but chemically backwards
+    C(i)-N(j) pair (both atoms already engaged in their own in-chain bonds) could
+    masquerade as ring closure. Only N(i)-C(j) is real.
+    """
+    atom37, mask, aatype, binder_mask, meta = _mainchain_fixture(0.133, i_is_first=False)
+    out = score_cyclization(atom37, mask, aatype, binder_mask, meta)
+    assert out["reward"].item() < 0.01
+    assert out["success"].item() is False
 
 
 # ---------------------------------------------------------------------------

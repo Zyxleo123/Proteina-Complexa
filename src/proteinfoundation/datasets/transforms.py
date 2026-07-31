@@ -562,10 +562,22 @@ class AttachPeptideSurfaceTransform(BaseTransform):
 class ShufflePeptideSurfaceTransform(BaseTransform):
     """Replace the attached surface with one from a different complex (oracle control).
 
-    Must run after ``AttachPeptideSurfaceTransform``. Picks another ``*.surface.npz`` from
-    the same directory (deterministically from ``seed`` + example id so a given sample
-    always gets the same wrong surface across workers of one epoch setup; change ``seed``
-    to reshuffle).
+    Must run after ``AttachPeptideSurfaceTransform``. Picks another cache from the same
+    directory (deterministically from ``seed`` + example id so a given sample always gets
+    the same wrong surface across workers of one epoch setup; change ``seed`` to
+    reshuffle), searched recursively since the default cache layout is sharded
+    (``<hh>/<hh>/<id>.surface.npz``, see ``surface.peptide_surface.cache_path_for``) --
+    a non-recursive glob would silently match zero caches on that layout.
+
+    The borrowed point cloud is recentered from its own complex's absolute PDB frame onto
+    this example's real interface location (translating by the delta between the two
+    surfaces' own masked centroids). Surface caches are stored per-complex in that
+    complex's own absolute coordinates (see ``AttachPeptideSurfaceTransform``), so without
+    this the borrowed cloud would sit wherever the other complex happened to be, which is
+    an unrelated point in space rather than "a wrong surface at the same interface."
+    Shape/normals/distance are left as sampled from the other complex -- only the
+    position is registered, since alignment beyond that (rotating one interface's shape
+    onto another) is not well-defined between different receptors.
     """
 
     def __init__(self, surface_dir: str, num_points: int = 96, seed: int = 0):
@@ -573,35 +585,48 @@ class ShufflePeptideSurfaceTransform(BaseTransform):
         self.num_points = int(num_points)
         self.seed = int(seed)
         self._cache_ids: list[str] | None = None
+        self._id_to_path: dict[str, Path] | None = None
 
-    def _ids(self) -> list[str]:
-        if self._cache_ids is None:
+    def _ids(self) -> dict[str, Path]:
+        if self._id_to_path is None:
             # ``Path("foo.surface.npz").stem`` is ``foo.surface``; strip the suffix explicitly.
-            self._cache_ids = sorted(
-                p.name[: -len(".surface.npz")] for p in self.surface_dir.glob("*.surface.npz")
-            )
-        return self._cache_ids
+            # Recursive: default caches live under sharded `<hh>/<hh>/` subdirectories.
+            mapping: dict[str, Path] = {}
+            for p in self.surface_dir.rglob("*.surface.npz"):
+                mapping[p.name[: -len(".surface.npz")]] = p
+            self._id_to_path = mapping
+        return self._id_to_path
 
     def __call__(self, graph: Data) -> Data:
         from proteinfoundation.surface.peptide_surface import load_surface_cache
 
-        ids = self._ids()
-        if len(ids) < 2:
-            raise RuntimeError(f"Need >=2 surface caches in {self.surface_dir} to shuffle")
+        id_to_path = self._ids()
+        if len(id_to_path) < 2:
+            raise RuntimeError(f"Need >=2 surface caches under {self.surface_dir} to shuffle")
 
         own = str(getattr(graph, "example_id", getattr(graph, "id", "")))
         rng = np.random.default_rng(self.seed + (hash(own) % (2**31)))
-        choices = [i for i in ids if i != own] or ids
+        choices = sorted(k for k in id_to_path if k != own) or sorted(id_to_path)
         other = choices[int(rng.integers(len(choices)))]
-        surface = load_surface_cache(self.surface_dir / f"{other}.surface.npz")
-        graph.surface_xyz = torch.from_numpy(np.asarray(surface.sampled_xyz, dtype=np.float32))
-        graph.surface_normals = torch.from_numpy(
-            np.asarray(surface.sampled_normals, dtype=np.float32)
-        )
-        graph.surface_mask = torch.from_numpy(np.asarray(surface.sampled_valid_mask, dtype=bool))
-        graph.surface_distance = torch.from_numpy(
+        surface = load_surface_cache(id_to_path[other])
+        other_xyz = torch.from_numpy(np.asarray(surface.sampled_xyz, dtype=np.float32))
+        other_normals = torch.from_numpy(np.asarray(surface.sampled_normals, dtype=np.float32))
+        other_mask = torch.from_numpy(np.asarray(surface.sampled_valid_mask, dtype=bool))
+        other_dist = torch.from_numpy(
             np.asarray(surface.sampled_receptor_distance, dtype=np.float32)
         )
+
+        own_xyz = getattr(graph, "surface_xyz", None)
+        own_mask = getattr(graph, "surface_mask", None)
+        if own_xyz is not None and own_mask is not None and bool(own_mask.any()) and bool(other_mask.any()):
+            own_center = own_xyz[own_mask].mean(dim=0)
+            other_center = other_xyz[other_mask].mean(dim=0)
+            other_xyz = other_xyz + (own_center - other_center)
+
+        graph.surface_xyz = other_xyz
+        graph.surface_normals = other_normals
+        graph.surface_mask = other_mask
+        graph.surface_distance = other_dist
         graph.surface_shuffled_from = other
         return graph
 
