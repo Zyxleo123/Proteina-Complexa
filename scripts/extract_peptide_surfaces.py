@@ -266,6 +266,8 @@ def _process_one(payload: dict) -> dict:
             payload["num_points"],
             payload["seed"],
             EXTRACTOR_VERSION,
+            backend=payload.get("backend", DEFAULT_BACKEND),
+            sas_points_per_atom=int(payload.get("sas_points_per_atom", DEFAULT_SAS_POINTS_PER_ATOM)),
         ):
             surface = load_surface_cache(existing)
             out.update(
@@ -427,9 +429,19 @@ def _run_pool(items: list[dict], payload_base: dict, num_points: int, workers: i
         cutoff = payload_base["cutoff"]
         num_points = payload_base["num_points"]
         seed = payload_base["seed"]
+        backend = payload_base.get("backend", DEFAULT_BACKEND)
+        sas_points_per_atom = int(payload_base.get("sas_points_per_atom", DEFAULT_SAS_POINTS_PER_ATOM))
 
         def _valid(eid: str) -> bool:
-            return is_cache_valid(on_disk[eid], cutoff, num_points, seed, EXTRACTOR_VERSION)
+            return is_cache_valid(
+                on_disk[eid],
+                cutoff,
+                num_points,
+                seed,
+                EXTRACTOR_VERSION,
+                backend=backend,
+                sas_points_per_atom=sas_points_per_atom,
+            )
 
         # Metadata zip reads are ZFS-latency bound — threads help a lot vs serial 26ms/cache.
         valid_ids: set[str] = set()

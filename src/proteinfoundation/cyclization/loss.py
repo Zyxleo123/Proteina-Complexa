@@ -28,15 +28,29 @@ def cyclization_link_loss(
     gold_j: torch.Tensor,
     gold_type: torch.Tensor,
     has_cyclization: torch.Tensor,
+    pre_force_valid_mask: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     """Global softmax/CE loss over all valid `(i, j, type)` candidates.
 
     Args:
         link_logits: [B, L, L, 3] symmetrized typed pair logits.
         valid_mask: [B, L, L, 3] bool, candidates allowed to compete in the softmax.
+            This is the mask actually used for the CE loss below, and -- when the
+            caller built it with `force_gold_valid=True` (the default in
+            `proteina.py`) -- the gold entry is unconditionally `True` in it by
+            construction, regardless of the hand-authored chemistry rules in
+            `cyclization.mask`.
         gold_i, gold_j: [B] gold cyclization endpoints (binder-local index, any order).
         gold_type: [B] gold linkage type.
         has_cyclization: [B] bool, whether this sample has a usable gold label.
+        pre_force_valid_mask: Optional [B, L, L, 3] bool, the SAME mask built with
+            `force_gold_valid=False` -- i.e. before the gold entry was unconditionally
+            punched through. Used only for the `gold_valid_before_force_frac`
+            diagnostic below. If omitted, that diagnostic falls back to reading
+            `valid_mask` directly, which reports a meaningless flat 1.0 whenever the
+            caller used `force_gold_valid=True` (checking a mask against an entry
+            that mask was just forced to contain). Passing this in is what makes the
+            diagnostic able to expose an invalid chemistry rule at all.
 
     Returns:
         (loss, metrics): scalar CE loss (differentiable) and a dict of
@@ -64,7 +78,14 @@ def cyclization_link_loss(
     gj = torch.maximum(gold_i_v, gold_j_v)
 
     batch_idx = torch.arange(gi.shape[0], device=link_logits.device)
-    gold_was_valid_before_force = valid_mask_v[batch_idx, gi, gj, gold_type_v]
+    # Read the pre-force mask when the caller gives us one, so this diagnostic can
+    # actually differ from 1.0 -- reading `valid_mask` itself here is meaningless
+    # whenever the caller used `force_gold_valid=True`, since that mask was just
+    # unconditionally stamped True at exactly this (gi, gj, gold_type) entry.
+    diagnostic_mask_v = (
+        pre_force_valid_mask[valid_examples] if pre_force_valid_mask is not None else valid_mask_v
+    )
+    gold_was_valid_before_force = diagnostic_mask_v[batch_idx, gi, gj, gold_type_v]
     metrics["gold_valid_before_force_frac"] = gold_was_valid_before_force.float().mean().item()
 
     masked_logits = link_logits_v.masked_fill(~valid_mask_v, _NEG_INF)

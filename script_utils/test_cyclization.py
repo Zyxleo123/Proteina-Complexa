@@ -284,6 +284,40 @@ def test_loss_ignores_samples_without_cyclization():
     assert metrics["n_valid_examples"] == 1.0
 
 
+def test_gold_valid_before_force_frac_reads_pre_force_mask():
+    """Regression: without `pre_force_valid_mask`, this diagnostic reads the
+    ALREADY-force-corrected `valid_mask`, which the caller (`force_gold_valid=True`)
+    just stamped True at the gold entry -- so it always reports 1.0 regardless of
+    whether the hand-authored chemistry rules actually allowed that entry. Passing
+    the pre-force mask must let it report the true (here: 0.0) rate.
+    """
+    B, L = 1, 4
+    link_logits = torch.zeros(B, L, L, NUM_CYCLIZATION_TYPES)
+    gold_i = torch.tensor([0])
+    gold_j = torch.tensor([1])
+    gold_type = torch.tensor([MAINCHAIN])
+    has_cyclization = torch.tensor([True])
+
+    # Simulates `build_cyclization_validity_mask(..., force_gold_valid=True)`:
+    # the gold entry is forced True in `valid_mask` even though no other candidate
+    # is valid (i.e. the raw chemistry rules did NOT actually allow it).
+    valid_mask = torch.zeros(B, L, L, NUM_CYCLIZATION_TYPES, dtype=torch.bool)
+    valid_mask[0, 0, 1, MAINCHAIN] = True
+    pre_force_valid_mask = torch.zeros_like(valid_mask)  # gold entry NOT valid before forcing
+
+    _, metrics_with_pre_force = cyclization_link_loss(
+        link_logits=link_logits, valid_mask=valid_mask, gold_i=gold_i, gold_j=gold_j, gold_type=gold_type,
+        has_cyclization=has_cyclization, pre_force_valid_mask=pre_force_valid_mask,
+    )
+    assert metrics_with_pre_force["gold_valid_before_force_frac"] == 0.0
+
+    _, metrics_without_pre_force = cyclization_link_loss(
+        link_logits=link_logits, valid_mask=valid_mask, gold_i=gold_i, gold_j=gold_j, gold_type=gold_type,
+        has_cyclization=has_cyclization,
+    )
+    assert metrics_without_pre_force["gold_valid_before_force_frac"] == 1.0
+
+
 def test_loss_all_missing_batch_returns_zero_without_crashing():
     B, L = 3, 4
     link_logits = torch.randn(B, L, L, NUM_CYCLIZATION_TYPES, requires_grad=True)
@@ -707,6 +741,7 @@ ALL_TESTS = [
     test_loss_high_gold_logit_gives_low_loss,
     test_loss_invalid_candidates_do_not_win,
     test_loss_ignores_samples_without_cyclization,
+    test_gold_valid_before_force_frac_reads_pre_force_mask,
     test_loss_all_missing_batch_returns_zero_without_crashing,
     test_decode_flat_index_roundtrip,
     test_decode_falls_back_to_terminal_mainchain_when_no_valid_candidate,

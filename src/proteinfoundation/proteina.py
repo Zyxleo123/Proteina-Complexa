@@ -230,6 +230,7 @@ class Proteina(L.LightningModule):
 
         self._init_cyclization_head(cfg_exp)
         self._init_cyclization_bond_loss(cfg_exp)
+        self._init_replay(cfg_exp)
 
     def _init_cyclization_head(self, cfg_exp):
         """Optionally builds the CPSea cyclization-linkage prediction head.
@@ -317,6 +318,42 @@ class Proteina(L.LightningModule):
                 f"Cyclization linkage-geometry loss enabled (loss_weight={self.cyclization_geometry_weight}, "
                 f"w_angle={self.cyclization_geometry_w_angle}, w_dihedral={self.cyclization_geometry_w_dihedral})"
             )
+
+    def _init_replay(self, cfg_exp):
+        """Optionally enables reward-weighted terminal-sample replay (Stage 7).
+
+        Purely additive: the real-CPSea-batch loss computed earlier in
+        `training_step` is completely unchanged either way. When enabled, this
+        also draws a balanced sample from an on-disk `ReplayBuffer`
+        (`proteinfoundation.replay.buffer`) and adds `lambda_replay * replay_loss`
+        to the total loss, where `replay_loss` is computed via the exact same
+        `flow_loss_from_clean_target` the real batch uses (Stage 5) -- see
+        `proteinfoundation.training.replay_mixer.ReplayMixer`. Off by default, so
+        existing runs are unchanged.
+        """
+        replay_cfg = cfg_exp.get("replay_buffer", None) or {}
+        self.replay_enabled = bool(replay_cfg.get("enabled", False))
+        self.replay_lambda = float(replay_cfg.get("lambda_replay", 1.0))
+        self.replay_n_per_update = int(replay_cfg.get("n_replayed_per_update", 0))
+        self.replay_mixer = None
+        if not self.replay_enabled:
+            return
+
+        from proteinfoundation.training.replay_mixer import ReplayMixer
+
+        self.replay_mixer = ReplayMixer(
+            buffer_dir=replay_cfg["buffer_dir"],
+            reward_version=replay_cfg.get("reward_version", "v1"),
+            weighting_mode=replay_cfg.get("weighting_mode", "success_only"),
+            reward_std_threshold=float(replay_cfg.get("reward_std_threshold", 0.05)),
+            near_weight=float(replay_cfg.get("near_weight", 0.3)),
+            max_size=int(replay_cfg.get("max_size", 10_000)),
+        )
+        logger.info(
+            f"Reward-weighted replay enabled (buffer_dir={replay_cfg['buffer_dir']}, "
+            f"weighting_mode={self.replay_mixer.weighting_mode}, lambda_replay={self.replay_lambda}, "
+            f"n_replayed_per_update={self.replay_n_per_update})"
+        )
 
     def _warn_on_vacuous_type_conditioning(self, cfg_exp):
         """Warns about the two ways type conditioning silently degrades into a no-op."""
@@ -614,6 +651,45 @@ class Proteina(L.LightningModule):
         if getattr(self, "surface_loss_enabled", False):
             surf_loss = self.compute_surface_attraction_loss(batch, nn_out, log_prefix=log_prefix, bs=bs)
             train_loss = train_loss + self.surface_loss_weight * surf_loss
+
+        # Reward-weighted replay (Stage 7): additive only, never touches the real-batch
+        # loss computed above. Training-only (a validation step should measure the model
+        # against real data, not a replay mixture) and a no-op until a replay buffer has
+        # actually been collected/saved to `replay_buffer.buffer_dir` (see
+        # `scripts/collect_cpsea_replay_rollouts.py`).
+        if self.replay_enabled and not val_step and self.replay_mixer is not None:
+            replay_result = self.replay_mixer.sample_replay_loss(
+                self, batch_size=self.replay_n_per_update, device=self.device, n_recycle=n_recycle
+            )
+            if replay_result is not None:
+                replay_losses, replay_diagnostics = replay_result
+                replay_loss = sum(
+                    torch.mean(v) for k, v in replay_losses.items() if "_justlog" not in k
+                )
+                train_loss = train_loss + self.replay_lambda * replay_loss
+                self.log(
+                    f"{log_prefix}/loss_replay",
+                    replay_loss,
+                    on_step=True,
+                    on_epoch=True,
+                    prog_bar=False,
+                    logger=True,
+                    batch_size=bs,
+                    sync_dist=True,
+                    add_dataloader_idx=False,
+                )
+                for name, value in replay_diagnostics.items():
+                    self.log(
+                        f"{log_prefix}/replay_{name}",
+                        value,
+                        on_step=True,
+                        on_epoch=True,
+                        prog_bar=False,
+                        logger=True,
+                        batch_size=bs,
+                        sync_dist=True,
+                        add_dataloader_idx=False,
+                    )
 
         # Joint AE training: anchor the (now trainable) autoencoder with its own recon+KL
         # objective so the encoder cannot collapse the flow target `z` into something trivial.
@@ -1162,16 +1238,29 @@ class Proteina(L.LightningModule):
             cond_type = batch["cyclization_type_cond"].to(device=device).long()
 
         gt_aa = batch["residue_type"].to(device=device).long()
-        valid_mask = build_cyclization_validity_mask(
+        mask_kwargs = dict(
             aa=gt_aa,
             binder_mask=binder_mask,
             gold_i=gold_i.clamp(min=0),
             gold_j=gold_j.clamp(min=0),
             gold_type=gold_type.clamp(min=0, max=NUM_CYCLIZATION_TYPES - 1),
-            force_gold_valid=self.cyclization_force_gold_valid,
             allow_asn_gln_isopeptide=self.cyclization_allow_asn_gln_isopeptide,
             cond_type=cond_type,
             terminal_only=self.cyclization_terminal_only,
+        )
+        valid_mask = build_cyclization_validity_mask(
+            force_gold_valid=self.cyclization_force_gold_valid,
+            **mask_kwargs,
+        )
+        # Built again with force_gold_valid=False so `gold_valid_before_force_frac`
+        # can actually read whether the hand-authored chemistry rules alone (not the
+        # unconditional punch-through above) already allowed the gold entry -- see
+        # `cyclization_link_loss`'s `pre_force_valid_mask` docstring. Skipped when
+        # `force_gold_valid` is already off, since then `valid_mask` IS that answer.
+        pre_force_valid_mask = (
+            build_cyclization_validity_mask(force_gold_valid=False, **mask_kwargs)
+            if self.cyclization_force_gold_valid
+            else valid_mask
         )
 
         loss, metrics = cyclization_link_loss(
@@ -1181,6 +1270,7 @@ class Proteina(L.LightningModule):
             gold_j=gold_j,
             gold_type=gold_type,
             has_cyclization=has_cyclization,
+            pre_force_valid_mask=pre_force_valid_mask,
         )
 
         self.log(

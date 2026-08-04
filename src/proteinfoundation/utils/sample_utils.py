@@ -304,7 +304,7 @@ def format_sample_local_latents(
 
     Args:
         x: Sample dict with keys 'bb_ca', 'local_latents'
-        ret_mode: One of 'samples', 'coors37_n_aatype', 'pdb_string'
+        ret_mode: One of 'samples', 'coors37_n_aatype', 'atom37_nm_with_atom_mask', 'pdb_string'
         mask: Residue mask [batch, n]
         autoencoder: AutoEncoder instance with decode() method
 
@@ -328,6 +328,18 @@ def format_sample_local_latents(
             "coors": nm_to_ang(output_decoder["coors_nm"]),
             "residue_type": output_decoder["residue_type"],
             "mask": output_decoder["residue_mask"],
+        }
+
+    if ret_mode == "atom37_nm_with_atom_mask":
+        # For reward/metric code operating on nm-scale atom37 tensors directly
+        # (e.g. `cyclization.scoring.score_cyclization`), which needs the atom-level
+        # presence mask `coors37_n_aatype` does not expose (only the coarser
+        # per-residue mask) and works in nm, not the Angstrom `coors37_n_aatype` returns.
+        return {
+            "coors_nm": output_decoder["coors_nm"],
+            "residue_type": output_decoder["residue_type"],
+            "residue_mask": output_decoder["residue_mask"],
+            "atom_mask": output_decoder["atom_mask"],
         }
 
     if ret_mode == "pdb_string":

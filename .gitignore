@@ -105,6 +105,15 @@ tests/test_eval_generated/
 .claude.json*
 params
 
+# Per-submission SLURM env files and job logs (scripts/submit_*.sh write one timestamped
+# env file per submission and pass its path positionally to the batch script).
+.slurm_envs/
+slurm_logs/
+
+# Rosetta native-baseline calibration outputs -- relaxed PDBs plus timing CSVs, one dir
+# per eval target. Regenerable from scripts/run_cpsea_evalset_dg_calibration.sh.
+calibration_native/
+
 # Peptide-interface surface caches and their QA renders (scripts/extract_peptide_surfaces.py,
 # script_utils/qa_peptide_surfaces.py). Regenerable from the dataset; the HTML views are
 # ~2.5 MB each because plotly.js is inlined so they open offline.

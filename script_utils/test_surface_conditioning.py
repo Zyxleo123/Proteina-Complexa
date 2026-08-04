@@ -357,6 +357,43 @@ def test_open_gates_change_predictions():
 # ---------------------------------------------------------------------------
 
 
+def test_shuffle_surface_choice_is_reproducible_across_processes(tmp_path):
+    """Regression: the shuffle pick used Python's built-in `hash()` on the example
+    id, which is salted per-process (`PYTHONHASHSEED`) unless explicitly disabled --
+    so the same id could pick a DIFFERENT "other" cache in a fresh process despite
+    an identical `seed`. `hash()` cannot be re-salted from within one already-running
+    process (`PYTHONHASHSEED` is read once at interpreter startup), so the only way
+    to observe the actual bug is a fresh subprocess per seed -- but spawning
+    subprocesses from inside this test file has caused hangs when run alongside the
+    other GPU/multiprocessing-touching tests in this module (fork-safety with
+    lingering torch/dataloader threads), so this instead directly checks that the
+    transform's pick matches an independent `hashlib`-based reference computation.
+    `hash()` is not merely unseeded but a DIFFERENT algorithm entirely, so matching
+    this reference on every call (never ~1/N by chance) is only possible if the
+    implementation really does use the deterministic `hashlib` path this test pins
+    down, not `hash()`.
+    """
+    import hashlib
+
+    from proteinfoundation.datasets.transforms import Data, ShufflePeptideSurfaceTransform
+
+    n_caches = 6
+    for i in range(n_caches):
+        _write_toy_cache(tmp_path / f"ex{i}.surface.npz", f"ex{i}", seed=i)
+
+    for seed in (0, 7):
+        transform = ShufflePeptideSurfaceTransform(str(tmp_path), num_points=96, seed=seed)
+        g = Data(id="ex0", example_id="ex0")
+        g = transform(g)
+
+        own_hash = int(hashlib.sha256(b"ex0").hexdigest(), 16) % (2**31)
+        rng = np.random.default_rng(seed + own_hash)
+        choices = sorted(f"ex{i}" for i in range(n_caches) if f"ex{i}" != "ex0")
+        expected = choices[int(rng.integers(len(choices)))]
+
+        assert g.surface_shuffled_from == expected
+
+
 def test_shuffle_surface_picks_a_different_cache(tmp_path):
     from proteinfoundation.datasets.transforms import (
         AttachPeptideSurfaceTransform,

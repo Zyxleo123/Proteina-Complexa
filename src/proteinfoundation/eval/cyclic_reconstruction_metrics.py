@@ -29,8 +29,10 @@ import torch
 from openfold.np.residue_constants import atom_order
 
 from proteinfoundation.cyclization.constants import (
+    AA_ASN,
     AA_ASP,
     AA_CYS,
+    AA_GLN,
     AA_GLU,
     AA_LYS,
     DISULFIDE,
@@ -62,6 +64,32 @@ SG_IDX = get_atom_index("SG")
 NZ_IDX = get_atom_index("NZ")
 CG_IDX = get_atom_index("CG")
 CD_IDX = get_atom_index("CD")
+
+
+def is_isopeptide_acid(aa: torch.Tensor) -> torch.Tensor:
+    """True where `aa` is a residue that can accept an isopeptide bond from a
+    lysine NZ: Asp/Asn (through CG) or Glu/Gln (through CD).
+
+    ASN/GLN are included because `cyclization.parse_labels` accepts them too (its
+    `_CARBOXYL_OR_CARBOXAMIDE_ATOMS`, the single source of truth for which real
+    CONECT-derived bonds exist in CPSea) -- a narrower check here would silently
+    zero out geometric supervision/strict-metric coverage for a sample that
+    `has_cyclization=True` already says is a real, usable isopeptide label.
+    """
+    return (aa == AA_ASP) | (aa == AA_ASN) | (aa == AA_GLU) | (aa == AA_GLN)
+
+
+def isopeptide_acid_atom_idx(aa: torch.Tensor) -> torch.Tensor:
+    """Side-chain carbonyl atom slot each acid/amide bonds an isopeptide through.
+
+    CG for Asp/Asn, CD for Glu/Gln (see `cyclization.constants.ISOPEPTIDE_ACID_CARBON_ATOM`).
+    Callers must gate on `is_isopeptide_acid(aa)` first: this function returns a
+    slot index for every input regardless of residue identity (defaulting
+    non-Asp/Asn residues to CD), so an unrelated residue's `CD` (or lack of one,
+    caught by the atom-presence mask) is never mistaken for a real acceptor.
+    """
+    is_cg_family = (aa == AA_ASP) | (aa == AA_ASN)
+    return torch.where(is_cg_family, torch.full_like(aa, CG_IDX), torch.full_like(aa, CD_IDX))
 CE_IDX = get_atom_index("CE")
 
 
@@ -484,31 +512,31 @@ def cyclic_geometry_metrics(
     out[f"{prefix}/cyc_endpoint_atom_rmsd_A"] = _reduce_valid_to_float(endpoint_errors["atom_rmse_A"], valid_common)
     out[f"{prefix}/cyc_endpoint_coord_mae_A"] = _reduce_valid_to_float(endpoint_errors["coord_mae_A"], valid_common)
 
-    # ---- Mainchain (head-to-tail): C of lower endpoint <-> N of higher endpoint ----
-    # `i < j` is guaranteed by the CPSea label convention, but we also log the
-    # flipped orientation and take the min distance in case that convention
-    # does not hold for some sample.
-    c_i, c_i_valid = _gather_atom(gt_atom37, mask_bool, i, C_IDX)
-    n_j, n_j_valid = _gather_atom(gt_atom37, mask_bool, j, N_IDX)
+    # ---- Mainchain (head-to-tail): N of the first (lower-index) endpoint <-> C of
+    # the last (higher-index) endpoint. `i < j` is guaranteed by the CPSea label
+    # convention (`parse_labels.py` sorts endpoints and requires MAINCHAIN's pair
+    # to be exactly the binder termini `{0, L_b - 1}`), so this is the single real
+    # closing bond -- NOT a min over both orientations. The flipped pair, C(i)-N(j),
+    # is two atoms that are each already engaged in ordinary in-chain peptide bonds
+    # (C of the first residue to N of its own neighbour, not the last residue's N);
+    # it is never a real bond, and a `min()` over it lets a coincidentally-close but
+    # chemically meaningless pair masquerade as ring closure, inflating
+    # `mainchain_cn_bond_success`. Matches the already-fixed single-orientation
+    # `per_sample_requested_bond_distance` below and `evaluation.cyclization_pdb_metrics`,
+    # which both measure only N(first)-C(last).
     n_i, n_i_valid = _gather_atom(gt_atom37, mask_bool, i, N_IDX)
     c_j, c_j_valid = _gather_atom(gt_atom37, mask_bool, j, C_IDX)
-    dist_o1_gt = torch.linalg.norm(c_i - n_j, dim=-1) * NM_TO_ANG
-    dist_o2_gt = torch.linalg.norm(n_i - c_j, dim=-1) * NM_TO_ANG
-    mainchain_dist_gt = torch.minimum(dist_o1_gt, dist_o2_gt)
+    mainchain_dist_gt = torch.linalg.norm(n_i - c_j, dim=-1) * NM_TO_ANG
 
-    c_i_p, _ = _gather_atom(pred_atom37, mask_bool, i, C_IDX)
-    n_j_p, _ = _gather_atom(pred_atom37, mask_bool, j, N_IDX)
     n_i_p, _ = _gather_atom(pred_atom37, mask_bool, i, N_IDX)
     c_j_p, _ = _gather_atom(pred_atom37, mask_bool, j, C_IDX)
-    dist_o1_pred = torch.linalg.norm(c_i_p - n_j_p, dim=-1) * NM_TO_ANG
-    dist_o2_pred = torch.linalg.norm(n_i_p - c_j_p, dim=-1) * NM_TO_ANG
-    mainchain_dist_pred = torch.minimum(dist_o1_pred, dist_o2_pred)
+    mainchain_dist_pred = torch.linalg.norm(n_i_p - c_j_p, dim=-1) * NM_TO_ANG
 
     mainchain_abs_err = (mainchain_dist_pred - mainchain_dist_gt).abs()
     mainchain_success = (mainchain_dist_pred >= MAINCHAIN_CN_BOND_WINDOW_A[0]) & (
         mainchain_dist_pred <= MAINCHAIN_CN_BOND_WINDOW_A[1]
     )
-    mainchain_atoms_valid = c_i_valid & n_j_valid & n_i_valid & c_j_valid
+    mainchain_atoms_valid = n_i_valid & c_j_valid
     valid_mainchain = has_cyc & (cyc_type == MAINCHAIN) & mainchain_atoms_valid
 
     out[f"{prefix}/mainchain_cn_dist_gt_A"] = _reduce_valid_to_float(mainchain_dist_gt, valid_mainchain)
@@ -536,19 +564,21 @@ def cyclic_geometry_metrics(
     out[f"{prefix}/disulfide_sg_dist_abs_err_A"] = _reduce_valid_to_float(disulfide_abs_err, valid_disulfide)
     out[f"{prefix}/disulfide_bond_success"] = _reduce_valid_to_float(disulfide_success.float(), valid_disulfide)
 
-    # ---- Isopeptide/lactam: LYS(NZ) <-> ASP(CG)/GLU(CD) ----
-    # Supports Lys-Asp and Lys-Glu only (per spec); ASN/GLN or other chemistry
-    # is left as NaN (unlike the coarse classification-only validity mask in
-    # `proteinfoundation.cyclization.mask`, which optionally allows ASN/GLN).
+    # ---- Isopeptide/lactam: LYS(NZ) <-> ASP(CG)/ASN(CG)/GLU(CD)/GLN(CD) ----
+    # Includes ASN/GLN alongside ASP/GLU (see `is_isopeptide_acid`): CPSea's own
+    # CONECT-based label parser (`cyclization.parse_labels`) accepts them as real
+    # isopeptide partners, so excluding them here would silently zero out geometric
+    # supervision/strict-metric coverage for a sample already labeled
+    # `has_cyclization=True`.
     i_is_lys = aa_i == AA_LYS
     j_is_lys = aa_j == AA_LYS
-    i_is_acid = (aa_i == AA_ASP) | (aa_i == AA_GLU)
-    j_is_acid = (aa_j == AA_ASP) | (aa_j == AA_GLU)
+    i_is_acid = is_isopeptide_acid(aa_i)
+    j_is_acid = is_isopeptide_acid(aa_j)
     case_i_lys = i_is_lys & j_is_acid
     case_j_lys = j_is_lys & i_is_acid
     valid_chem = case_i_lys | case_j_lys
 
-    acid_atom_j_idx = torch.where(aa_j == AA_ASP, torch.full_like(j, CG_IDX), torch.full_like(j, CD_IDX))
+    acid_atom_j_idx = isopeptide_acid_atom_idx(aa_j)
     nz_i, nz_i_valid = _gather_atom(gt_atom37, mask_bool, i, torch.full_like(i, NZ_IDX))
     acid_j_gt, acid_j_valid = _gather_atom(gt_atom37, mask_bool, j, acid_atom_j_idx)
     dist_a_gt = torch.linalg.norm(nz_i - acid_j_gt, dim=-1) * NM_TO_ANG
@@ -557,7 +587,7 @@ def cyclic_geometry_metrics(
     dist_a_pred = torch.linalg.norm(nz_i_pred - acid_j_pred, dim=-1) * NM_TO_ANG
     valid_a = nz_i_valid & acid_j_valid
 
-    acid_atom_i_idx = torch.where(aa_i == AA_ASP, torch.full_like(i, CG_IDX), torch.full_like(i, CD_IDX))
+    acid_atom_i_idx = isopeptide_acid_atom_idx(aa_i)
     nz_j, nz_j_valid = _gather_atom(gt_atom37, mask_bool, j, torch.full_like(j, NZ_IDX))
     acid_i_gt, acid_i_valid = _gather_atom(gt_atom37, mask_bool, i, acid_atom_i_idx)
     dist_b_gt = torch.linalg.norm(nz_j - acid_i_gt, dim=-1) * NM_TO_ANG
@@ -678,16 +708,17 @@ def per_sample_requested_bond_distance(
     disulfide_dist = torch.linalg.norm(sg_i - sg_j, dim=-1) * NM_TO_ANG
     disulfide_valid = (aa_i == AA_CYS) & (aa_j == AA_CYS) & sg_i_valid & sg_j_valid
 
-    # ---- Isopeptide/lactam: LYS(NZ) <-> ASP(CG)/GLU(CD) ----
-    case_i_lys = (aa_i == AA_LYS) & ((aa_j == AA_ASP) | (aa_j == AA_GLU))
-    case_j_lys = (aa_j == AA_LYS) & ((aa_i == AA_ASP) | (aa_i == AA_GLU))
+    # ---- Isopeptide/lactam: LYS(NZ) <-> ASP(CG)/ASN(CG)/GLU(CD)/GLN(CD) ----
+    # See `is_isopeptide_acid` for why ASN/GLN are included alongside ASP/GLU.
+    case_i_lys = (aa_i == AA_LYS) & is_isopeptide_acid(aa_j)
+    case_j_lys = (aa_j == AA_LYS) & is_isopeptide_acid(aa_i)
 
-    acid_atom_j_idx = torch.where(aa_j == AA_ASP, torch.full_like(j, CG_IDX), torch.full_like(j, CD_IDX))
+    acid_atom_j_idx = isopeptide_acid_atom_idx(aa_j)
     nz_i, nz_i_valid = _gather_atom(pred_atom37, mask_bool, i, torch.full_like(i, NZ_IDX))
     acid_j, acid_j_valid = _gather_atom(pred_atom37, mask_bool, j, acid_atom_j_idx)
     dist_a = torch.linalg.norm(nz_i - acid_j, dim=-1) * NM_TO_ANG
 
-    acid_atom_i_idx = torch.where(aa_i == AA_ASP, torch.full_like(i, CG_IDX), torch.full_like(i, CD_IDX))
+    acid_atom_i_idx = isopeptide_acid_atom_idx(aa_i)
     nz_j, nz_j_valid = _gather_atom(pred_atom37, mask_bool, j, torch.full_like(j, NZ_IDX))
     acid_i, acid_i_valid = _gather_atom(pred_atom37, mask_bool, i, acid_atom_i_idx)
     dist_b = torch.linalg.norm(nz_j - acid_i, dim=-1) * NM_TO_ANG

@@ -440,13 +440,23 @@ def compute_rosetta_metrics_single(
     pdb_path: str,
     binder_chain: str,
     target_chain: str,
+    cyclization_type: str | None = None,
 ) -> dict[str, Any]:
-    """Compute PyRosetta InterfaceAnalyzerMover metrics for a single PDB."""
+    """Compute PyRosetta InterfaceAnalyzerMover metrics for a single PDB.
+
+    `cyclization_type`, when given, declares that closing bond on the pose before
+    scoring (mainchain/disulfide only -- see `rosetta_energy` module docstring),
+    so `dG_separated` describes the macrocycle that was actually generated rather
+    than a linear peptide sitting in a ring-shaped conformation. `None` (default)
+    is a complete no-op.
+    """
     if not PYROSETTA_AVAILABLE:
         return dict.fromkeys(ROSETTA_METRIC_COLS, np.nan)
 
     try:
-        return compute_rosetta_interface_metrics_single(pdb_path, binder_chain, target_chain)
+        return compute_rosetta_interface_metrics_single(
+            pdb_path, binder_chain, target_chain, cyclization_type=cyclization_type
+        )
     except Exception as e:
         logger.error(f"Rosetta metrics failed for {pdb_path}: {e}")
         return dict.fromkeys(ROSETTA_METRIC_COLS, np.nan)
@@ -571,7 +581,11 @@ def compute_interface_metrics(
                 metrics.update(dict.fromkeys(ROSETTA_METRIC_COLS, np.nan))
             else:
                 logger.info("Computing Rosetta interface energy metrics...")
-                metrics.update(compute_rosetta_metrics_single(pdb_path, binder_chain, target_chain))
+                metrics.update(
+                    compute_rosetta_metrics_single(
+                        pdb_path, binder_chain, target_chain, cyclization_type=cyclization_type
+                    )
+                )
 
         # Macrocycle closure. Cheap (a PDB parse and one distance), and it is the only
         # metric here that can see the ring at all -- every other column is computed on a

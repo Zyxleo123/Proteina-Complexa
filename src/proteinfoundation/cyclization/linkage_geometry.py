@@ -27,9 +27,9 @@ import math
 import torch
 
 from proteinfoundation.eval.cyclic_reconstruction_metrics import (
+    AA_ASN,
     AA_ASP,
     AA_CYS,
-    AA_GLU,
     AA_LYS,
     C_IDX,
     CA_IDX,
@@ -41,6 +41,7 @@ from proteinfoundation.eval.cyclic_reconstruction_metrics import (
     NZ_IDX,
     SG_IDX,
     _gather_atom,
+    is_isopeptide_acid,
 )
 from proteinfoundation.cyclization.constants import DISULFIDE, ISOPEPTIDE, MAINCHAIN
 from proteinfoundation.utils.angle_utils import bond_angles, signed_dihedral_angle
@@ -148,18 +149,20 @@ def _isopeptide_atoms(atom37, mask_bool, i, j, aa_i, aa_j):
     # to NZ at all).
     ce_lys, v1 = _gather_atom(atom37, mask_bool, lys_idx, CE_IDX)
     nz_lys, v2 = _gather_atom(atom37, mask_bool, lys_idx, NZ_IDX)
-    # Asp's carbonyl carbon is CG (its other real neighbor is CB); Glu's is CD (its
-    # other real neighbor is CG, one bond further out than Asp's CB).
-    is_asp = aa_acid == AA_ASP
-    acid_c = torch.where(is_asp, torch.full_like(acid_idx, CG_IDX), torch.full_like(acid_idx, CD_IDX))
-    acid_x = torch.where(is_asp, torch.full_like(acid_idx, CB_IDX), torch.full_like(acid_idx, CG_IDX))
+    # Asp/Asn's carbonyl carbon is CG (their other real neighbor is CB); Glu/Gln's is
+    # CD (their other real neighbor is CG, one bond further out than Asp/Asn's CB).
+    # ASN/GLN are included alongside ASP/GLU because `cyclization.parse_labels`
+    # accepts them as real isopeptide partners too (see `is_isopeptide_acid`) --
+    # excluding them here would silently drop the angle/dihedral term for a sample
+    # already labeled `has_cyclization=True`.
+    is_cg_family = (aa_acid == AA_ASP) | (aa_acid == AA_ASN)
+    acid_c = torch.where(is_cg_family, torch.full_like(acid_idx, CG_IDX), torch.full_like(acid_idx, CD_IDX))
+    acid_x = torch.where(is_cg_family, torch.full_like(acid_idx, CB_IDX), torch.full_like(acid_idx, CG_IDX))
     c_acid, v3 = _gather_atom(atom37, mask_bool, acid_idx, acid_c)
     x_acid, v4 = _gather_atom(atom37, mask_bool, acid_idx, acid_x)
 
-    is_lys_pair = (
-        (aa_i == AA_LYS) & ((aa_j == AA_ASP) | (aa_j == AA_GLU))
-    ) | (
-        (aa_j == AA_LYS) & ((aa_i == AA_ASP) | (aa_i == AA_GLU))
+    is_lys_pair = ((aa_i == AA_LYS) & is_isopeptide_acid(aa_j)) | (
+        (aa_j == AA_LYS) & is_isopeptide_acid(aa_i)
     )
     return ce_lys, nz_lys, c_acid, x_acid, v1 & v2 & v3 & v4 & is_lys_pair
 

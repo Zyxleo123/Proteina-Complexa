@@ -35,6 +35,13 @@ from proteinfoundation.eval.cyclic_reconstruction_metrics import (
 
 _EPS = 1e-6
 
+# Bumped whenever the reward SHAPE/semantics change (window widths, gate defaults,
+# chirality/clash formulas) -- not for pure refactors. `ReplayBuffer` refuses to mix
+# entries scored under different versions in one buffer (see
+# `replay.buffer.REQUIRED_ENTRY_FIELDS`'s `reward_version`), so a collector/trainer
+# pair must agree on this string.
+REWARD_VERSION = "score_cyclization_v1"
+
 # Additional margin (Angstrom) beyond each type's hard acceptance window
 # (`*_BOND_WINDOW_A` in `cyclic_reconstruction_metrics.py`) that still counts as
 # "near" a valid closure, for the shaped reward and `near_success`. Set equal to

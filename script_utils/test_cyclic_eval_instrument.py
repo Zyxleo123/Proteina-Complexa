@@ -120,6 +120,38 @@ def test_binder_longer_than_complex_raises():
         build_complex_cyclic_offset(10, 12)
 
 
+def test_chain_break_gap_is_preserved_not_erased():
+    """The bug this guards: rebuilding from `arange(total_len)` silently turns a real
+    target/binder chain-break gap (e.g. -50) into an ordinary linear separation (-1),
+    which tells AF2 the two chains are backbone neighbours."""
+    target_len, binder_len = 20, 12
+    # Mirrors ColabDesign's prep_pdb/prep_inputs: binder residue_index starts at
+    # target's last index + 50, not at target_len.
+    residue_index = np.concatenate(
+        [np.arange(target_len), residue_index_gap := np.arange(binder_len) + (target_len - 1) + 50]
+    )
+    off = build_complex_cyclic_offset(residue_index, binder_len)
+    # Target-binder cross block must reflect the real ~50-residue gap, not ~1.
+    assert off[0, target_len] == pytest.approx(-(residue_index_gap[0] - 0))
+    assert abs(off[0, target_len]) > 40
+    # Binder-binder block is still the wrapped ring, unaffected by the gap.
+    np.testing.assert_array_equal(off[-binder_len:, -binder_len:], cyclic_offset_block(binder_len))
+
+
+def test_apply_cyclic_offset_preserves_real_chain_break():
+    target_len, binder_len = 20, 12
+    residue_index = np.concatenate([np.arange(target_len), np.arange(binder_len) + (target_len - 1) + 50])
+
+    class _RealisticFakeAFModel:
+        def __init__(self, residue_index):
+            self._inputs = {"residue_index": residue_index}
+
+    model = _RealisticFakeAFModel(residue_index)
+    assert apply_cyclic_offset(model, binder_len=binder_len, linkage_type="mainchain") is True
+    cross_offset = model._inputs["offset"][0, target_len]
+    assert abs(cross_offset) > 40, "chain-break gap was erased by the cyclic-offset patch"
+
+
 # ---------------------------------------------------------------------------
 # apply_cyclic_offset -- linkage gating
 # ---------------------------------------------------------------------------

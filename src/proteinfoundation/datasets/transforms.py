@@ -1,4 +1,5 @@
 import gzip
+import hashlib
 import os
 import random
 import re
@@ -492,6 +493,11 @@ class AttachPeptideSurfaceTransform(BaseTransform):
             ``sample_count`` are rejected when ``require_surface`` is True.
         require_surface: If True (default), missing/invalid caches raise. If False,
             attaches an all-masked zero cloud so the batch schema stays uniform.
+        backend, sas_points_per_atom: Expected extraction backend / SAS resolution
+            (see `surface.peptide_surface.is_cache_valid`). `None` (default) skips
+            these checks -- set them when a training run needs to guarantee it is
+            reading caches from one specific backend/resolution rather than
+            whatever happens to be on disk (e.g. a stale mixed-backend cache dir).
     """
 
     def __init__(
@@ -499,10 +505,14 @@ class AttachPeptideSurfaceTransform(BaseTransform):
         surface_dir: str,
         num_points: int = 96,
         require_surface: bool = True,
+        backend: str | None = None,
+        sas_points_per_atom: int | None = None,
     ):
         self.surface_dir = Path(surface_dir)
         self.num_points = int(num_points)
         self.require_surface = bool(require_surface)
+        self.backend = backend
+        self.sas_points_per_atom = sas_points_per_atom
 
     def _example_id(self, graph: Data) -> str:
         for key in ("example_id", "id"):
@@ -533,6 +543,8 @@ class AttachPeptideSurfaceTransform(BaseTransform):
             cache_path,
             num_points=self.num_points,
             version=EXTRACTOR_VERSION,
+            backend=self.backend,
+            sas_points_per_atom=self.sas_points_per_atom,
         ):
             if self.require_surface:
                 raise FileNotFoundError(
@@ -605,7 +617,13 @@ class ShufflePeptideSurfaceTransform(BaseTransform):
             raise RuntimeError(f"Need >=2 surface caches under {self.surface_dir} to shuffle")
 
         own = str(getattr(graph, "example_id", getattr(graph, "id", "")))
-        rng = np.random.default_rng(self.seed + (hash(own) % (2**31)))
+        # Python's built-in `hash()` on strings is salted per-process (PYTHONHASHSEED)
+        # unless explicitly disabled, so the same `own` id maps to a different value
+        # in every new process -- silently breaking reproducibility across dataloader
+        # workers/job restarts despite the fixed `self.seed`. `hashlib` is stable
+        # across processes and Python versions, which is what "seeded" needs to mean.
+        own_hash = int(hashlib.sha256(own.encode("utf-8")).hexdigest(), 16) % (2**31)
+        rng = np.random.default_rng(self.seed + own_hash)
         choices = sorted(k for k in id_to_path if k != own) or sorted(id_to_path)
         other = choices[int(rng.integers(len(choices)))]
         surface = load_surface_cache(id_to_path[other])

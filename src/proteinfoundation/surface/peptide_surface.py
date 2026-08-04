@@ -851,15 +851,33 @@ def is_cache_valid(
     num_points: int | None = None,
     seed: int | None = None,
     version: str | None = EXTRACTOR_VERSION,
+    backend: str | None = None,
+    sas_points_per_atom: int | None = None,
 ) -> bool:
     """True if ``path`` is a readable cache matching the requested settings.
 
-    A cache built with a different cutoff/sample count/seed/extractor version is *not*
-    valid for the current request: reusing it would silently mix incompatible point sets
-    into one dataset. Returning False here makes ``--skip-existing`` rebuild it.
+    A cache built with a different cutoff/sample count/seed/extractor version/
+    extraction backend/backend resolution is *not* valid for the current request:
+    reusing it would silently mix incompatible point sets into one dataset (e.g. a
+    PyMOL-extracted surface accepted in place of an SAS-extracted one just because
+    cutoff/num_points/seed/version happened to match -- `backend` is stored in
+    every cache's metadata, see `extract_peptide_surface`, but was never checked
+    here). Returning False here makes ``--skip-existing`` rebuild it.
 
     Only the embedded metadata blob is opened (zip entry), so validating millions of
     existing caches at job start stays I/O-bound on stats, not full decompress.
+
+    Args:
+        path: Cache file to check.
+        cutoff, num_points, seed, version: As before.
+        backend: Expected extraction backend (e.g. ``"pymol"`` or ``"sas"``).
+            `None` skips this check (matches any backend).
+        sas_points_per_atom: Expected Fibonacci-sphere density for the ``"sas"``
+            backend. Only checked when the cache's own metadata records a
+            `backend` of `"sas"` (a cache from a different backend has no such
+            key and is already rejected by the `backend` check above whenever
+            `backend` is also given; if `backend` is left `None`, a non-`"sas"`
+            cache without this key is treated as not applicable, not a mismatch).
     """
     path = Path(path)
     if not path.exists() or path.stat().st_size == 0:
@@ -872,11 +890,15 @@ def is_cache_valid(
         (num_points, "sample_count", int),
         (seed, "seed", int),
         (version, "extractor_version", str),
+        (backend, "backend", str),
     )
     for requested, key, caster in checks:
         if requested is None:
             continue
         if key not in meta or caster(meta[key]) != caster(requested):
+            return False
+    if sas_points_per_atom is not None and meta.get("backend") == "sas":
+        if int(meta.get("sas_points_per_atom", -1)) != int(sas_points_per_atom):
             return False
     return True
 

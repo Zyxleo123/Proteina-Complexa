@@ -64,18 +64,40 @@ def cyclic_offset_block(binder_len: int) -> np.ndarray:
     return np.where(abs_off > binder_len // 2, -np.sign(off) * (binder_len - abs_off), off)
 
 
-def build_complex_cyclic_offset(total_len: int, binder_len: int) -> np.ndarray:
+def build_complex_cyclic_offset(residue_index, binder_len: int) -> np.ndarray:
     """Offset matrix for a target+binder complex with the binder block made cyclic.
 
     ColabDesign's binder protocol lays the complex out as ``[target, binder]``, so the
     binder occupies the trailing `binder_len` rows/columns. Only that diagonal block
-    is wrapped: target-target and target-binder offsets are left exactly as they were,
-    since no cyclization relates a receptor residue to anything.
+    is wrapped: target-target and target-binder offsets are left exactly as they were.
+
+    **Must be built from the complex's real `residue_index`, not a fresh
+    ``arange(total_len)``.** ColabDesign's `prep_pdb`/`prep_inputs` deliberately puts a
+    large gap in `residue_index` at the target/binder chain boundary (e.g. binder start
+    = target's last index + 50) precisely so AF2's relative positional encoding reads
+    the two chains as unrelated rather than sequence-adjacent. Rebuilding the whole
+    matrix from a contiguous `arange` silently collapses that gap back down to the
+    ordinary linear separation (e.g. an intended boundary offset of -50 becomes -1),
+    which tells AF2 the receptor and binder are backbone neighbours -- the exact
+    instrument problem this module exists to avoid, just relocated to the wrong chain
+    boundary instead of the binder's own termini. `residue_index` here should be
+    whatever `inputs["residue_index"]` already is for the prepared complex.
+
+    Args:
+        residue_index: The complex's real per-residue index, array-like of length
+            `total_len`. For convenience (e.g. tests that don't need a real chain-break
+            gap), a plain int is also accepted and treated as a contiguous
+            ``arange(int)`` -- but production callers must pass the actual prepared
+            array, never a bare length.
+        binder_len: Number of trailing binder residues to wrap into a ring.
     """
+    if np.isscalar(residue_index):
+        residue_index = np.arange(int(residue_index))
+    residue_index = np.asarray(residue_index).reshape(-1)
+    total_len = residue_index.shape[0]
     if binder_len > total_len:
         raise ValueError(f"binder_len ({binder_len}) exceeds total_len ({total_len})")
-    idx = np.arange(total_len)
-    offset = idx[:, None] - idx[None, :]
+    offset = residue_index[:, None] - residue_index[None, :]
     if binder_len > 0:
         offset[-binder_len:, -binder_len:] = cyclic_offset_block(binder_len)
     return offset
@@ -116,13 +138,18 @@ def apply_cyclic_offset(af_model, binder_len: int, linkage_type: str | None) -> 
         logger.warning("Cyclic offset skipped: model has no prepared inputs (call prep_inputs first).")
         return False
 
-    total_len = int(np.asarray(inputs["residue_index"]).reshape(-1).shape[0])
+    residue_index = np.asarray(inputs["residue_index"]).reshape(-1)
+    total_len = int(residue_index.shape[0])
     if binder_len > total_len:
         logger.warning(
             "Cyclic offset skipped: binder_len=%d exceeds prepared complex length %d.", binder_len, total_len
         )
         return False
 
-    inputs["offset"] = build_complex_cyclic_offset(total_len, binder_len)
+    # Pass the model's own `residue_index`, NOT `total_len` -- see
+    # `build_complex_cyclic_offset`'s docstring. Rebuilding from a bare length would
+    # silently erase whatever target/binder chain-break gap `prep_inputs` already
+    # encoded there.
+    inputs["offset"] = build_complex_cyclic_offset(residue_index, binder_len)
     logger.info("Applied cyclic offset to binder block (binder_len=%d, total_len=%d).", binder_len, total_len)
     return True

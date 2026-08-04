@@ -46,6 +46,20 @@ def test_geocycler_high_std_group_gets_shaped_weights():
     assert torch.all((weights >= 0.0) & (weights <= 1.0))
 
 
+def test_geocycler_group_idx_device_matches_rewards_device():
+    """Regression: `_group_index` builds its index tensor on CPU (pure Python
+    bookkeeping over `group_ids`), and an earlier version of this function
+    indexed `rewards` with that CPU tensor directly -- a silent no-op on CPU-only
+    runs, but a hard `RuntimeError: ... cuda:0 and cpu` in real training. This
+    can't reproduce the CUDA case without a GPU, but at minimum confirms the
+    output is pinned to `rewards.device`, which is what the fix (`group_idx =
+    group_idx.to(rewards.device)`) guarantees regardless of device.
+    """
+    rewards = torch.tensor([0.0, 1.0, 0.5, 0.5])
+    weights = geocycler_group_relative_weights(rewards, ["A", "A", "B", "B"])
+    assert weights.device == rewards.device
+
+
 def test_geocycler_groups_are_independent():
     # Group A has spread (should get shaped weights); group B is degenerate (skipped).
     rewards = torch.tensor([0.0, 1.0, 0.5, 0.5])
@@ -58,6 +72,23 @@ def test_geocycler_groups_are_independent():
 # ---------------------------------------------------------------------------
 # B. Success-only weighting
 # ---------------------------------------------------------------------------
+def test_success_only_weights_device_matches_input_not_default():
+    """Regression: `weights = torch.zeros(success.shape, dtype=torch.float32)` (no
+    `device=`) previously created the weights tensor on the DEFAULT device
+    regardless of where `success`/`near_success` actually lived -- fine on a
+    CPU-only run, but a hard `RuntimeError: ... cuda:0 and cpu` in real training
+    the moment `success`/`near_success` are CUDA tensors (as they are once
+    `ReplayMixer._collate` moves everything to `self.device`). `meta` is used
+    here (not CUDA) precisely because it's a distinct-from-default device
+    available without a GPU, so this reproduces the same class of failure this
+    sandbox's CPU-only tests would otherwise miss entirely.
+    """
+    success = torch.tensor([True, False], device="meta")
+    near_success = torch.tensor([False, True], device="meta")
+    weights = success_only_weights(success, near_success)
+    assert weights.device.type == "meta"
+
+
 def test_success_only_mapping():
     success = torch.tensor([True, False, False])
     near_success = torch.tensor([False, True, False])
@@ -171,6 +202,8 @@ ALL_TESTS = [
     test_geocycler_low_std_group_is_skipped_to_zero,
     test_geocycler_high_std_group_gets_shaped_weights,
     test_geocycler_groups_are_independent,
+    test_geocycler_group_idx_device_matches_rewards_device,
+    test_success_only_weights_device_matches_input_not_default,
     test_success_only_mapping,
     test_success_only_success_takes_precedence_over_near,
     test_raw_bounded_is_identity_on_bounded_input,

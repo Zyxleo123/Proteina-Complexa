@@ -41,3 +41,19 @@ AA_ASP = residue_constants.restype_order["D"]
 AA_GLU = residue_constants.restype_order["E"]
 AA_ASN = residue_constants.restype_order["N"]
 AA_GLN = residue_constants.restype_order["Q"]
+
+# Isopeptide acid/amide partner atom name, by residue three-letter code. CONECT
+# records in CPSea bond to the side-chain carbonyl carbon (CG for Asp/Asn, CD for
+# Glu/Gln), never the oxygens -- see `cyclization.parse_labels`, the single source
+# of truth for which real bonds exist in the dataset. ASN/GLN are included here
+# because they ARE accepted at label-parsing time; every downstream consumer of an
+# isopeptide `(i, j, type)` triple (geometry loss, strict reconstruction metrics,
+# generation-time closure scoring) must recognize the same four residues, or a
+# sample labeled `has_cyclization=True` at parse time silently gets zero geometric
+# supervision / a silently-`None` observed chemistry downstream.
+ISOPEPTIDE_ACID_CARBON_ATOM = {
+    "ASP": "CG",
+    "ASN": "CG",
+    "GLU": "CD",
+    "GLN": "CD",
+}

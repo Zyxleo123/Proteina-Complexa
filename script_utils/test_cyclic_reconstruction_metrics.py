@@ -18,8 +18,10 @@ import math
 import torch
 
 from proteinfoundation.cyclization.constants import (
+    AA_ASN,
     AA_ASP,
     AA_CYS,
+    AA_GLN,
     AA_GLU,
     AA_LYS,
     DISULFIDE,
@@ -338,6 +340,59 @@ def test_isopeptide_reversed_order_lys_at_j():
     assert out["cyc/isopeptide_bond_success"] == 1.0
 
 
+def test_isopeptide_lys_asn_uses_cg_and_succeeds():
+    """ASN is accepted as an isopeptide partner (see `is_isopeptide_acid`), same
+    carbonyl atom (CG) as ASP -- excluding it here would be inconsistent with
+    `parse_labels.py` accepting ASN-linked samples as `has_cyclization=True`."""
+    gt, mask = _zeros_atom37(1, 2)
+    pred = gt.clone()
+    seq_tokens = _uniform_aa(1, 2)
+    seq_tokens[0, 0] = AA_LYS
+    seq_tokens[0, 1] = AA_ASN
+
+    mask[0, 0, NZ_IDX] = True
+    mask[0, 1, CG_IDX] = True
+    gt[0, 0, NZ_IDX] = torch.tensor([0.0, 0.0, 0.0])
+    gt[0, 1, CG_IDX] = torch.tensor([0.0, 0.0, 0.132])
+    pred[0, 0, NZ_IDX] = torch.tensor([0.0, 0.0, 0.0])
+    pred[0, 1, CG_IDX] = torch.tensor([0.0, 0.0, 0.132])
+
+    meta = {
+        "i": torch.tensor([0]),
+        "j": torch.tensor([1]),
+        "type": torch.tensor([ISOPEPTIDE]),
+        "has_cyclization": torch.tensor([True]),
+    }
+    out = cyclic_geometry_metrics(pred, gt, mask, seq_tokens, meta, prefix="cyc")
+    assert math.isclose(out["cyc/isopeptide_n_c_dist_pred_A"], 1.32, abs_tol=1e-4)
+    assert out["cyc/isopeptide_bond_success"] == 1.0
+
+
+def test_isopeptide_lys_gln_uses_cd():
+    gt, mask = _zeros_atom37(1, 2)
+    pred = gt.clone()
+    seq_tokens = _uniform_aa(1, 2)
+    seq_tokens[0, 0] = AA_LYS
+    seq_tokens[0, 1] = AA_GLN
+
+    mask[0, 0, NZ_IDX] = True
+    mask[0, 1, CD_IDX] = True
+    gt[0, 0, NZ_IDX] = torch.tensor([0.0, 0.0, 0.0])
+    gt[0, 1, CD_IDX] = torch.tensor([0.0, 0.0, 0.132])
+    pred[0, 0, NZ_IDX] = torch.tensor([0.0, 0.0, 0.0])
+    pred[0, 1, CD_IDX] = torch.tensor([0.0, 0.0, 0.132])
+
+    meta = {
+        "i": torch.tensor([0]),
+        "j": torch.tensor([1]),
+        "type": torch.tensor([ISOPEPTIDE]),
+        "has_cyclization": torch.tensor([True]),
+    }
+    out = cyclic_geometry_metrics(pred, gt, mask, seq_tokens, meta, prefix="cyc")
+    assert math.isclose(out["cyc/isopeptide_n_c_dist_pred_A"], 1.32, abs_tol=1e-4)
+    assert out["cyc/isopeptide_bond_success"] == 1.0
+
+
 def test_isopeptide_unsupported_chemistry_is_nan():
     gt, mask = _zeros_atom37(1, 2)
     pred = gt.clone()
@@ -355,11 +410,11 @@ def test_isopeptide_unsupported_chemistry_is_nan():
 
 
 # ---------------------------------------------------------------------------
-# H. Mainchain geometry with orientation ambiguity (min-distance logic)
+# H. Mainchain geometry: single real orientation, no min-over-both-pairs
 # ---------------------------------------------------------------------------
-def test_mainchain_min_distance_picks_the_real_bond():
+def test_mainchain_uses_only_the_real_n_i_c_j_bond():
     # Head-to-tail closure: N of the N-terminus (i) bonds to C of the C-terminus (j).
-    # The naive "C_i - N_j" orientation is the *unrelated*, far-apart pair here.
+    # The "C_i - N_j" orientation is the *unrelated*, far-apart pair here.
     gt, mask = _zeros_atom37(1, 2)
     pred = gt.clone()
     seq_tokens = _uniform_aa(1, 2)
@@ -390,6 +445,43 @@ def test_mainchain_min_distance_picks_the_real_bond():
     out = cyclic_geometry_metrics(pred, gt, mask, seq_tokens, meta, prefix="cyc")
     assert math.isclose(out["cyc/mainchain_cn_dist_pred_A"], 1.3, abs_tol=1e-3)
     assert out["cyc/mainchain_cn_bond_success"] == 1.0
+
+
+def test_mainchain_does_not_false_positive_on_coincidentally_close_wrong_pair():
+    """Regression: a min() over both N/C orientations let a meaningless C(i)-N(j)
+    coincidence report a closed ring even though the real N(i)-C(j) bond is wide open.
+    """
+    gt, mask = _zeros_atom37(1, 2)
+    pred = gt.clone()
+    seq_tokens = _uniform_aa(1, 2)
+
+    mask[0, 0, N_IDX] = True
+    mask[0, 0, C_IDX] = True
+    mask[0, 1, N_IDX] = True
+    mask[0, 1, C_IDX] = True
+
+    # Real bond N(i)-C(j): wide open, 5 A -- the ring did NOT close.
+    pred[0, 0, N_IDX] = torch.tensor([0.0, 0.0, 0.0])
+    pred[0, 1, C_IDX] = torch.tensor([0.0, 0.0, 0.5])
+    gt[0, 0, N_IDX] = pred[0, 0, N_IDX].clone()
+    gt[0, 1, C_IDX] = pred[0, 1, C_IDX].clone()
+
+    # Meaningless C(i)-N(j) pair: coincidentally very close, ~1.3 A. A min-based
+    # metric would report this as the closed bond; it must not.
+    pred[0, 0, C_IDX] = torch.tensor([10.0, 0.0, 0.0])
+    pred[0, 1, N_IDX] = torch.tensor([10.0, 0.0, 0.13])
+    gt[0, 0, C_IDX] = pred[0, 0, C_IDX].clone()
+    gt[0, 1, N_IDX] = pred[0, 1, N_IDX].clone()
+
+    meta = {
+        "i": torch.tensor([0]),
+        "j": torch.tensor([1]),
+        "type": torch.tensor([MAINCHAIN]),
+        "has_cyclization": torch.tensor([True]),
+    }
+    out = cyclic_geometry_metrics(pred, gt, mask, seq_tokens, meta, prefix="cyc")
+    assert math.isclose(out["cyc/mainchain_cn_dist_pred_A"], 5.0, abs_tol=1e-3)
+    assert out["cyc/mainchain_cn_bond_success"] == 0.0
 
 
 def test_mainchain_nan_for_non_mainchain_type():
@@ -425,9 +517,12 @@ ALL_TESTS = [
     test_disulfide_nan_when_endpoints_not_cysteine,
     test_isopeptide_lys_asp_uses_cg_and_succeeds,
     test_isopeptide_lys_glu_uses_cd,
+    test_isopeptide_lys_asn_uses_cg_and_succeeds,
+    test_isopeptide_lys_gln_uses_cd,
     test_isopeptide_reversed_order_lys_at_j,
     test_isopeptide_unsupported_chemistry_is_nan,
-    test_mainchain_min_distance_picks_the_real_bond,
+    test_mainchain_uses_only_the_real_n_i_c_j_bond,
+    test_mainchain_does_not_false_positive_on_coincidentally_close_wrong_pair,
     test_mainchain_nan_for_non_mainchain_type,
 ]
 

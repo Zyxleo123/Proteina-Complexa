@@ -357,6 +357,35 @@ def test_cache_validity_rejects_mismatched_settings(tmp_path):
     assert not is_cache_valid(tmp_path / "does_not_exist.npz")
 
 
+def test_cache_validity_rejects_mismatched_backend_and_resolution(tmp_path):
+    """Regression: `backend`/`sas_points_per_atom` are stored in every cache's
+    metadata (see `extract_peptide_surface`) but were never checked by
+    `is_cache_valid`, so a cache extracted with one backend (or SAS resolution)
+    was silently accepted for a request specifying a different one whenever
+    cutoff/num_points/seed/version happened to match."""
+    surface = _make_surface(num_points=96, seed=0)
+    surface.metadata["backend"] = "pymol"
+    path = save_surface_cache(tmp_path / "pymol.surface.npz", surface)
+
+    assert is_cache_valid(path, DEFAULT_CUTOFF, 96, 0, EXTRACTOR_VERSION, backend="pymol")
+    assert not is_cache_valid(path, DEFAULT_CUTOFF, 96, 0, EXTRACTOR_VERSION, backend="sas")
+    # No backend requested at all: unaffected, matches prior behavior.
+    assert is_cache_valid(path, DEFAULT_CUTOFF, 96, 0, EXTRACTOR_VERSION)
+
+    sas_surface = _make_surface(num_points=96, seed=0)
+    sas_surface.metadata["backend"] = "sas"
+    sas_surface.metadata["sas_points_per_atom"] = 20
+    sas_path = save_surface_cache(tmp_path / "sas.surface.npz", sas_surface)
+
+    assert is_cache_valid(sas_path, DEFAULT_CUTOFF, 96, 0, EXTRACTOR_VERSION, backend="sas", sas_points_per_atom=20)
+    assert not is_cache_valid(
+        sas_path, DEFAULT_CUTOFF, 96, 0, EXTRACTOR_VERSION, backend="sas", sas_points_per_atom=40
+    )
+    # A pymol cache has no sas_points_per_atom key at all; requesting one without
+    # also pinning backend="sas" must not be treated as a mismatch for it.
+    assert is_cache_valid(path, DEFAULT_CUTOFF, 96, 0, EXTRACTOR_VERSION, sas_points_per_atom=20)
+
+
 def test_truncated_cache_is_not_valid(tmp_path):
     path = save_surface_cache(tmp_path / "x.surface.npz", _make_surface())
     path.write_bytes(path.read_bytes()[: len(path.read_bytes()) // 3])

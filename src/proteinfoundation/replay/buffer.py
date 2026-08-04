@@ -23,6 +23,7 @@ import json
 import os
 import random
 import statistics
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -218,29 +219,42 @@ class ReplayBuffer:
     # Save / load (sharded, lossless round trip)
     # ------------------------------------------------------------------
     def save(self, dir: str | Path) -> None:
-        """Writes a new snapshot without ever leaving `dir` in a half-written state.
+        """Writes a new snapshot with `manifest.json` as the sole atomic commit point.
 
-        New shards and the manifest are written under a fresh `.tmp-<pid>` prefix
-        first; only once every shard and the manifest have landed does this delete
-        the previous snapshot's files. A crash or `Ctrl-C` mid-save therefore either
-        leaves the old snapshot fully intact or the new one fully written, never a
-        directory with some old shards deleted and the new ones missing (which
-        `load()` would silently read as a truncated buffer).
+        Each call writes its shards under a filename unique to this save --
+        `shard_<generation>_<index>.pt`, never reusing a previous save's shard
+        filenames -- so every shard byte the new manifest could possibly reference
+        is fully written to disk *before* that manifest exists at all. Publishing
+        is then a single `os.replace` of `manifest.json` (atomic on a POSIX
+        same-filesystem rename): a reader (or a crash) can only ever see the
+        complete old manifest pointing at the complete old shards, or the complete
+        new manifest pointing at the complete new shards -- never a manifest whose
+        shard list is partly old and partly new content under reused filenames,
+        which a naive per-file-rename promotion (this function's previous
+        implementation) could produce if interrupted between renaming a shard and
+        renaming the manifest.
+
+        Stale shards from the previous generation are deleted only after the
+        manifest swap, as best-effort cleanup: `load()` never looks at a file the
+        current manifest doesn't name, so a leftover orphan from an interrupted
+        cleanup is inert, not a correctness issue.
         """
         dir = Path(dir)
         dir.mkdir(parents=True, exist_ok=True)
-        old_shards = sorted(dir.glob("shard_*.pt"))
-        tmp_prefix = f".tmp-{os.getpid()}-"
 
+        previous_manifest_path = dir / "manifest.json"
+        previous_shard_files: set[str] = set()
+        if previous_manifest_path.exists():
+            with open(previous_manifest_path) as f:
+                previous_shard_files = set(json.load(f).get("shard_files", []))
+
+        generation = uuid.uuid4().hex[:12]
         entries = list(self._entries)
         shard_files = []
-        tmp_paths = []
         for start in range(0, len(entries), self.shard_size):
             shard = entries[start : start + self.shard_size]
-            shard_name = f"shard_{start // self.shard_size:06d}.pt"
-            tmp_path = dir / f"{tmp_prefix}{shard_name}"
-            torch.save(shard, tmp_path)
-            tmp_paths.append((tmp_path, dir / shard_name))
+            shard_name = f"shard_{generation}_{start // self.shard_size:06d}.pt"
+            torch.save(shard, dir / shard_name)
             shard_files.append(shard_name)
 
         manifest = {
@@ -251,20 +265,16 @@ class ReplayBuffer:
             "n_entries": len(entries),
             "shard_files": shard_files,
         }
-        tmp_manifest = dir / f"{tmp_prefix}manifest.json"
+        tmp_manifest = dir / f".tmp-{os.getpid()}-{generation}-manifest.json"
         with open(tmp_manifest, "w") as f:
             json.dump(manifest, f, indent=2)
+        os.replace(tmp_manifest, previous_manifest_path)
 
-        # Everything new is safely on disk under the tmp prefix -- now atomically
-        # (per-file rename) promote it, then clear out whatever the old snapshot left.
-        for tmp_path, final_path in tmp_paths:
-            os.replace(tmp_path, final_path)
-        os.replace(tmp_manifest, dir / "manifest.json")
-
-        new_shard_names = set(shard_files)
-        for old_shard in old_shards:
-            if old_shard.name not in new_shard_names:
-                old_shard.unlink()
+        for stale_shard in previous_shard_files - set(shard_files):
+            try:
+                (dir / stale_shard).unlink()
+            except OSError:
+                pass
 
     @classmethod
     def load(cls, dir: str | Path, expected_reward_version: str | None = None) -> "ReplayBuffer":

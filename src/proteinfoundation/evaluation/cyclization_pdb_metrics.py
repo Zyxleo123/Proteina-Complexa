@@ -16,9 +16,9 @@ restated, so the number reported for a design run means the same thing as the
 bug that would be nearly impossible to see in aggregate.
 
 Chemistry, matching `cyclization.constants`:
-  mainchain  -- head-to-tail amide: C of residue i  <-> N of residue j
-  disulfide  -- CYS SG            <-> CYS SG
-  isopeptide -- LYS NZ            <-> ASP CG / GLU CD
+  mainchain  -- head-to-tail amide: N of residue i (first) <-> C of residue j (last)
+  disulfide  -- CYS SG                                     <-> CYS SG
+  isopeptide -- LYS NZ (either i or j)                     <-> ASP/ASN CG or GLU/GLN CD
 """
 
 from __future__ import annotations
@@ -26,6 +26,7 @@ from __future__ import annotations
 import numpy as np
 from loguru import logger
 
+from proteinfoundation.cyclization.constants import ISOPEPTIDE_ACID_CARBON_ATOM
 from proteinfoundation.eval.cyclic_reconstruction_metrics import (
     DISULFIDE_SG_BOND_WINDOW_A,
     ISOPEPTIDE_N_C_BOND_WINDOW_A,
@@ -47,16 +48,57 @@ CYCLIZATION_METRIC_COLS = [
 # because it is invisible to any one-sided proximity test.
 FUSED_BOND_DIST_A = 1.0
 
-_ANCHORS = {
-    "mainchain": (("C",), ("N",), MAINCHAIN_CN_BOND_WINDOW_A),
-    "disulfide": (("SG",), ("SG",), DISULFIDE_SG_BOND_WINDOW_A),
-    "isopeptide": (("NZ",), ("CG", "CD"), ISOPEPTIDE_N_C_BOND_WINDOW_A),
+_WINDOWS = {
+    "mainchain": MAINCHAIN_CN_BOND_WINDOW_A,
+    "disulfide": DISULFIDE_SG_BOND_WINDOW_A,
+    "isopeptide": ISOPEPTIDE_N_C_BOND_WINDOW_A,
 }
 
 _THREE_TO_ONE = {
     "ALA": "A", "ARG": "R", "ASN": "N", "ASP": "D", "CYS": "C", "GLN": "Q", "GLU": "E",
     "GLY": "G", "HIS": "H", "ILE": "I", "LEU": "L", "LYS": "K", "MET": "M", "PHE": "F",
     "PRO": "P", "SER": "S", "THR": "T", "TRP": "W", "TYR": "Y", "VAL": "V",
+}
+
+
+def _mainchain_anchor(atoms_i, atoms_j):
+    """N of the first (i) residue <-> C of the last (j) residue -- the only real
+    head-to-tail closing bond (the free N-terminus amine to the free C-terminus
+    carbonyl). See `eval.cyclic_reconstruction_metrics.per_sample_requested_bond_distance`,
+    which measures the identical pair on the tensor side.
+    """
+    return atoms_i.get("N"), atoms_j.get("C")
+
+
+def _disulfide_anchor(res_i, res_j, atoms_i, atoms_j):
+    """SG <-> SG, only if both residues are actually CYS."""
+    if res_i == "CYS" and res_j == "CYS":
+        return atoms_i.get("SG"), atoms_j.get("SG")
+    return None, None
+
+
+def _isopeptide_anchor(res_i, res_j, atoms_i, atoms_j):
+    """LYS(NZ) <-> ASP/ASN(CG) or GLU/GLN(CD), in EITHER i/j order.
+
+    The bonding carbon is picked by the acid/amide residue's own identity
+    (`ISOPEPTIDE_ACID_CARBON_ATOM`), never by "whichever of CG/CD happens to be
+    present" -- GLU/GLN carry BOTH a CG (an ordinary, non-bonding side-chain
+    carbon) and a CD (the real carbonyl); a first-found search over (CG, CD)
+    silently always resolves to the wrong atom (CG) for those two. Returns
+    (None, None) if neither orientation matches (no LYS, or its partner isn't
+    one of the accepted acid/amide residues).
+    """
+    if res_i == "LYS" and res_j in ISOPEPTIDE_ACID_CARBON_ATOM:
+        return atoms_i.get("NZ"), atoms_j.get(ISOPEPTIDE_ACID_CARBON_ATOM[res_j])
+    if res_j == "LYS" and res_i in ISOPEPTIDE_ACID_CARBON_ATOM:
+        return atoms_i.get(ISOPEPTIDE_ACID_CARBON_ATOM[res_i]), atoms_j.get("NZ")
+    return None, None
+
+
+_ANCHOR_FUNCS = {
+    "mainchain": lambda res_i, res_j, atoms_i, atoms_j: _mainchain_anchor(atoms_i, atoms_j),
+    "disulfide": _disulfide_anchor,
+    "isopeptide": _isopeptide_anchor,
 }
 
 
@@ -80,13 +122,6 @@ def _read_binder_residues(pdb_path: str, binder_chain: str) -> list[tuple[str, d
     return [residues[i] for i in sorted(order)]
 
 
-def _first_atom(atoms: dict[str, np.ndarray], names: tuple[str, ...]) -> np.ndarray | None:
-    for name in names:
-        if name in atoms:
-            return atoms[name]
-    return None
-
-
 def _infer_chemistry(
     res_i: str,
     res_j: str,
@@ -99,22 +134,29 @@ def _infer_chemistry(
     actually built. This is an OBSERVATION, not a check that it obeyed a request --
     `binder_cyc_type_satisfied` is what compares it against what was asked for.
 
-    Side-chain chemistries are named by their residues, but mainchain is not: a head-to-tail
-    amide can join ANY two residues, so it has no residue signature and can only be
-    recognised by finding the backbone N and C already bonded. Inferring it last (and only
-    from a closed bond) keeps it from swallowing the other two -- a Lys/Asp pair whose side
-    chains happen to sit near each other is an isopeptide, not a mainchain.
+    Determined from each eligible chemistry's REAL anchor-atom distance, not from
+    residue identity alone: two termini that happen to be Cys/Cys, or Lys/Asp, do not
+    by themselves mean their side chains are bonded -- the actual ring closure might
+    be an ordinary backbone amide with those side chains simply sitting near each
+    other, unbonded. Preferring disulfide/isopeptide over mainchain purely on residue
+    identity (the previous behavior) let exactly that coincidence override a real,
+    closed mainchain bond. Reports whichever eligible chemistry's anchor atoms are
+    actually within their own bonding window; if more than one are (a pathological,
+    not physically expected, structure), the tightest one wins.
     """
-    if res_i == "CYS" and res_j == "CYS":
-        return "disulfide"
-    if res_i == "LYS" and res_j in ("ASP", "GLU"):
-        return "isopeptide"
-    n_i, c_j = atoms_i.get("N"), atoms_j.get("C")
-    if n_i is not None and c_j is not None:
-        lo, hi = MAINCHAIN_CN_BOND_WINDOW_A
-        if lo <= float(np.linalg.norm(n_i - c_j)) <= hi:
-            return "mainchain"
-    return None
+    candidates: list[tuple[str, float]] = []
+    for chem, anchor_fn in _ANCHOR_FUNCS.items():
+        atom_i, atom_j = anchor_fn(res_i, res_j, atoms_i, atoms_j)
+        if atom_i is None or atom_j is None:
+            continue
+        dist = float(np.linalg.norm(atom_i - atom_j))
+        lo, hi = _WINDOWS[chem]
+        if lo <= dist <= hi:
+            candidates.append((chem, dist))
+
+    if not candidates:
+        return None
+    return min(candidates, key=lambda cd: cd[1])[0]
 
 
 def compute_cyclization_metrics_single(
@@ -152,24 +194,19 @@ def compute_cyclization_metrics_single(
     # scoring its isopeptide would report that failure as a success. With no request,
     # fall back to whatever chemistry its terminal residues imply.
     observed = _infer_chemistry(name_i, name_j, atoms_i, atoms_j)
-    chem = requested_type if requested_type in _ANCHORS else observed
+    chem = requested_type if requested_type in _WINDOWS else observed
     out["binder_cyc_type_observed"] = observed if observed else np.nan
 
-    if chem not in _ANCHORS:
-        if requested_type in _ANCHORS:
+    if chem not in _WINDOWS:
+        if requested_type in _WINDOWS:
             out["binder_cyc_type_satisfied"] = False
         return out
 
-    names_i, names_j, (lo, hi) = _ANCHORS[chem]
-    if chem == "mainchain":
-        atom_i = _first_atom(atoms_i, ("N",))
-        atom_j = _first_atom(atoms_j, ("C",))
-    else:
-        atom_i = _first_atom(atoms_i, names_i)
-        atom_j = _first_atom(atoms_j, names_j)
+    lo, hi = _WINDOWS[chem]
+    atom_i, atom_j = _ANCHOR_FUNCS[chem](name_i, name_j, atoms_i, atoms_j)
 
     if atom_i is None or atom_j is None:
-        if requested_type in _ANCHORS:
+        if requested_type in _WINDOWS:
             out["binder_cyc_type_satisfied"] = False
         return out
 
@@ -178,7 +215,7 @@ def compute_cyclization_metrics_single(
     out["binder_cyc_bond_closed"] = bool(lo <= dist <= hi)
     out["binder_cyc_bond_fused"] = bool(dist < FUSED_BOND_DIST_A)
 
-    if requested_type in _ANCHORS:
+    if requested_type in _WINDOWS:
         if requested_type == "mainchain":
             # Mainchain constrains no side chain, so no residue signature can witness it --
             # every peptide has an N-terminus and a C-terminus. A closed N-C bond IS the only

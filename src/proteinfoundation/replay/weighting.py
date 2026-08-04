@@ -55,6 +55,7 @@ def geocycler_group_relative_weights(
     """
     rewards = rewards.float()
     group_idx, n_groups = _group_index(group_ids)
+    group_idx = group_idx.to(rewards.device)  # `_group_index` builds it on CPU (pure Python bookkeeping)
     weights = torch.zeros_like(rewards)
 
     for g in range(n_groups):
@@ -78,7 +79,7 @@ def success_only_weights(
     """weight = 1 (success) / `near_weight` (near_success, not success) / 0 (failure)."""
     success = success.bool()
     near_success = near_success.bool() & ~success
-    weights = torch.zeros(success.shape, dtype=torch.float32)
+    weights = torch.zeros(success.shape, dtype=torch.float32, device=success.device)
     weights = torch.where(success, torch.ones_like(weights), weights)
     weights = torch.where(near_success, torch.full_like(weights, float(near_weight)), weights)
     return weights

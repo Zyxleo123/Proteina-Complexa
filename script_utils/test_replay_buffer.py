@@ -16,6 +16,7 @@ import random
 import shutil
 import tempfile
 from pathlib import Path
+from unittest.mock import patch
 
 import torch
 
@@ -115,6 +116,46 @@ def test_save_load_recovers_from_interrupted_run():
         recovered = ReplayBuffer.load(tmpdir)
         recovered.append([_make_entry(i) for i in range(5, 9)])
         assert len(recovered) == 9
+    finally:
+        shutil.rmtree(tmpdir)
+
+
+def test_save_interrupted_before_manifest_swap_leaves_old_snapshot_intact():
+    """Regression: manifest.json is the sole atomic commit point. A crash before
+    its `os.replace` must leave the previous snapshot exactly as it was --
+    including its shard files, which a naive per-file-rename promotion could
+    otherwise leave partially overwritten under reused filenames."""
+    tmpdir = tempfile.mkdtemp()
+    try:
+        buf = ReplayBuffer(max_size=100, shard_size=4)
+        buf.append([_make_entry(i) for i in range(5)])
+        buf.save(tmpdir)
+        old_shard_names = sorted(p.name for p in Path(tmpdir).glob("shard_*.pt"))
+        assert old_shard_names, "expected at least one shard file after the first save"
+
+        buf2 = ReplayBuffer(max_size=100, shard_size=4)
+        buf2.append([_make_entry(i) for i in range(20, 28)])  # different count/content
+
+        with patch(
+            "proteinfoundation.replay.buffer.os.replace",
+            side_effect=OSError("simulated crash before manifest swap"),
+        ):
+            try:
+                buf2.save(tmpdir)
+                assert False, "expected the simulated crash to propagate"
+            except OSError:
+                pass
+
+        # Old shard files must be untouched (never overwritten in place -- the new
+        # generation used fresh filenames) and the old manifest must still resolve
+        # to exactly the old snapshot.
+        for name in old_shard_names:
+            assert (Path(tmpdir) / name).exists()
+        recovered = ReplayBuffer.load(tmpdir)
+        assert len(recovered) == 5
+        assert [e["target_or_dataset_id"] for e in recovered._entries] == [
+            f"cpsea_target_{i}" for i in range(5)
+        ]
     finally:
         shutil.rmtree(tmpdir)
 
@@ -228,6 +269,7 @@ ALL_TESTS = [
     test_fifo_eviction_incremental_appends,
     test_save_load_round_trip_lossless,
     test_save_load_recovers_from_interrupted_run,
+    test_save_interrupted_before_manifest_swap_leaves_old_snapshot_intact,
     test_load_reward_version_mismatch_raises,
     test_append_reward_version_mismatch_raises,
     test_append_missing_field_raises,

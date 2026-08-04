@@ -28,6 +28,8 @@ from collections import defaultdict
 import torch
 from omegaconf import OmegaConf
 
+import proteinfoundation.patches.atomworks_patches  # noqa: F401
+
 from proteinfoundation.cyclization.constants import (
     AA_ASN,
     AA_ASP,
@@ -93,17 +95,19 @@ def main() -> None:
         )
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    model = Proteina.load_from_checkpoint(args.ckpt, map_location=device).eval().to(device)
-
-    # Minimal inference config: single-pass generation, no search/reward.
-    model.configure_inference(
-        OmegaConf.create({"args": {"self_cond": True, "nsteps": args.nsteps, "guidance_w": 1.0, "ag_ratio": 0.0},
-                          "model": {"bb_ca": {}, "local_latents": {}}, "n_recycle": 0}),
-        nn_ag=None,
-    )
 
     with initialize_config_dir(config_dir=os.path.abspath("configs"), version_base=None):
         data_cfg = compose(config_name="example/training_cpsea_peptide_cyc_typecond", overrides=["+single=true"])
+
+    # Design-pipeline sampler (same as val_generation / collect_cpsea_replay_rollouts):
+    # empty bb_ca/local_latents crash; generation.model.ode centers binders wrongly.
+    design = data_cfg.val_generation.design_sampling
+    inf_cfg = OmegaConf.create(OmegaConf.to_container(design, resolve=True))
+    inf_cfg.args.nsteps = args.nsteps
+
+    model = Proteina.load_from_checkpoint(args.ckpt, map_location=device).eval().to(device)
+    model.configure_inference(inf_cfg, nn_ag=None)
+
     dm = instantiate(data_cfg.dataset.unified.datamodule)
     dm.setup("fit")
     batches = [b for _, b in zip(range(args.n_batches), dm.val_dataloader())]

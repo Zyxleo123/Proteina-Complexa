@@ -138,16 +138,23 @@ def test_per_sample_disulfide_invalid_when_endpoints_not_cysteine():
     assert not bool(out["atoms_valid"][0])
 
 
-def test_per_sample_mainchain_takes_min_orientation_and_its_window():
+def test_per_sample_mainchain_uses_only_the_real_n_i_c_j_orientation():
+    """N(first, i) <-> C(last, j) is the only real closing bond: it's the free
+    N-terminus amine bonding to the free C-terminus carbonyl. C(i)<->N(j) is a
+    different, chemically meaningless pair (both atoms are already engaged in
+    their own in-chain peptide bonds), and must play no part in the distance --
+    not even via a min() over both orientations, which would let a
+    coincidentally-close meaningless pair masquerade as ring closure.
+    """
     coords, mask = _zeros_atom37(1, 4)
     for res in (0, 3):
         for atom in (N_IDX, C_IDX):
             mask[0, res, atom] = True
-    # C_0 <-> N_3 is the real bond at 1.33 A; N_0 <-> C_3 is far.
-    coords[0, 0, C_IDX] = torch.tensor([0.0, 0.0, 0.0])
-    coords[0, 3, N_IDX] = torch.tensor([1.33 * ANG_TO_NM, 0.0, 0.0])
-    coords[0, 0, N_IDX] = torch.tensor([0.0, 5.0, 0.0])
-    coords[0, 3, C_IDX] = torch.tensor([0.0, -5.0, 0.0])
+    # Real bond N_0 <-> C_3: 1.33 A. Meaningless pair C_0 <-> N_3: far apart.
+    coords[0, 0, N_IDX] = torch.tensor([0.0, 0.0, 0.0])
+    coords[0, 3, C_IDX] = torch.tensor([1.33 * ANG_TO_NM, 0.0, 0.0])
+    coords[0, 0, C_IDX] = torch.tensor([0.0, 5.0, 0.0])
+    coords[0, 3, N_IDX] = torch.tensor([0.0, -5.0, 0.0])
     aa = torch.full((1, 4), AA_OTHER, dtype=torch.long)
     meta = _meta(0, 3, MAINCHAIN)
 
@@ -645,7 +652,7 @@ ALL_TESTS = [
     test_flat_bottom_gradient_is_zero_inside_and_signed_outside,
     test_per_sample_disulfide_distance_and_window,
     test_per_sample_disulfide_invalid_when_endpoints_not_cysteine,
-    test_per_sample_mainchain_takes_min_orientation_and_its_window,
+    test_per_sample_mainchain_uses_only_the_real_n_i_c_j_orientation,
     test_per_sample_isopeptide_lys_asp_uses_cg,
     test_per_sample_unknown_type_is_invalid,
     test_per_sample_distance_matches_the_closure_metric,

@@ -1,0 +1,43 @@
+# @package _global_
+# Reward-weighted terminal-sample replay on top of the CPSea type-conditioned config.
+#
+# Purely additive: everything in `training_cpsea_peptide_cyc_typecond.yaml` (the real
+# CPSea batch loss, the cyclization head, model architecture) is unchanged. This only
+# adds `lambda_replay * replay_loss` to the total loss, where `replay_loss` is drawn
+# from an on-disk `ReplayBuffer` populated by `scripts/collect_cpsea_replay_rollouts.py`
+# (offline collection) BEFORE this training run starts -- `replay_buffer.buffer_dir`
+# must already contain a saved buffer (i.e. `manifest.json` + shards written by
+# `ReplayBuffer.save`), or replay silently contributes nothing (see
+# `ReplayMixer.sample_replay_loss`'s `None` return on an empty buffer).
+#
+# Run (after a replay buffer has been collected to $REPLAY_BUFFER_DIR):
+#   CONFIG=example/training_cpsea_peptide_replay \
+#     RUN_NAME=cpsea_replay_success_only \
+#     EXTRA_OVERRIDES="++replay_buffer.buffer_dir=$REPLAY_BUFFER_DIR" \
+#     bash ~/slurm/cpsea/cpsea_peptide_train_finetune.sh full
+#
+# Weighting mode ablations (Stage 8 arms C/D/E in the implementation plan):
+#   ++replay_buffer.weighting_mode=raw_bounded          (arm C)
+#   ++replay_buffer.weighting_mode=success_only         (arm D, default here)
+#   ++replay_buffer.weighting_mode=geocycler_group_relative  (arm E)
+#
+# Conservative real:replay ratio to start (n_real_per_update is dataset.datamodule.batch_size
+# below, unchanged at 2; n_replayed_per_update starts at 1:1, not GeoCycler's 5:1 -- raise it
+# explicitly via ++replay_buffer.n_replayed_per_update=10 for the ratio-5 arm F).
+
+defaults:
+  - training_cpsea_peptide_cyc_typecond
+  - _self_
+
+run_name: cpsea_replay_success_only
+
+replay_buffer:
+  enabled: true
+  buffer_dir: ??? # must be set: e.g. $ZFS/CPSea/replay_buffers/<run>/
+  reward_version: v1
+  weighting_mode: success_only # success_only | raw_bounded | geocycler_group_relative
+  lambda_replay: 1.0
+  n_replayed_per_update: 2 # 1:1 with dataset.datamodule.batch_size (2) above
+  reward_std_threshold: 0.05 # geocycler_group_relative only
+  near_weight: 0.3 # success_only only
+  max_size: 10000
