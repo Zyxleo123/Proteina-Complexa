@@ -31,7 +31,7 @@ SAMPLE_SURFACES = REPO / "surfaces" / "cpsea_sample100"
 # ---------------------------------------------------------------------------
 
 
-def _tiny_nn_kwargs(enable_surface: bool = True):
+def _tiny_nn_kwargs(enable_surface: bool = True, **surface_overrides):
     # Keep tiny: full FeatureFactory+14-layer trunks OOMs on shared login nodes.
     return dict(
         name="local_latents_transformer",
@@ -75,6 +75,7 @@ def _tiny_nn_kwargs(enable_surface: bool = True):
             "gate_layers": [1, 2, 3],
             "rbf_n": 4,
             "pair_dim": 16,
+            **surface_overrides,
         },
     )
 
@@ -336,6 +337,58 @@ def test_surface_modules_receive_nonzero_gradients():
     assert nn.binder_surface_pair_feats.proj[0].weight.grad.abs().sum() > 0
     gate_grads = [float(layer.gate.grad.abs()) for layer in nn.surface_cross_layers.values()]
     assert all(g > 0 for g in gate_grads)
+
+
+def test_fixed_gate_is_not_a_parameter_and_keeps_encoder_gradients_alive():
+    """`gate_learnable: false` breaks the zero-init deadlock the S1/S2 runs hit.
+
+    With a learnable gate at 0 the encoder's gradient is `dL/dDelta = g = 0`, so the
+    surface branch can never become useful and the gate never opens (measured: |g| ~ 1e-4
+    after 25k steps). Pinning `g` keeps that gradient nonzero from step 0.
+    """
+    from proteinfoundation.nn.local_latents_transformer import LocalLatentsTransformer
+
+    batch = _fake_batch(enable_surface=True)
+
+    learnable = LocalLatentsTransformer(
+        **_tiny_nn_kwargs(enable_surface=True, gate_init=0.0, gate_learnable=True)
+    )
+    out = learnable(batch)
+    (out["bb_ca"]["v"].pow(2).mean() + out["local_latents"]["v"].pow(2).mean()).backward()
+    assert learnable.surface_encoder.type_emb.grad.abs().sum() == 0.0
+
+    fixed = LocalLatentsTransformer(
+        **_tiny_nn_kwargs(enable_surface=True, gate_init=0.25, gate_learnable=False)
+    )
+    gate_names = {n for n, _ in fixed.named_parameters() if n.endswith(".gate")}
+    assert not gate_names, f"gate should not be an optimizer parameter, got {gate_names}"
+    # Still checkpointed, so a fixed-gate run round-trips through state_dict.
+    assert any(k.endswith(".gate") for k in fixed.state_dict())
+    for layer in fixed.surface_cross_layers.values():
+        assert float(layer.gate) == pytest.approx(0.25)
+
+    out = fixed(batch)
+    (out["bb_ca"]["v"].pow(2).mean() + out["local_latents"]["v"].pow(2).mean()).backward()
+    assert fixed.surface_encoder.type_emb.grad.abs().sum() > 0
+    assert fixed.binder_surface_pair_feats.proj[0].weight.grad.abs().sum() > 0
+
+
+def test_fixed_gate_survives_an_optimizer_step():
+    """The whole point is that `g` cannot drift back to 0 the way S1/S2's did."""
+    from proteinfoundation.nn.local_latents_transformer import LocalLatentsTransformer
+
+    batch = _fake_batch(enable_surface=True)
+    nn = LocalLatentsTransformer(
+        **_tiny_nn_kwargs(enable_surface=True, gate_init=0.25, gate_learnable=False)
+    )
+    opt = torch.optim.Adam([p for p in nn.parameters() if p.requires_grad], lr=1e-2)
+    for _ in range(3):
+        opt.zero_grad()
+        out = nn(batch)
+        (out["bb_ca"]["v"].pow(2).mean() + out["local_latents"]["v"].pow(2).mean()).backward()
+        opt.step()
+    for layer in nn.surface_cross_layers.values():
+        assert float(layer.gate) == pytest.approx(0.25)
 
 
 def test_open_gates_change_predictions():

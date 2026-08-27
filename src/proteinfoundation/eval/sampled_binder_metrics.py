@@ -18,7 +18,9 @@ geometry. Meant to run inside the training validation loop, so it must cost seco
 Metric groups
 -------------
 geom      Is it even a peptide? Consecutive Ca-Ca should be ~0.38 nm.
-iface     Is it docking, or floating off into solvent? Contacts against target / hotspots.
+iface     Is it docking, or floating off into solvent? Contacts / clashes / burial against the
+          target, each also reported as a ratio to the NATIVE binder on the same target
+          (iface_native/*), because a raw contact count has no "good" value on its own.
 seq       Sequence mode collapse (a model emitting poly-Gly scores fine on coordinate MSE).
 div       Structural mode collapse: spread across repeats of the SAME complex. Needs n_repeat>1.
 place     Unaligned Ca RMSD to the native binder. The frame is target-centered, so this is a
@@ -88,11 +90,80 @@ CA_CA_TOL_NM = 0.05
 
 CONTACT_NM = 0.8       # binder-target Ca-Ca contact threshold (8 A)
 HOTSPOT_NM = 1.0       # a hotspot counts as engaged if any binder Ca is within 10 A
+CLASH_NM = 0.40        # binder-target Ca-Ca below this is interpenetration. Nearest inter-chain
+                       # Ca-Ca in a real interface is ~0.45-0.5 nm, so <0.40 nm is a hard clash.
+                       # Read as an EXCESS over the native reference, not an absolute count.
 
 
 def _masked_mean(x: torch.Tensor, m: torch.Tensor) -> float:
     m = m.bool()
     return float(x[m].mean().item()) if m.any() else float("nan")
+
+
+def _safe_ratio(a: float, b: float) -> float:
+    """a / b, but NaN whenever the ratio is meaningless (native reference absent or zero).
+
+    A ratio only answers "is 24 contacts good?" when the denominator is the native binder's
+    own count on the SAME target. If the native has zero contacts (or is unavailable) there is
+    no bar to divide by, so we report NaN rather than a spurious 0 or inf.
+    """
+    if not (math.isfinite(a) and math.isfinite(b)) or b == 0.0:
+        return float("nan")
+    return a / b
+
+
+def _iface_group(
+    ca: torch.Tensor,
+    m: torch.Tensor,
+    tca: torch.Tensor,
+    tm: torch.Tensor,
+    hs: torch.Tensor | None,
+) -> dict[str, float]:
+    """Interface geometry of one binder Ca set against the target Ca. Prefix-free scalars.
+
+    Applied identically to the SAMPLED binder and to the NATIVE binder so the two are directly
+    comparable (same target, same threshold, same masking). ``ca``/``m`` are [B, L, 3]/[B, L];
+    ``tca``/``tm`` are [B, T, 3]/[B, T]; ``hs`` is an optional [B, T] hotspot mask (already
+    AND-ed with ``tm`` by the caller).
+    """
+    b = ca.shape[0]
+    d = torch.linalg.norm(ca[:, :, None, :] - tca[:, None, :, :], dim=-1)  # [B, L, T]
+    pair = m[:, :, None] & tm[:, None, :]
+    big = torch.finfo(d.dtype).max
+    dm = d.masked_fill(~pair, big)
+
+    per_min = dm.reshape(b, -1).min(dim=-1).values                        # [B]
+    ok = per_min < big
+    min_dist = float(per_min[ok].mean().item()) if ok.any() else float("nan")
+
+    n_contacts = float(((dm < CONTACT_NM) & pair).reshape(b, -1).sum(-1).float().mean().item())
+    n_clash = float(((dm < CLASH_NM) & pair).reshape(b, -1).sum(-1).float().mean().item())
+
+    # burial: fraction of the binder's own residues that touch the receptor (>=1 target Ca in the
+    # contact shell). Disambiguates "seated in the pocket" from "docked on the rim": n_contacts can
+    # be inflated by one deeply buried loop, but burial only rises when the whole binder engages.
+    binder_touch = ((dm < CONTACT_NM) & pair).any(dim=2)                   # [B, L]
+    denom = m.float().sum(-1)
+    burial_per = torch.where(
+        denom > 0, binder_touch.float().sum(-1) / denom.clamp(min=1), torch.full_like(denom, float("nan"))
+    )
+    burial = float(torch.nanmean(burial_per).item())
+
+    hotspot_frac = float("nan")
+    if hs is not None:
+        near = ((dm < HOTSPOT_NM) & pair).any(dim=1)                       # [B, T] hotspot engaged
+        hit = (near & hs).sum(-1).float()
+        tot = hs.sum(-1).float()
+        frac = torch.where(tot > 0, hit / tot.clamp(min=1), torch.full_like(tot, float("nan")))
+        hotspot_frac = float(torch.nanmean(frac).item())
+
+    return {
+        "min_dist_nm": min_dist,
+        "n_contacts": n_contacts,
+        "n_clash": n_clash,
+        "burial": burial,
+        "hotspot_frac": hotspot_frac,
+    }
 
 
 def _target_ca(x_target: torch.Tensor) -> torch.Tensor:
@@ -158,32 +229,44 @@ def sampled_binder_metrics(
     viol = (step - CA_CA_NM).abs() > CA_CA_TOL_NM
     out[f"{prefix}/geom/ca_ca_viol_frac"] = _masked_mean(viol.float(), step_valid)
 
-    # --- iface: is it actually on the receptor? ----------------------------------------------
+    # --- iface: is it actually on the receptor, and native-like? ------------------------------
+    # Raw counts (n_contacts, burial) are uninterpretable in absolute terms -- they scale with
+    # binder length and target-Ca density -- so the native binder on the SAME target is scored with
+    # the identical function and every count is also reported as a ratio to it: ~1.0 == native-like,
+    # <1 == under-engaged / floating, >1 (with clash_excess>0) == interpenetrating to game contacts.
+    IFACE_RAW_KEYS = ("min_dist_nm", "n_contacts", "n_clash", "burial", "hotspot_frac")
+    IFACE_DERIVED_KEYS = ("contact_ratio", "burial_ratio", "clash_excess")
     if x_target is not None and target_mask is not None:
         tca = _target_ca(x_target)                                     # [B, T, 3]
         tm = _as_residue_mask(target_mask.bool())                      # [B, T]
-        d = torch.linalg.norm(ca[:, :, None, :] - tca[:, None, :, :], dim=-1)  # [B, L, T]
-        pair = m[:, :, None] & tm[:, None, :]
-        big = torch.finfo(d.dtype).max
-        dm = d.masked_fill(~pair, big)
-
-        per_min = dm.reshape(b, -1).min(dim=-1).values                 # [B]
-        ok = per_min < big
-        out[f"{prefix}/iface/min_dist_nm"] = float(per_min[ok].mean().item()) if ok.any() else float("nan")
-        out[f"{prefix}/iface/n_contacts"] = float(
-            ((dm < CONTACT_NM) & pair).reshape(b, -1).sum(-1).float().mean().item()
-        )
+        hs = None
         if target_hotspot_mask is not None:
             hs = _as_residue_mask(target_hotspot_mask.bool()) & tm     # [B, T]
-            near = ((dm < HOTSPOT_NM) & pair).any(dim=1)               # [B, T] hotspot engaged
-            hit = (near & hs).sum(-1).float()
-            tot = hs.sum(-1).float()
-            frac = torch.where(tot > 0, hit / tot.clamp(min=1), torch.full_like(tot, float("nan")))
-            out[f"{prefix}/iface/hotspot_frac"] = float(torch.nanmean(frac).item())
+
+        samp = _iface_group(ca, m, tca, tm, hs)
+        for k in IFACE_RAW_KEYS:
+            out[f"{prefix}/iface/{k}"] = samp[k]
+
+        if gt_coors is not None:
+            # Native binder shares the sampled binder's layout/mask (same [B, L, 37]).
+            nat = _iface_group(gt_coors[..., CA_IDX, :], m, tca, tm, hs)
+            for k in IFACE_RAW_KEYS:
+                out[f"{prefix}/iface_native/{k}"] = nat[k]
+            out[f"{prefix}/iface/contact_ratio"] = _safe_ratio(samp["n_contacts"], nat["n_contacts"])
+            out[f"{prefix}/iface/burial_ratio"] = _safe_ratio(samp["burial"], nat["burial"])
+            # EXCESS not ratio: native clash ~0, so a ratio would divide by zero. Positive means the
+            # sample interpenetrates where the crystal complex does not.
+            out[f"{prefix}/iface/clash_excess"] = samp["n_clash"] - nat["n_clash"]
         else:
-            out[f"{prefix}/iface/hotspot_frac"] = float("nan")
+            for k in IFACE_RAW_KEYS:
+                out[f"{prefix}/iface_native/{k}"] = float("nan")
+            for k in IFACE_DERIVED_KEYS:
+                out[f"{prefix}/iface/{k}"] = float("nan")
     else:
-        for k in ("min_dist_nm", "n_contacts", "hotspot_frac"):
+        for k in IFACE_RAW_KEYS:
+            out[f"{prefix}/iface/{k}"] = float("nan")
+            out[f"{prefix}/iface_native/{k}"] = float("nan")
+        for k in IFACE_DERIVED_KEYS:
             out[f"{prefix}/iface/{k}"] = float("nan")
 
     # --- seq: mode collapse ------------------------------------------------------------------
@@ -238,7 +321,17 @@ SAMPLED_METRIC_SUFFIXES = [
     "geom/ca_ca_viol_frac",
     "iface/min_dist_nm",
     "iface/n_contacts",
+    "iface/n_clash",
+    "iface/burial",
     "iface/hotspot_frac",
+    "iface/contact_ratio",
+    "iface/burial_ratio",
+    "iface/clash_excess",
+    "iface_native/min_dist_nm",
+    "iface_native/n_contacts",
+    "iface_native/n_clash",
+    "iface_native/burial",
+    "iface_native/hotspot_frac",
     "seq/top1_frac",
     "seq/entropy_bits",
     "seq/n_types",

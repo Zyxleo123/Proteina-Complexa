@@ -21,6 +21,7 @@ from proteinfoundation.surface.peptide_surface import (
     SurfaceExtractionError,
     extract_peptide_surface,
     farthest_point_sample,
+    generate_sas_points,
     interface_mask,
     is_cache_valid,
     load_surface_cache,
@@ -34,6 +35,9 @@ from proteinfoundation.surface.peptide_surface import (
     split_chains,
     transform_surface,
     _chunked_nearest_distance,
+    _sas_accessible_mask,
+    _vdw_radii,
+    _fibonacci_sphere,
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -610,6 +614,54 @@ def test_real_extraction_rejects_a_receptorless_request(real_surface):
     with pytest.raises(SurfaceExtractionError) as exc:
         extract_peptide_surface(pdb, receptor_chains=["A"], peptide_chains=["A"])
     assert exc.value.reason == "chain_overlap"
+
+
+def test_sas_accessible_mask_matches_dense_reference():
+    """Regression: `_sas_accessible_mask`'s sparse-distance path must return EXACTLY the
+    same accessibility as the original dense `(P, A)` check it replaced -- this is a
+    performance fix, not an approximation. Caught the bug behind the first `--role
+    receptor` extraction run's OOM kill: `generate_sas_points` was reused on a
+    receptor-sized atom count while its buried-point check still materialized a dense
+    matrix sized for a small peptide ("Peptides are tiny — dense check" was the exact
+    comment describing the assumption that broke)."""
+    rng = np.random.default_rng(0)
+    n_atoms = 150  # large enough to stress the sparse-vs-dense comparison, small enough
+    # that the dense reference itself stays cheap to compute in a test.
+    coords = rng.normal(scale=8.0, size=(n_atoms, 3))
+    elements = (["C", "N", "O", "S"] * (n_atoms // 4 + 1))[:n_atoms]
+    radii = _vdw_radii(elements, 1.4)
+    points_per_atom = 48
+    unit = _fibonacci_sphere(points_per_atom)
+    pts = (coords[:, None, :] + radii[:, None, None] * unit[None, :, :]).reshape(-1, 3)
+    parent = np.repeat(np.arange(n_atoms), points_per_atom)
+
+    dist = np.linalg.norm(pts[:, None, :] - coords[None, :, :], axis=-1)
+    dist[np.arange(pts.shape[0]), parent] = np.inf
+    accessible_dense = (dist >= (radii[None, :] - 1e-3)).all(axis=1)
+
+    accessible_sparse = _sas_accessible_mask(pts, parent, coords, radii)
+    assert np.array_equal(accessible_dense, accessible_sparse)
+    assert 0 < accessible_dense.sum() < pts.shape[0]  # sanity: neither trivially all/none
+
+
+def test_generate_sas_points_scales_to_receptor_sized_atom_counts():
+    """A receptor-sized structure must not blow up memory the way a dense `(P, A)` check
+    would (P = n_atoms * points_per_atom, so a naive dense matrix here would be
+    ~3200 * 48 * 3200 * 8 bytes ~= 3.9 GB for a SINGLE call -- what OOM-killed a 16-worker
+    extraction job under a 32G SLURM allocation before `_sas_accessible_mask`)."""
+    rng = np.random.default_rng(1)
+    n_atoms = 1000  # smaller than the ~3200-atom receptors that triggered the OOM, kept
+    # modest here purely for test runtime; test_sas_accessible_mask_matches_dense_reference
+    # already proves this path's numerics are identical to the dense one at any size.
+    coords = rng.normal(scale=20.0, size=(n_atoms, 3))
+    elements = (["C", "N", "O", "S"] * (n_atoms // 4 + 1))[:n_atoms]
+
+    t0 = time.time()
+    pts, normals = generate_sas_points(coords, elements, points_per_atom=48, probe=1.4)
+    elapsed = time.time() - t0
+
+    assert pts.shape[0] > 0
+    assert elapsed < 10.0, f"generate_sas_points too slow at receptor scale: {elapsed:.1f}s"
 
 
 @pytest.mark.skipif(_real_complex() is None, reason="needs CPSea_data/preprocessed_sample100")

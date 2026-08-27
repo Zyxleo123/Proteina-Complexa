@@ -4,6 +4,15 @@ Compare a generated peptide (CA trace or extracted surface) against a ground-tru
 interface surface cache. Complements existing binder / cyclization / Rosetta metrics;
 does not replace them.
 
+CAUTION: this measures agreement against whatever ``oracle`` cache the caller loads --
+`load_surface_cache` on a peptide-surface cache (`extract_peptide_surface`) checks whether
+the generated binder's own shape matches the real binder's own shape (a reconstruction-
+quality metric, related to but distinct from RMSD). It is NOT a check of whether the binder
+sits correctly against the receptor pocket; for that, load a cache from
+`extract_receptor_surface` instead and compare the generated binder's Cβ-proxy surface
+against the RECEPTOR's pocket surface. Passing a peptide-surface cache when a receptor
+check was intended silently measures the wrong thing.
+
 Typical use after generation (nm or Å — pass consistent units):
 
     from proteinfoundation.eval.surface_metrics import surface_agreement_metrics

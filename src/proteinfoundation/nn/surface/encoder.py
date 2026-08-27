@@ -221,8 +221,21 @@ class GatedSurfaceCrossAttention(nn.Module):
 
     Default ``gate_init=0`` keeps a pretrained receptor-only warm-start bit-identical, but
     then ``∂L/∂Δ = g = 0`` so the surface encoder never receives gradients until ``g`` moves.
-    Set ``gate_init`` > 0 (e.g. 0.1) to unstick the encoder, or rely on an aux loss that
-    can open ``g`` from zero.
+    MEASURED (runs ``cpsea_surfcond_from_v4cfg`` / ``cpsea_surfloss_from_v4cfg``, 25k steps
+    each): with ``gate_init=0`` and ``gate_learnable=True`` every ``g`` random-walked in
+    ``|g| ~ 1e-5..1e-4`` and never opened, in the arm WITH the contact aux loss as well as
+    the one without. A single scalar has to guess the sign of a noisy inner product against
+    a randomly-initialized ``Δ``, while ``Δ`` itself cannot become informative until ``g``
+    moves -- a deadlock, not a learned decision that the surface is useless.
+
+    ``gate_learnable=False`` breaks it: ``g`` becomes a fixed buffer at ``gate_init`` so the
+    encoder always receives ``∂L/∂Δ = g ≠ 0``. The block can still learn to ignore the
+    surface, via the per-token sigmoid gate ``to_g`` and the ``to_out`` projection inside
+    ``PairBiasedCrossAttention`` -- forcing participation of the *pathway* is not forcing
+    participation of the *signal*. Warm-starting a pretrained checkpoint with ``gate_init=1``
+    injects a full-magnitude random-init residual into three layers at once and will spike
+    the loss; ``gate_init`` in ``0.1..0.3`` gets the same nonvanishing gradient much more
+    gently.
     """
 
     def __init__(
@@ -232,12 +245,20 @@ class GatedSurfaceCrossAttention(nn.Module):
         nheads: int,
         use_qkln: bool = True,
         gate_init: float = 0.0,
+        gate_learnable: bool = True,
     ):
         super().__init__()
         self.cross = PairBiasedCrossAttention(
             dim_token=dim_token, dim_pair=dim_pair, nheads=nheads, use_qkln=use_qkln
         )
-        self.gate = nn.Parameter(torch.full((), float(gate_init)))
+        self.gate_learnable = bool(gate_learnable)
+        gate = torch.full((), float(gate_init))
+        if self.gate_learnable:
+            self.gate = nn.Parameter(gate)
+        else:
+            # Buffer, not Parameter: appears in state_dict (so a fixed-gate checkpoint still
+            # round-trips) but is never stepped by the optimizer.
+            self.register_buffer("gate", gate)
 
     def forward(
         self,

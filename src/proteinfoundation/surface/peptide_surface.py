@@ -123,6 +123,14 @@ import numpy as np
 #         atoms (no PyMOL). ~50× faster; interface set is similar but not bit-identical.
 EXTRACTOR_VERSION = "2.0.0"
 
+# Separate version namespace for `extract_receptor_surface` (below): a receptor-pocket
+# cache and a peptide-interface cache are never interchangeable, so they must never pass
+# `is_cache_valid`'s `version` check against each other even if extraction logic on both
+# sides happens to be bumped in lockstep. Also separately gates the filename via
+# `cache_path_for`'s `suffix` -- both a version mismatch AND a distinct filename prevent
+# one role's cache from ever being silently read (or overwritten) as the other's.
+RECEPTOR_SURFACE_EXTRACTOR_VERSION = "1.0.0"
+
 DEFAULT_CUTOFF = 4.0
 DEFAULT_NUM_POINTS = 96
 DEFAULT_SEED = 0
@@ -396,6 +404,54 @@ def load_heavy_atoms_split(
     )
 
 
+def _sas_accessible_mask(
+    pts: np.ndarray, parent: np.ndarray, coords: np.ndarray, radii: np.ndarray, chunk_size: int = 4096
+) -> np.ndarray:
+    """True where `pts[i]` is not inside any OTHER atom's (vdW+probe) sphere.
+
+    A point is buried if some atom j != parent[i] has ``dist(pts[i], coords[j]) < radii[j]
+    - 1e-3``. Same threshold/exclusion semantics as a dense ``(P, A)`` distance-matrix
+    check, computed without ever materializing one: a full receptor pocket can have
+    thousands of atoms and `points_per_atom * n_atoms` points, so the dense matrix is
+    O(P*A) memory (tens of GB, and what OOM-killed the first `--role receptor` extraction
+    run under a 32G SLURM allocation) even though this function's only prior caller,
+    `extract_peptide_surface`, has that headroom because a CPSea peptide is small.
+
+    `scipy.spatial.cKDTree.sparse_distance_matrix` only materializes entries within
+    `max_r` (the largest radius any atom could possibly bury a point with), which is
+    exactly the same "which pairs matter" cutoff the dense check applies implicitly via
+    the `>= radii - eps` comparison -- pairs farther than `max_r` are never buried
+    regardless, dense or sparse. Falls back to a POINT-chunked (not atom-chunked) dense
+    check when SciPy is unavailable, bounding memory to `chunk_size * n_atoms` regardless
+    of how large `pts` is.
+    """
+    n_atoms = coords.shape[0]
+    max_r = float(radii.max())
+
+    try:
+        from scipy.spatial import cKDTree
+
+        pts_tree = cKDTree(pts)
+        atoms_tree = cKDTree(coords)
+        sparse = pts_tree.sparse_distance_matrix(atoms_tree, max_r, output_type="coo_matrix")
+        row, col, dist = sparse.row, sparse.col, sparse.data
+        not_parent = col != parent[row]
+        buried_pair = not_parent & (dist < (radii[col] - 1e-3))
+        buried = np.zeros(pts.shape[0], dtype=bool)
+        buried[row[buried_pair]] = True
+        return ~buried
+    except ImportError:  # pragma: no cover - environment-dependent
+        accessible = np.empty(pts.shape[0], dtype=bool)
+        for start in range(0, pts.shape[0], chunk_size):
+            end = start + chunk_size
+            chunk_pts = pts[start:end]
+            chunk_parent = parent[start:end]
+            dist = np.linalg.norm(chunk_pts[:, None, :] - coords[None, :, :], axis=-1)  # (chunk, A)
+            dist[np.arange(chunk_pts.shape[0]), chunk_parent] = np.inf
+            accessible[start:end] = (dist >= (radii[None, :] - 1e-3)).all(axis=1)
+        return accessible
+
+
 def generate_sas_points(
     coords: np.ndarray,
     elements: Sequence[str],
@@ -405,7 +461,9 @@ def generate_sas_points(
     """Shrake–Rupley solvent-accessible points + outward normals.
 
     Returns float32 ``(P, 3)`` xyz and unit normals. Much faster than a PyMOL SES mesh
-    for short peptides (tens of ms vs seconds).
+    for short peptides (tens of ms vs seconds). Scales to receptor-sized atom counts too
+    (see `_sas_accessible_mask`) -- both `extract_peptide_surface` and
+    `extract_receptor_surface` call this on their respective (small vs. large) structure.
     """
     coords = np.asarray(coords, dtype=np.float64)
     if coords.ndim != 2 or coords.shape[1] != 3:
@@ -419,10 +477,7 @@ def generate_sas_points(
     pts = (coords[:, None, :] + radii[:, None, None] * unit[None, :, :]).reshape(-1, 3)
     parent = np.repeat(np.arange(n_atoms), int(points_per_atom))
 
-    # Buried if inside any other atom's (vdw+probe) sphere. Peptides are tiny — dense check.
-    dist = np.linalg.norm(pts[:, None, :] - coords[None, :, :], axis=-1)  # (P, A)
-    dist[np.arange(pts.shape[0]), parent] = np.inf
-    accessible = (dist >= (radii[None, :] - 1e-3)).all(axis=1)
+    accessible = _sas_accessible_mask(pts, parent, coords, radii)
     pts = pts[accessible]
     parent = parent[accessible]
     if pts.shape[0] == 0:
@@ -792,6 +847,135 @@ def extract_peptide_surface(
     )
 
 
+def extract_receptor_surface(
+    pdb_path: str | os.PathLike,
+    receptor_chains: Sequence[str] | None,
+    peptide_chains: Sequence[str],
+    cutoff: float = DEFAULT_CUTOFF,
+    num_points: int = DEFAULT_NUM_POINTS,
+    seed: int = DEFAULT_SEED,
+    sas_points_per_atom: int = DEFAULT_SAS_POINTS_PER_ATOM,
+    solvent_radius: float | None = None,
+) -> PeptideSurface:
+    """Extract the RECEPTOR's pocket-facing surface: the geometric mirror of
+    :func:`extract_peptide_surface`, with which side gets SAS-sampled and which side
+    supplies the "is this within cutoff of the other molecule" reference swapped.
+
+    Why this exists: the peptide's own surface (`extract_peptide_surface`) is a coarse
+    shape hint about the thing being generated -- close to leaking the answer when it is
+    also used to condition/supervise binder generation, since the receptor is already
+    conditioned on separately (`x_target`). The receptor's pocket-facing surface has no
+    such problem: it tells the model the shape of the site it needs to fit into, which is
+    genuinely new information relative to `x_target`'s atom coordinates (a molecular
+    surface, not a backbone/atom skeleton).
+
+    SAS-only (unlike `extract_peptide_surface`, no `backend="pymol"` option): a CPSea
+    receptor is a pocket crop, comparable in atom count to the peptide it binds, so the
+    same Shrake-Rupley approach that made the peptide side fast is just as applicable
+    here and there is no PepBridge precedent to mirror for this side.
+
+    Returns a `PeptideSurface` (deliberately -- see that dataclass; reusing it here is
+    what lets this reuse `save_surface_cache`/`load_surface_cache`/`is_cache_valid`
+    unmodified). Field names read as "the pocket side" for this function's output;
+    `metadata["role"] = "receptor"` and a distinct `extractor_version`
+    (`RECEPTOR_SURFACE_EXTRACTOR_VERSION`) are what a caller/cache-validity check uses to
+    tell the two apart -- never rely on field names alone to distinguish them.
+    """
+    pdb_path = Path(pdb_path)
+    if not pdb_path.exists():
+        raise SurfaceExtractionError(f"missing PDB {pdb_path}", reason="missing_pdb")
+
+    peptide_chains = list(peptide_chains)
+    if receptor_chains is not None:
+        receptor_chains = list(receptor_chains)
+        overlap = set(receptor_chains) & set(peptide_chains)
+        if overlap:
+            raise SurfaceExtractionError(
+                f"chains {sorted(overlap)} assigned to both receptor and peptide",
+                reason="chain_overlap",
+            )
+
+    pep_coords, pep_elems, rec_coords, rec_elems, receptor_chains = load_heavy_atoms_split(
+        pdb_path, peptide_chains, receptor_chains
+    )
+    if pep_coords.shape[0] == 0:
+        raise SurfaceExtractionError(
+            f"no heavy atoms for peptide chains {peptide_chains} in {pdb_path}",
+            reason="empty_chain",
+        )
+    if rec_coords.shape[0] == 0:
+        raise SurfaceExtractionError(
+            f"no heavy atoms for receptor chains {receptor_chains} in {pdb_path}",
+            reason="empty_chain",
+        )
+
+    probe = 1.4 if solvent_radius is None else float(solvent_radius)
+    rec_xyz, rec_normals = generate_sas_points(
+        rec_coords, rec_elems, points_per_atom=int(sas_points_per_atom), probe=probe
+    )
+    n_rec_atoms = int(rec_coords.shape[0])
+    n_pep_atoms = int(pep_coords.shape[0])
+    pep_xyz = pep_coords.astype(np.float32)
+
+    # Distance from each RECEPTOR SAS point to the nearest PEPTIDE atom -- the mirror of
+    # extract_peptide_surface's `nearest_receptor_distance(pep_xyz, rec_xyz)`. The function
+    # name says "receptor" from the peptide-surface side's point of view; here the "other
+    # molecule" argument is the peptide, which is exactly what this needs -- it is a plain
+    # nearest-neighbour distance, not receptor-specific despite the name.
+    distance = nearest_receptor_distance(rec_xyz, pep_xyz)
+    mask = interface_mask(distance, cutoff)
+
+    interface_xyz = rec_xyz[mask]
+    interface_normals = rec_normals[mask]
+    interface_distance = distance[mask]
+
+    if interface_xyz.shape[0] == 0:
+        raise SurfaceExtractionError(
+            f"no receptor surface vertex within {cutoff} A of the peptide",
+            reason="empty_interface",
+        )
+
+    idx = farthest_point_sample(interface_xyz, num_points, seed=seed)
+    n_valid = int(idx.shape[0])
+    sampled_xyz = pad_to(interface_xyz[idx], num_points)
+    sampled_normals = pad_to(interface_normals[idx], num_points)
+    sampled_distance = pad_to(interface_distance[idx], num_points)
+    sampled_valid_mask = np.zeros(num_points, dtype=bool)
+    sampled_valid_mask[:n_valid] = True
+
+    metadata = {
+        "source_pdb": str(pdb_path.resolve()),
+        "receptor_chains": receptor_chains,
+        "peptide_chains": peptide_chains,
+        "cutoff": float(cutoff),
+        "sample_count": int(num_points),
+        "seed": int(seed),
+        "extractor_version": RECEPTOR_SURFACE_EXTRACTOR_VERSION,
+        "backend": "sas",
+        "sas_points_per_atom": int(sas_points_per_atom),
+        "role": "receptor",
+        "num_receptor_atoms": int(n_rec_atoms),
+        "num_peptide_atoms": int(n_pep_atoms),
+        "num_receptor_surface_vertices": int(rec_xyz.shape[0]),
+        "num_full_peptide_vertices": int(rec_xyz.shape[0]),  # "full" = full pocket-side surface here
+        "num_interface_vertices": int(interface_xyz.shape[0]),
+        "num_valid_sampled": n_valid,
+    }
+
+    return PeptideSurface(
+        full_peptide_xyz=rec_xyz.astype(np.float32),
+        full_peptide_normals=rec_normals.astype(np.float32),
+        interface_xyz=interface_xyz.astype(np.float32),
+        interface_normals=interface_normals.astype(np.float32),
+        interface_receptor_distance=interface_distance.astype(np.float32),
+        sampled_xyz=sampled_xyz.astype(np.float32),
+        sampled_normals=sampled_normals.astype(np.float32),
+        sampled_receptor_distance=sampled_distance.astype(np.float32),
+        sampled_valid_mask=sampled_valid_mask,
+        metadata=metadata,
+    )
+
+
 def _maybe_cleanup(path: Path) -> None:
     import shutil
 
@@ -1004,14 +1188,20 @@ def cache_path_for(
     example_id: str,
     *,
     shard: bool = True,
+    suffix: str = "surface",
 ) -> Path:
     """Canonical write path for one complex.
 
     Default is sharded: ``<output_dir>/<hh>/<hh>/<example_id>.surface.npz``. Flat
     ``<output_dir>/<example_id>.surface.npz`` remains readable via
     :func:`resolve_cache_path` for older runs.
+
+    `suffix` (default `"surface"`, i.e. exactly the historical filename) is what keeps a
+    peptide-surface cache and a `extract_receptor_surface` cache from colliding on the
+    SAME filename even if a caller points both extractions at one `output_dir` --
+    `extract_peptide_surfaces.py --role receptor` passes `suffix="receptor_surface"`.
     """
-    name = f"{example_id}.surface.npz"
+    name = f"{example_id}.{suffix}.npz"
     root = Path(output_dir)
     if not shard:
         return root / name
@@ -1019,12 +1209,14 @@ def cache_path_for(
     return root / a / b / name
 
 
-def resolve_cache_path(output_dir: str | os.PathLike, example_id: str) -> Path:
+def resolve_cache_path(
+    output_dir: str | os.PathLike, example_id: str, *, suffix: str = "surface"
+) -> Path:
     """Existing cache path (sharded or flat), else the sharded write location."""
-    sharded = cache_path_for(output_dir, example_id, shard=True)
+    sharded = cache_path_for(output_dir, example_id, shard=True, suffix=suffix)
     if sharded.exists():
         return sharded
-    flat = cache_path_for(output_dir, example_id, shard=False)
+    flat = cache_path_for(output_dir, example_id, shard=False, suffix=suffix)
     if flat.exists():
         return flat
     return sharded

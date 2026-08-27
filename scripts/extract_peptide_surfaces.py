@@ -63,15 +63,25 @@ from proteinfoundation.surface.peptide_surface import (  # noqa: E402
     DEFAULT_SAS_POINTS_PER_ATOM,
     DEFAULT_SEED,
     EXTRACTOR_VERSION,
+    RECEPTOR_SURFACE_EXTRACTOR_VERSION,
     SurfaceExtractionError,
     cache_path_for,
     extract_peptide_surface,
+    extract_receptor_surface,
     is_cache_valid,
     load_surface_cache,
     resolve_cache_path,
     resolve_chain_assignment,
     save_surface_cache,
 )
+
+# Maps --role to (extraction fn, cache filename suffix, extractor version to validate
+# against). "receptor" is SAS-only (extract_receptor_surface takes no `backend` arg) --
+# see that function's docstring for why there is no PyMOL precedent to mirror.
+_ROLE_EXTRACTORS = {
+    "peptide": (extract_peptide_surface, "surface", EXTRACTOR_VERSION),
+    "receptor": (extract_receptor_surface, "receptor_surface", RECEPTOR_SURFACE_EXTRACTOR_VERSION),
+}
 
 logger = logging.getLogger("extract_peptide_surfaces")
 
@@ -255,18 +265,20 @@ def _process_one(payload: dict) -> dict:
     """Extract one complex. Returns a picklable result dict for the parent process."""
     item = payload["item"]
     example_id = item["example_id"]
-    cache = cache_path_for(payload["output_dir"], example_id)  # sharded write path
+    role = payload.get("role", "peptide")
+    _, suffix, extractor_version = _ROLE_EXTRACTORS[role]
+    cache = cache_path_for(payload["output_dir"], example_id, suffix=suffix)  # sharded write path
     out: dict = {"example_id": example_id, "status": "failed", "reason": "", "message": ""}
 
     if payload["skip_existing"] and not payload["overwrite"]:
-        existing = resolve_cache_path(payload["output_dir"], example_id)
+        existing = resolve_cache_path(payload["output_dir"], example_id, suffix=suffix)
         if is_cache_valid(
             existing,
             payload["cutoff"],
             payload["num_points"],
             payload["seed"],
-            EXTRACTOR_VERSION,
-            backend=payload.get("backend", DEFAULT_BACKEND),
+            extractor_version,
+            backend=payload.get("backend", DEFAULT_BACKEND) if role == "peptide" else "sas",
             sas_points_per_atom=int(payload.get("sas_points_per_atom", DEFAULT_SAS_POINTS_PER_ATOM)),
         ):
             surface = load_surface_cache(existing)
@@ -285,25 +297,41 @@ def _process_one(payload: dict) -> dict:
         receptor = item.get("receptor_chains")
         peptide = item["peptide_chains"]
         # SAS resolves "receptor = every non-peptide chain" inside one PDB scan.
-        # PyMOL still needs an explicit receptor list before split_chains.
-        if backend == "pymol" or receptor is not None:
+        # PyMOL still needs an explicit receptor list before split_chains. Receptor-role
+        # extraction is SAS-only (see extract_receptor_surface's docstring) but still needs
+        # explicit chains resolved up front the same way, for the same reason.
+        if role == "receptor" or backend == "pymol" or receptor is not None:
             receptor, peptide = resolve_chain_assignment(
                 item["pdb"], peptide, receptor
             )
-        surface = extract_peptide_surface(
-            item["pdb"],
-            receptor_chains=receptor,
-            peptide_chains=peptide,
-            cutoff=payload["cutoff"],
-            num_points=payload["num_points"],
-            seed=payload["seed"],
-            solvent_radius=payload["solvent_radius"],
-            surface_quality=payload["surface_quality"],
-            backend=backend,
-            sas_points_per_atom=int(
-                payload.get("sas_points_per_atom", DEFAULT_SAS_POINTS_PER_ATOM)
-            ),
-        )
+        if role == "receptor":
+            surface = extract_receptor_surface(
+                item["pdb"],
+                receptor_chains=receptor,
+                peptide_chains=peptide,
+                cutoff=payload["cutoff"],
+                num_points=payload["num_points"],
+                seed=payload["seed"],
+                solvent_radius=payload["solvent_radius"],
+                sas_points_per_atom=int(
+                    payload.get("sas_points_per_atom", DEFAULT_SAS_POINTS_PER_ATOM)
+                ),
+            )
+        else:
+            surface = extract_peptide_surface(
+                item["pdb"],
+                receptor_chains=receptor,
+                peptide_chains=peptide,
+                cutoff=payload["cutoff"],
+                num_points=payload["num_points"],
+                seed=payload["seed"],
+                solvent_radius=payload["solvent_radius"],
+                surface_quality=payload["surface_quality"],
+                backend=backend,
+                sas_points_per_atom=int(
+                    payload.get("sas_points_per_atom", DEFAULT_SAS_POINTS_PER_ATOM)
+                ),
+            )
         for key in ("peptide_length", "cyclization_type"):
             if item.get(key) is not None:
                 surface.metadata[key] = (
@@ -413,23 +441,28 @@ def _run_pool(items: list[dict], payload_base: dict, num_points: int, workers: i
 
     # Parent-side skip: honour extractor_version / cutoff / seed. Glob once, then only
     # open npz for ids that exist (avoids 2.7M stat calls; also drops stale v1 caches).
+    role = payload_base.get("role", "peptide")
+    _, suffix, extractor_version = _ROLE_EXTRACTORS[role]
     todo = items
     if payload_base["skip_existing"] and not payload_base["overwrite"]:
         from concurrent.futures import ThreadPoolExecutor
 
         out_dir = Path(payload_base["output_dir"])
+        glob_suffix = f".{suffix}.npz"
         # Flat + sharded layouts (rglob). Keep full paths so we don't re-stat via
-        # resolve_cache_path (that doubled ZFS metadata traffic per cache).
+        # resolve_cache_path (that doubled ZFS metadata traffic per cache). Suffix-scoped
+        # so a peptide run's prefilter never touches (or is confused by) a receptor run's
+        # caches sharing the same --output-dir, and vice versa.
         on_disk: dict[str, Path] = {}
-        for p in out_dir.rglob("*.surface.npz"):
+        for p in out_dir.rglob(f"*{glob_suffix}"):
             if p.is_file() and not p.name.endswith(".npz.tmp"):
-                on_disk[p.name[: -len(".surface.npz")]] = p
-        logger.info("prefilter: found %d caches on disk; validating...", len(on_disk))
+                on_disk[p.name[: -len(glob_suffix)]] = p
+        logger.info("prefilter: found %d %s caches on disk; validating...", len(on_disk), role)
 
         cutoff = payload_base["cutoff"]
         num_points = payload_base["num_points"]
         seed = payload_base["seed"]
-        backend = payload_base.get("backend", DEFAULT_BACKEND)
+        backend = payload_base.get("backend", DEFAULT_BACKEND) if role == "peptide" else "sas"
         sas_points_per_atom = int(payload_base.get("sas_points_per_atom", DEFAULT_SAS_POINTS_PER_ATOM))
 
         def _valid(eid: str) -> bool:
@@ -438,7 +471,7 @@ def _run_pool(items: list[dict], payload_base: dict, num_points: int, workers: i
                 cutoff,
                 num_points,
                 seed,
-                EXTRACTOR_VERSION,
+                extractor_version,
                 backend=backend,
                 sas_points_per_atom=sas_points_per_atom,
             )
@@ -584,6 +617,18 @@ def main(argv=None) -> int:
     source.add_argument("--pdb", type=Path, help="a single complex PDB (single mode)")
 
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument(
+        "--role",
+        choices=("peptide", "receptor"),
+        default="peptide",
+        help="'peptide' (default) = ground-truth binder's own interface surface, historical "
+        "behavior. 'receptor' = the receptor pocket's surface facing the peptide -- see "
+        "proteinfoundation.surface.peptide_surface.extract_receptor_surface's docstring for "
+        "why this is the non-circular conditioning signal. Cache filenames are suffix-scoped "
+        "per role (*.surface.npz vs *.receptor_surface.npz), so both roles CAN safely share "
+        "one --output-dir, but keeping them in separate directories is still recommended for "
+        "clarity when browsing the cache tree.",
+    )
     parser.add_argument("--cutoff", type=float, default=DEFAULT_CUTOFF)
     parser.add_argument("--num-points", type=int, default=DEFAULT_NUM_POINTS)
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
@@ -657,6 +702,11 @@ def main(argv=None) -> int:
 
     if args.pdb is not None and not args.peptide_chains:
         parser.error("--peptide-chains is required with --pdb")
+    if args.role == "receptor" and args.backend == "pymol":
+        parser.error(
+            "--role receptor is SAS-only (extract_receptor_surface has no PyMOL path -- "
+            "see its docstring); drop --backend pymol or switch --role to peptide"
+        )
 
     if args.pdb is not None:
         items = [
@@ -705,8 +755,10 @@ def main(argv=None) -> int:
     )
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
+    _, _, role_extractor_version = _ROLE_EXTRACTORS[args.role]
     payload_base = {
         "output_dir": str(args.output_dir),
+        "role": args.role,
         "cutoff": args.cutoff,
         "num_points": args.num_points,
         "seed": args.seed,
@@ -717,7 +769,12 @@ def main(argv=None) -> int:
         "backend": args.backend,
         "sas_points_per_atom": args.sas_points_per_atom,
     }
-    logger.info("backend=%s  extractor_version=%s", args.backend, EXTRACTOR_VERSION)
+    logger.info(
+        "role=%s  backend=%s  extractor_version=%s",
+        args.role,
+        args.backend if args.role == "peptide" else "sas",
+        role_extractor_version,
+    )
 
     started = time.time()
     if args.workers == 1:
@@ -748,7 +805,8 @@ def main(argv=None) -> int:
         ) = _run_pool(items, payload_base, args.num_points, args.workers)
 
     stats = {
-        "extractor_version": EXTRACTOR_VERSION,
+        "role": args.role,
+        "extractor_version": role_extractor_version,
         "cutoff": args.cutoff,
         "num_points": args.num_points,
         "seed": args.seed,

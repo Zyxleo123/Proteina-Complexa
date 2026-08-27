@@ -32,10 +32,12 @@ from proteinfoundation.cyclization.constants import (
     UNSPECIFIED,
 )
 from proteinfoundation.eval.cyclic_reconstruction_metrics import (
+    CB_IDX,
     DISULFIDE_SG_BOND_WINDOW_A,
     MAINCHAIN_CN_BOND_WINDOW_A,
     cyclic_geometry_metrics,
     per_sample_requested_bond_distance,
+    virtual_cb_from_backbone,
 )
 from proteinfoundation.nn.feature_factory.pair_feats import CyclizationGraphPositionalPairFeat
 
@@ -445,7 +447,7 @@ def _bond_loss_stub(coords, atom_mask, aa, n):
 
     stub = _t_weight_stub(0.5)
     # Real implementation, just bound onto the stub.
-    stub._bond_loss_t_weight = lambda batch: Proteina._bond_loss_t_weight(stub, batch)
+    stub._bond_loss_t_weight = lambda batch, t_lower=None: Proteina._bond_loss_t_weight(stub, batch, t_lower=t_lower)
     stub.fm.nn_out_to_clean_sample_prediction = lambda batch, nn_out: {
         "bb_ca": torch.zeros(1, n, 3),
         "local_latents": torch.zeros(1, n, 8),
@@ -476,13 +478,95 @@ def test_compute_cyclization_bond_loss_wiring_and_logging():
         "cyclization_type": meta["type"],
         "has_cyclization": meta["has_cyclization"],
     }
-    loss, metrics = Proteina.compute_cyclization_bond_loss(stub, batch, nn_out={}, log_prefix="train", bs=1)
+    loss, geom_loss, metrics = Proteina.compute_cyclization_bond_loss(stub, batch, nn_out={}, log_prefix="train", bs=1)
 
     assert float(loss) > 0
+    assert float(geom_loss) == 0.0  # cyclization_geometry_enabled defaults False on the stub
     assert metrics["n_valid"] == 1.0
     assert stub.logged["train/loss_cyclization_bond"] > 0
     for key in ("window_success", "mean_dist_A", "n_valid"):
         assert f"train/cyclization_bond_{key}" in stub.logged, key
+
+
+def test_compute_cyclization_bond_loss_geometry_term_not_double_weighted():
+    """Regression: `geom_loss` must come back unweighted by `cyclization_geometry_weight`,
+    so the caller (`Proteina.training_step`) applies that weight exactly once as its own
+    top-level term. Previously the geometry loss was folded into the returned `loss` and
+    then the CALLER multiplied the whole thing by `cyclization_bond_loss_weight` again,
+    silently squaring the two 0.05 defaults into an effective 0.0025 weight."""
+    from proteinfoundation.proteina import Proteina
+
+    n = 4
+    coords, atom_mask, aa, meta = _disulfide_at(6.0, length=n)  # open ring -> nonzero angle/dihedral error
+    stub = _bond_loss_stub(coords, atom_mask, aa, n)
+    stub.cyclization_geometry_enabled = True
+    stub.cyclization_geometry_w_angle = 1.0
+    stub.cyclization_geometry_w_dihedral = 1.0
+    batch = {
+        "mask": torch.ones(1, n, dtype=torch.bool),
+        "t": {"bb_ca": torch.tensor([1.0]), "local_latents": torch.tensor([1.0])},
+        "cyclization_i": meta["i"],
+        "cyclization_j": meta["j"],
+        "cyclization_type": meta["type"],
+        "has_cyclization": meta["has_cyclization"],
+    }
+
+    # cyclization_geometry_weight must have zero effect on the RETURNED geom_loss --
+    # only on how much of it the caller adds to train_loss.
+    stub.cyclization_geometry_weight = 0.05
+    _, geom_loss_a, _ = Proteina.compute_cyclization_bond_loss(stub, batch, nn_out={}, log_prefix="train", bs=1)
+    stub.cyclization_geometry_weight = 7.0
+    _, geom_loss_b, _ = Proteina.compute_cyclization_bond_loss(stub, batch, nn_out={}, log_prefix="train", bs=1)
+
+    assert float(geom_loss_a) > 0.0
+    assert math.isclose(float(geom_loss_a), float(geom_loss_b), rel_tol=1e-6)
+    assert "train/loss_cyclization_geometry" in stub.logged
+    assert stub.logged["train/loss_cyclization_geometry"] > 0.0
+
+
+def _d_configured_backbone(n=3):
+    """[1, n, 37, 3]/[1, n, 37] fixture with every residue placed as a D-amino-acid
+    (CB reflected through CA), so `chirality_loss` should report positive loss."""
+    coords, mask = _zeros_atom37(1, n)
+    p_n = torch.tensor([0.0, 0.0, 0.0])
+    p_ca = torch.tensor([1.46, 0.0, 0.0])
+    p_c = torch.tensor([2.0, 1.4, 0.0])
+    cb_l = virtual_cb_from_backbone(p_n, p_ca, p_c)
+    cb_d = 2 * p_ca - cb_l
+    for r in range(n):
+        coords[0, r, N_IDX] = p_n
+        coords[0, r, CA_IDX] = p_ca
+        coords[0, r, C_IDX] = p_c
+        coords[0, r, CB_IDX] = cb_d
+        mask[0, r, N_IDX] = True
+        mask[0, r, CA_IDX] = True
+        mask[0, r, C_IDX] = True
+        mask[0, r, CB_IDX] = True
+    aa = torch.full((1, n), AA_OTHER, dtype=torch.long)
+    return coords, mask, aa
+
+
+def test_compute_chirality_loss_wiring_and_logging():
+    """Regression for the "gate only rejects, never trains" gap: unlike replay's
+    `gate_chirality`, this must return a positive, differentiable loss for a
+    D-configured structure and log both the loss and its `frac_d` diagnostic."""
+    from proteinfoundation.proteina import Proteina
+
+    n = 3
+    coords, atom_mask, aa = _d_configured_backbone(n)
+    stub = _bond_loss_stub(coords, atom_mask, aa, n)
+    stub.chirality_loss_margin = 0.0
+    stub.chirality_loss_t_lower = 0.5
+    batch = {
+        "mask": torch.ones(1, n, dtype=torch.bool),
+        "t": {"bb_ca": torch.tensor([1.0]), "local_latents": torch.tensor([1.0])},
+    }
+    loss = Proteina.compute_chirality_loss(stub, batch, nn_out={}, log_prefix="train", bs=1)
+
+    assert float(loss) > 0
+    assert stub.logged["train/loss_chirality"] > 0
+    assert math.isclose(stub.logged["train/chirality_frac_d"], 1.0, rel_tol=1e-6)
+    assert stub.logged["train/chirality_n_valid"] == float(n)
 
 
 def test_compute_cyclization_bond_loss_noop_without_cyclization_keys():
@@ -493,8 +577,9 @@ def test_compute_cyclization_bond_loss_noop_without_cyclization_keys():
     coords, atom_mask, aa, _ = _disulfide_at(6.0, length=n)
     stub = _bond_loss_stub(coords, atom_mask, aa, n)
     batch = {"mask": torch.ones(1, n, dtype=torch.bool), "t": {"bb_ca": torch.tensor([1.0])}}
-    loss, metrics = Proteina.compute_cyclization_bond_loss(stub, batch, nn_out={}, log_prefix="train", bs=1)
+    loss, geom_loss, metrics = Proteina.compute_cyclization_bond_loss(stub, batch, nn_out={}, log_prefix="train", bs=1)
     assert math.isclose(float(loss), 0.0, abs_tol=1e-8)
+    assert math.isclose(float(geom_loss), 0.0, abs_tol=1e-8)
     assert metrics == {}
 
 
@@ -677,6 +762,8 @@ ALL_TESTS = [
     test_t_weight_ramps_linearly_from_t_lower_lim,
     test_t_weight_takes_min_over_modalities,
     test_compute_cyclization_bond_loss_wiring_and_logging,
+    test_compute_cyclization_bond_loss_geometry_term_not_double_weighted,
+    test_compute_chirality_loss_wiring_and_logging,
     test_compute_cyclization_bond_loss_noop_without_cyclization_keys,
     test_val_generation_uses_the_design_sampler_not_the_monomer_one,
     test_sample_formatting_returns_angstrom_so_val_gen_must_convert,

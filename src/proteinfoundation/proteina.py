@@ -2,6 +2,7 @@ import copy
 import math
 import os
 import random
+import re
 from functools import partial
 from typing import Literal
 
@@ -35,6 +36,7 @@ from proteinfoundation.logging.metric_schema import finalize_metrics, init_metri
 from proteinfoundation.nn.genie2 import Genie2Denoiser
 from proteinfoundation.utils.file_utils import create_dir as _create_dir
 from proteinfoundation.utils.sample_utils import add_clean_samples, sample_formatting
+from proteinfoundation.utils.training_handlers import _safe_get as _safe_cfg_get
 from proteinfoundation.utils.training_handlers import handle_batch_conditioning
 from proteinfoundation.utils.validation_utils import (
     clean_validation_files,
@@ -103,6 +105,23 @@ def _cyclic_metric_weight(key: str, metrics: dict[str, float], default: int) -> 
     if count_suffix is None:
         return default
     return float(metrics.get(f"{prefix}/{count_suffix}", default))
+
+
+def _subset_batch(batch: dict, n_keep: int, bs: int) -> dict:
+    """Shallow copy of `batch` truncated to its first `n_keep` examples.
+
+    Only tensors whose leading dimension is the batch size are sliced, so per-batch
+    scalars and non-tensor metadata pass through untouched. Handles the one level of
+    nesting the flow-matching state uses (`x_t`, `t`, `x_1`, ... are `{data_mode: Tensor}`).
+    """
+    def _slice(v):
+        if torch.is_tensor(v):
+            return v[:n_keep] if v.dim() >= 1 and v.shape[0] == bs else v
+        if isinstance(v, dict):
+            return {k: _slice(sub) for k, sub in v.items()}
+        return v
+
+    return {k: _slice(v) for k, v in batch.items()}
 
 
 class Proteina(L.LightningModule):
@@ -196,6 +215,36 @@ class Proteina(L.LightningModule):
         self.surface_loss_enabled = bool(surf_loss_cfg.get("enabled", False))
         self.surface_loss_weight = float(surf_loss_cfg.get("loss_weight", 0.1))
         self.surface_loss_t_lower = float(surf_loss_cfg.get("t_lower_lim", 0.5))
+        # "chamfer" (legacy, coincidence — correct only for the binder's OWN surface) vs
+        # "contact" (normal-aware complementarity — correct for the RECEPTOR pocket surface).
+        # See proteinfoundation.nn.surface.loss for why chamfer-vs-receptor is misspecified.
+        self.surface_loss_mode = str(surf_loss_cfg.get("mode", "chamfer")).lower()
+        self.surface_loss_contact_band = float(surf_loss_cfg.get("contact_band_nm", 0.5))
+        self.surface_loss_clash_margin = float(surf_loss_cfg.get("clash_margin_nm", 0.0))
+        self.surface_loss_clash_weight = float(surf_loss_cfg.get("clash_weight", 1.0))
+        self.surface_loss_cover_weight = float(surf_loss_cfg.get("cover_weight", 1.0))
+
+        # Optional aux: differentiable penalty on D-configured (wrong-handedness) residues.
+        # `cyclization.scoring`'s `gate_chirality` only REJECTS bad replay candidates after
+        # the fact -- it supplies no gradient, so a checkpoint that generates D-amino-acids
+        # has nothing training it to stop. This closes that gap; applies to every residue,
+        # not just cyclization linkage atoms, so it needs no cyclization label.
+        chir_loss_cfg = cfg_exp.get("chirality_loss", None) or {}
+        self.chirality_loss_enabled = bool(chir_loss_cfg.get("enabled", False))
+        self.chirality_loss_weight = float(chir_loss_cfg.get("loss_weight", 0.05))
+        self.chirality_loss_margin = float(chir_loss_cfg.get("margin", 0.0))
+        self.chirality_loss_t_lower = float(chir_loss_cfg.get("t_lower_lim", 0.5))
+        if self.chirality_loss_enabled:
+            if "local_latents" not in cfg_exp.product_flowmatcher or getattr(self, "autoencoder", None) is None:
+                raise ValueError(
+                    "chirality_loss.enabled=true requires the 'local_latents' data mode with an "
+                    "autoencoder: chirality only exists once the predicted latents are decoded to "
+                    "all-atom coordinates (a CB position needs a full sidechain decode)."
+                )
+            logger.info(
+                f"Chirality loss enabled (loss_weight={self.chirality_loss_weight}, "
+                f"margin={self.chirality_loss_margin}, t_lower_lim={self.chirality_loss_t_lower})"
+            )
 
         # NaN-safe epoch aggregation for metrics that are legitimately NaN on some steps (empty
         # t-bins, absent cyclization chemistries, ...). See `log_nan_safe` for why `self.log`'s
@@ -230,6 +279,7 @@ class Proteina(L.LightningModule):
 
         self._init_cyclization_head(cfg_exp)
         self._init_cyclization_bond_loss(cfg_exp)
+        self._init_rollout_finetune(cfg_exp)
         self._init_replay(cfg_exp)
 
     def _init_cyclization_head(self, cfg_exp):
@@ -298,10 +348,46 @@ class Proteina(L.LightningModule):
                 "autoencoder: the bond distance only exists once the predicted latents are decoded "
                 "to all-atom coordinates."
             )
+        # Unrolled clean prediction. The one-step `x_hat_1` this loss reads is the
+        # conditional MEAN E[x_1 | x_t], and bond distance is a nonlinear functional of
+        # coordinates, so `d(E[x_1|x_t]) != E[d(x_1)|x_t]`: averaging over ring
+        # conformations pulls the anchors together, and the mean can sit inside the
+        # acceptance window while nothing the sampler emits does. That Jensen gap, not
+        # a shortage of data or of loss weight, is the leading explanation for
+        # "training closure ~1.0, sampled closure ~0.6". `steps > 1` penalises the
+        # endpoint of a short ODE unroll instead -- a much closer stand-in for a sample.
+        # See `proteinfoundation.training.unrolled_prediction`.
+        unroll_cfg = bond_cfg.get("unroll", None) or {}
+        self.cyclization_bond_unroll_steps = int(unroll_cfg.get("steps", 1))
+        self.cyclization_bond_unroll_grad_steps = int(unroll_cfg.get("grad_steps", 1))
+        self.cyclization_bond_unroll_self_cond = unroll_cfg.get("self_cond", None)
+        # Cap on how many batch examples the unroll runs on. The gradient-carrying step
+        # holds a SECOND network graph next to the flow loss's, so null (= whole batch)
+        # roughly doubles peak activation memory and OOMs a 48G a6000 at v4's batch size.
+        _ms = unroll_cfg.get("max_samples", None)
+        self.cyclization_bond_unroll_max_samples = None if _ms is None else int(_ms)
+        # With an unroll the endpoint is a genuine (coarse) sample even from a noisy
+        # start, so the "predicted clean structure is meaningless here" argument behind
+        # `t_lower_lim` weakens and this may be lowered independently. Defaults to the
+        # one-step value, so an existing config is unchanged.
+        _unroll_t_lower = unroll_cfg.get("t_lower_lim", None)
+        self.cyclization_bond_unroll_t_lower = (
+            self.cyclization_bond_loss_t_lower if _unroll_t_lower is None else float(_unroll_t_lower)
+        )
         logger.info(
             f"Cyclization bond loss enabled (loss_weight={self.cyclization_bond_loss_weight}, "
             f"t_lower_lim={self.cyclization_bond_loss_t_lower})"
         )
+        if self.cyclization_bond_unroll_steps > 1:
+            logger.info(
+                f"Cyclization bond loss uses an UNROLLED clean prediction "
+                f"(steps={self.cyclization_bond_unroll_steps}, "
+                f"grad_steps={self.cyclization_bond_unroll_grad_steps}, "
+                f"self_cond={self.cyclization_bond_unroll_self_cond}, "
+                f"max_samples={self.cyclization_bond_unroll_max_samples}, "
+                f"t_lower_lim={self.cyclization_bond_unroll_t_lower}). Costs "
+                f"{self.cyclization_bond_unroll_steps - 1} extra nn forward(s) per step."
+            )
 
         # Angle/dihedral terms ride on the SAME decoded structure as the distance term.
         # Decoding is the expensive part of this loss, so computing them here rather than
@@ -318,6 +404,99 @@ class Proteina(L.LightningModule):
                 f"Cyclization linkage-geometry loss enabled (loss_weight={self.cyclization_geometry_weight}, "
                 f"w_angle={self.cyclization_geometry_w_angle}, w_dihedral={self.cyclization_geometry_w_dihedral})"
             )
+
+    def _init_rollout_finetune(self, cfg_exp):
+        """Optionally enables truncated-backprop fine-tuning on the model's OWN rollouts.
+
+        The complement to `cyclization.bond_loss.unroll`. That one shrinks the Jensen gap
+        (mean-vs-sample) but still starts every trajectory from a *real* interpolant
+        `x_t = (1-t) x_0 + t x_1` built out of ground-truth data -- so it says nothing
+        about the second failure mode, exposure bias: at sampling time `x_t` comes from
+        the model's own accumulated output and has drifted off that manifold, and no
+        teacher-forced objective ever visits the states the sampler actually occupies.
+
+        This term closes that loop directly. It integrates the deployed sampler from
+        t=0 (`ProductSpaceFlowMatcher.full_simulation_draft`, same schedule, same
+        `simulation_step`, same noise as design), decodes the endpoint, and applies the
+        same flat-bottom closing-bond penalty to the SAMPLE. Gradients are kept only
+        through the last `grad_steps` integration steps (DRaFT-K).
+
+        Two properties keep this from being reward hacking. First it is strictly
+        additive: the real-data flow loss is computed on the same optimizer step and is
+        untouched, so the model is anchored to the data distribution throughout. Second
+        the reward is flat-bottomed -- once a ring closes inside its window the gradient
+        is exactly zero, so there is no incentive to over-optimise closure at the expense
+        of everything else, which is precisely the failure a one-sided reward invites.
+
+        Config (`rollout_finetune` block), all optional, disabled by default:
+            enabled        bool, default False.
+            loss_weight    weight on the additive term (default 0.05).
+            nsteps         ODE steps. Default: the design sampler's -- lowering it makes
+                           the rollout cheaper but trains a sampler nobody deploys.
+            grad_steps     steps to backprop through (default 1). The memory knob.
+            every_n_steps  run only every N optimizer steps (default 8) to amortise the
+                           cost. Keyed off `global_step`, so all DDP ranks agree.
+            max_samples    cap on rollout batch size (default 2); the batch is truncated,
+                           not sampled, so the choice is rank-deterministic.
+            self_cond      default: the design sampler's.
+            geometry       also apply the linkage angle/dihedral loss to the sampled
+                           structure (default: follow `cyclization.bond_loss.geometry`).
+            design_sampling  the design pipeline's sampling config (`args` + `model`).
+                           Falls back to `val_generation.design_sampling`.
+        """
+        cfg = cfg_exp.get("rollout_finetune", None) or {}
+        self.rollout_ft_enabled = bool(cfg.get("enabled", False))
+        self.rollout_ft_cfg = cfg
+        if not self.rollout_ft_enabled:
+            return
+
+        if "local_latents" not in cfg_exp.product_flowmatcher or getattr(self, "autoencoder", None) is None:
+            raise ValueError(
+                "rollout_finetune.enabled=true requires the 'local_latents' data mode with an "
+                "autoencoder: the reward is a bond distance, which only exists once the sampled "
+                "latents are decoded to all-atom coordinates."
+            )
+        if not getattr(self, "cyclization_bond_loss_enabled", False):
+            raise ValueError(
+                "rollout_finetune.enabled=true requires cyclization.bond_loss.enabled=true -- the "
+                "rollout reward IS that loss, applied to a sample instead of to the one-step mean."
+            )
+
+        self.rollout_ft_weight = float(cfg.get("loss_weight", 0.05))
+        self.rollout_ft_grad_steps = int(cfg.get("grad_steps", 1))
+        self.rollout_ft_every_n = max(1, int(cfg.get("every_n_steps", 8)))
+        self.rollout_ft_max_samples = cfg.get("max_samples", 2)
+        self.rollout_ft_max_samples = None if self.rollout_ft_max_samples is None else int(self.rollout_ft_max_samples)
+        self.rollout_ft_geometry = bool(cfg.get("geometry", getattr(self, "cyclization_geometry_enabled", False)))
+        self._rollout_ft_sampler_warned = False
+        logger.info(
+            f"Rollout fine-tuning (DRaFT-K) enabled (loss_weight={self.rollout_ft_weight}, "
+            f"grad_steps={self.rollout_ft_grad_steps}, every_n_steps={self.rollout_ft_every_n}, "
+            f"max_samples={self.rollout_ft_max_samples}, geometry={self.rollout_ft_geometry})"
+        )
+
+    def _rollout_ft_sampler(self):
+        """Resolves the sampler config the rollout should integrate.
+
+        Prefers `rollout_finetune.design_sampling`, then `val_generation.design_sampling`.
+        There is deliberately NO fallback to `generation.model["ode"]` here: that is the
+        unconditional-monomer sampler, whose `bb_ca.center_every_step=True` zero-CoMs a
+        binder that CPSea centres on its TARGET. Training against samples from a wrong
+        sampler is worse than not training against samples at all, so this raises instead.
+        """
+        design = self.rollout_ft_cfg.get("design_sampling", None)
+        if design is None and self.val_gen_cfg is not None:
+            design = self.val_gen_cfg.get("design_sampling", None)
+            if design is not None and not self._rollout_ft_sampler_warned:
+                self._rollout_ft_sampler_warned = True
+                logger.info("rollout_finetune has no `design_sampling`; using val_generation's.")
+        if design is None:
+            raise ValueError(
+                "rollout_finetune needs a `design_sampling` block (the design pipeline's "
+                "`args` + `model`). Add `- /pipeline/model_sampling@rollout_finetune.design_sampling` "
+                "to the config's defaults list so the rollout integrates the sampler design runs."
+            )
+        return design
 
     def _init_replay(self, cfg_exp):
         """Optionally enables reward-weighted terminal-sample replay (Stage 7).
@@ -348,6 +527,7 @@ class Proteina(L.LightningModule):
             reward_std_threshold=float(replay_cfg.get("reward_std_threshold", 0.05)),
             near_weight=float(replay_cfg.get("near_weight", 0.3)),
             max_size=int(replay_cfg.get("max_size", 10_000)),
+            group_size=int(replay_cfg.get("group_size", 8)),
         )
         logger.info(
             f"Reward-weighted replay enabled (buffer_dir={replay_cfg['buffer_dir']}, "
@@ -645,12 +825,29 @@ class Proteina(L.LightningModule):
             train_loss = train_loss + self.cyclization_loss_weight * cyclization_loss
 
         if getattr(self, "cyclization_bond_loss_enabled", False):
-            bond_loss, _ = self.compute_cyclization_bond_loss(batch, nn_out, log_prefix=log_prefix, bs=bs)
+            bond_loss, geom_loss, _ = self.compute_cyclization_bond_loss(batch, nn_out, log_prefix=log_prefix, bs=bs)
             train_loss = train_loss + self.cyclization_bond_loss_weight * bond_loss
+            if getattr(self, "cyclization_geometry_enabled", False):
+                # Own top-level weight, not multiplied by `cyclization_bond_loss_weight`
+                # again -- see the "Returned UNWEIGHTED" note in `compute_cyclization_bond_loss`.
+                train_loss = train_loss + self.cyclization_geometry_weight * geom_loss
 
         if getattr(self, "surface_loss_enabled", False):
             surf_loss = self.compute_surface_attraction_loss(batch, nn_out, log_prefix=log_prefix, bs=bs)
             train_loss = train_loss + self.surface_loss_weight * surf_loss
+
+        if getattr(self, "chirality_loss_enabled", False):
+            chir_loss = self.compute_chirality_loss(batch, nn_out, log_prefix=log_prefix, bs=bs)
+            train_loss = train_loss + self.chirality_loss_weight * chir_loss
+
+        # Rollout fine-tuning (DRaFT-K). Strictly ADDITIVE and training-only: the flow
+        # loss above is computed on real data and untouched, which is what anchors the
+        # model to the data distribution while a sample-space reward pulls on it. A
+        # validation step must measure the model against real data, and `val_generation`
+        # already scores generated samples without feeding anything back.
+        if getattr(self, "rollout_ft_enabled", False) and not val_step:
+            rollout_loss = self.compute_rollout_finetune_loss(batch, log_prefix=log_prefix, bs=bs)
+            train_loss = train_loss + self.rollout_ft_weight * rollout_loss
 
         # Reward-weighted replay (Stage 7): additive only, never touches the real-batch
         # loss computed above. Training-only (a validation step should measure the model
@@ -828,6 +1025,16 @@ class Proteina(L.LightningModule):
 
         Applied only for samples with ``t_bb_ca >= t_lower_lim`` (prediction is noise below that).
         Gives the zero-init gate a nonzero dL/dg even when the FM loss alone leaves g shut.
+
+        CAUTION on what ``batch["surface_xyz"]`` actually is: this function is agnostic to
+        which dataset transform populated it, and that choice changes what this loss means.
+        With ``AttachPeptideSurfaceTransform`` (the historical default), it pulls the binder
+        toward its OWN ground-truth surface -- close to circular, since it is close to
+        supervising the model with a coarse restatement of the very structure being
+        generated. With ``AttachReceptorSurfaceTransform`` it pulls the binder toward the
+        RECEPTOR pocket's surface instead, which is a genuine "sit in the pocket" signal
+        (new shape information ``x_target`` does not otherwise supply). See
+        ``proteinfoundation.surface.peptide_surface.extract_receptor_surface``'s docstring.
         """
         if "surface_xyz" not in batch or "surface_mask" not in batch or getattr(self, "autoencoder", None) is None:
             z = torch.zeros((), device=self.device, dtype=torch.float32)
@@ -865,19 +1072,66 @@ class Proteina(L.LightningModule):
             decoded_coors[..., N_IDX, :], decoded_coors[..., CA_IDX, :], decoded_coors[..., C_IDX, :]
         )  # [B, N, 3] nm, surface-facing proxy
 
+        from proteinfoundation.nn.surface.loss import (
+            surface_contact_loss,
+            virtual_cb_surface_chamfer,
+        )
+
         surf = batch["surface_xyz"]
         smask = batch["surface_mask"].bool()
-
         cb_mask = binder_mask & backbone_ok
-        dist = (cb[:, :, None, :] - surf[:, None, :, :]).norm(dim=-1)  # [B, N, M]
-        dist = dist.masked_fill(~smask[:, None, :], 1e6)
-        dist = dist.masked_fill(~cb_mask[:, :, None], 1e6)
-        d_bs = dist.min(dim=-1).values  # [B, N]
-        d_sb = dist.min(dim=1).values  # [B, M]
 
-        per_b = (d_bs * cb_mask).sum(-1) / cb_mask.sum(-1).clamp_min(1)
-        per_s = (d_sb * smask).sum(-1) / smask.sum(-1).clamp_min(1)
-        per = 0.5 * (per_b + per_s)
+        clash_term = cover_term = None
+        if self.surface_loss_mode == "contact":
+            # Normal-aware complementarity: correct target for the RECEPTOR pocket surface,
+            # unlike the coincidence Chamfer below (which the binder can only satisfy by
+            # interpenetrating the receptor). Needs the outward normals.
+            snormals = batch["surface_normals"]
+            per, clash_term, cover_term = surface_contact_loss(
+                cb,
+                cb_mask,
+                surf,
+                snormals,
+                smask,
+                contact_band=self.surface_loss_contact_band,
+                clash_margin=self.surface_loss_clash_margin,
+                clash_weight=self.surface_loss_clash_weight,
+                cover_weight=self.surface_loss_cover_weight,
+            )
+        elif self.surface_loss_mode == "chamfer":
+            per = virtual_cb_surface_chamfer(cb, cb_mask, surf, smask)
+        else:
+            raise ValueError(
+                f"Unknown surface_loss.mode={self.surface_loss_mode!r} (use 'contact' or 'chamfer')"
+            )
+
+        # CONTROL: re-score the SAME predicted structure against a batch-rolled (mismatched)
+        # surface. `surface_attraction` falling proves nothing on its own -- a model that
+        # ignores the surface entirely can drive it down by learning the marginal pose, which
+        # is what runs `cpsea_surfcond/surfloss_from_v4cfg` did (gates stayed at |g|~1e-4 while
+        # this loss fell 0.15 -> 0.04). `surface_specificity = shuffled - true` is the part
+        # that can ONLY come from conditioning: ~0 means the output is not surface-specific,
+        # no matter how low the raw loss is. Detached and free of the training loss.
+        specificity = None
+        if per.shape[0] > 1:
+            with torch.no_grad():
+                surf_sh = torch.roll(surf, shifts=1, dims=0)
+                smask_sh = torch.roll(smask, shifts=1, dims=0)
+                if self.surface_loss_mode == "contact":
+                    per_sh, _, _ = surface_contact_loss(
+                        cb.detach(),
+                        cb_mask,
+                        surf_sh,
+                        torch.roll(batch["surface_normals"], shifts=1, dims=0),
+                        smask_sh,
+                        contact_band=self.surface_loss_contact_band,
+                        clash_margin=self.surface_loss_clash_margin,
+                        clash_weight=self.surface_loss_clash_weight,
+                        cover_weight=self.surface_loss_cover_weight,
+                    )
+                else:
+                    per_sh = virtual_cb_surface_chamfer(cb.detach(), cb_mask, surf_sh, smask_sh)
+                specificity = per_sh - per.detach()
 
         t = batch["t"]["bb_ca"]
         if t.dim() > 1:
@@ -909,12 +1163,36 @@ class Proteina(L.LightningModule):
             sync_dist=True,
             add_dataloader_idx=False,
         )
+        # Decompose the contact loss so clash (interpenetration) and coverage can be watched
+        # separately -- a run driving coverage down while clash stays ~0 is the healthy shape.
+        for name, term in (
+            ("clash", clash_term),
+            ("cover", cover_term),
+            ("specificity", specificity),
+        ):
+            if term is None:
+                continue
+            self.log(
+                f"{log_prefix}/surface_{name}",
+                term.mean().detach(),
+                on_step=True,
+                on_epoch=True,
+                prog_bar=False,
+                logger=True,
+                batch_size=bs,
+                sync_dist=True,
+                add_dataloader_idx=False,
+            )
         return loss
 
     def log_surface_gates(self, bs: int, log_prefix: str) -> None:
-        """Log zero-init surface cross-attn gates (`g` in ``h ← h + g·Δ``).
+        """Log the surface cross-attn gates (`g` in ``h ← h + g·Δ``).
 
-        If these stay ~0, surface conditioning is inert and all arms look like baseline.
+        If these stay ~0, surface conditioning is inert and all arms look like baseline --
+        which is exactly what happened in `cpsea_surfcond/surfloss_from_v4cfg` (|g| ~ 1e-4
+        after 25k steps). Under `nn.surface.gate_learnable: false` `g` is a fixed buffer, so
+        these lines become a constant; watch `surface_specificity` instead to tell whether
+        the now-open pathway is actually carrying surface information.
         """
         nn = getattr(self, "nn", None)
         layers = getattr(nn, "surface_cross_layers", None) if nn is not None else None
@@ -1299,21 +1577,39 @@ class Proteina(L.LightningModule):
 
         return loss, metrics
 
-    def _bond_loss_t_weight(self, batch: dict) -> torch.Tensor:
-        """[b] weight in [0, 1] that switches the bond loss off at low flow time.
+    def _bond_loss_t_weight(self, batch: dict, t_lower: float | None = None) -> torch.Tensor:
+        """[b] weight in [0, 1] that switches a "reads the predicted clean structure" loss off at low flow time.
 
-        The bond distance is read off the *predicted clean structure*, which is
+        The decoded structure is read off the *predicted clean sample*, which is
         meaningless at high noise -- penalising it there would be supervising the
-        model's own noise. Weight ramps linearly from `t_lower_lim` to 1.
+        model's own noise. Weight ramps linearly from `t_lower` to 1.
 
         Takes the MIN over modalities rather than `bb_ca` alone: an anchor atom needs
         both a clean Ca trace and clean local latents to be placed, so a sample that
         is clean in one modality and noisy in the other still has no usable bond.
+
+        `t_lower` defaults to `cyclization_bond_loss_t_lower` (this helper's original,
+        still most common caller); pass it explicitly for a loss with its own ramp
+        (e.g. `compute_chirality_loss`'s `chirality_loss_t_lower`).
         """
         ts = [batch["t"][dm] for dm in self.fm.data_modes if dm in batch["t"]]
         t = ts[0] if len(ts) == 1 else torch.stack(ts, dim=0).min(dim=0).values  # [b]
-        lo = self.cyclization_bond_loss_t_lower
+        lo = self.cyclization_bond_loss_t_lower if t_lower is None else t_lower
         return torch.clamp((t - lo) / max(1.0 - lo, 1e-6), min=0.0, max=1.0)
+
+    def _unroll_self_cond(self) -> bool:
+        """Whether an unrolled clean prediction should self-condition between its steps.
+
+        Defaults to the model's own `training.self_cond`: a model trained with
+        self-conditioning is fed `x_sc` by the sampler at every step, so an unroll that
+        omits it evaluates the network off the distribution it was trained on -- which
+        would trade one train/sample mismatch for another. Override explicitly with
+        `cyclization.bond_loss.unroll.self_cond` only to isolate that effect.
+        """
+        override = getattr(self, "cyclization_bond_unroll_self_cond", None)
+        if override is not None:
+            return bool(override)
+        return bool(_safe_cfg_get(self.cfg_exp.training, "self_cond", False))
 
     def compute_cyclization_bond_loss(
         self,
@@ -1343,10 +1639,52 @@ class Proteina(L.LightningModule):
         device = batch["mask"].device
         cyclization_metadata = extract_cyclization_metadata(batch)
         if cyclization_metadata is None:
-            return torch.zeros((), device=device), {}
+            return torch.zeros((), device=device), torch.zeros((), device=device), {}
 
-        binder_mask = batch["mask"]
-        x_1_pred = self.fm.nn_out_to_clean_sample_prediction(batch=batch, nn_out=nn_out)
+        work_batch = batch
+        k_steps = int(getattr(self, "cyclization_bond_unroll_steps", 1))
+        if k_steps > 1:
+            # Penalise the endpoint of a short ODE unroll rather than the one-step
+            # posterior mean -- see `_init_cyclization_bond_loss` for why the mean is the
+            # wrong object for a closure constraint.
+            #
+            # MEMORY: the unroll's gradient-carrying step builds a SECOND full network
+            # graph alongside the one the flow loss is already holding, so peak activation
+            # memory roughly doubles at `max_samples: null` -- enough to OOM a 48G a6000 at
+            # the batch size v4 trains at. `max_samples` caps how many examples the unroll
+            # runs on, which is the right knob because this is an auxiliary term already
+            # averaged over the batch: a subset only raises its gradient variance, while
+            # the flow loss keeps the full batch. Truncation (not random choice) keeps the
+            # subset rank-deterministic and reproducible.
+            from proteinfoundation.training.unrolled_prediction import unrolled_clean_prediction
+
+            max_samples = getattr(self, "cyclization_bond_unroll_max_samples", None)
+            n_keep = bs if max_samples is None else min(bs, int(max_samples))
+            nn_out_0 = nn_out
+            if n_keep < bs:
+                work_batch = _subset_batch(batch, n_keep, bs)
+                cyclization_metadata = {k: v[:n_keep] for k, v in cyclization_metadata.items()}
+                # `nn_out` was computed on the FULL batch; slicing a nested nn_out to match
+                # is more fragile than just recomputing step 0 on the subset, which runs
+                # under no_grad here anyway (grad_steps < k_steps) and so is nearly free.
+                nn_out_0 = None
+
+            x_1_pred = unrolled_clean_prediction(
+                fm=self.fm,
+                call_nn=self.call_nn,
+                batch=work_batch,
+                k_steps=k_steps,
+                grad_steps=self.cyclization_bond_unroll_grad_steps,
+                self_cond=self._unroll_self_cond(),
+                n_recycle=int(_safe_cfg_get(self.cfg_exp.training, "n_recycle", 0)),
+                nn_out_0=nn_out_0,
+            )
+            t_lower = self.cyclization_bond_unroll_t_lower
+        else:
+            x_1_pred = self.fm.nn_out_to_clean_sample_prediction(batch=batch, nn_out=nn_out)
+            t_lower = None
+        binder_mask = work_batch["mask"]
+        bs = binder_mask.shape[0]
         decoded = self.autoencoder.decode(
             z_latent=x_1_pred["local_latents"],
             ca_coors_nm=x_1_pred["bb_ca"],
@@ -1355,7 +1693,7 @@ class Proteina(L.LightningModule):
 
         decoded_mask = decoded["atom_mask"].bool() & binder_mask.bool()[..., None]
         decoded_seq = decoded["residue_type"].long()
-        t_weight = self._bond_loss_t_weight(batch)
+        t_weight = self._bond_loss_t_weight(work_batch, t_lower=t_lower)
 
         loss, metrics = cyclization_bond_loss(
             pred_atom37=decoded["coors_nm"],
@@ -1365,6 +1703,13 @@ class Proteina(L.LightningModule):
             t_weight=t_weight,
         )
 
+        # Returned UNWEIGHTED by `cyclization_geometry_weight` -- the caller applies
+        # that weight directly to `train_loss` as its own top-level term. Folding it
+        # into `loss` here and letting the caller multiply by `cyclization_bond_loss_weight`
+        # again would double-apply a weight (effective 0.05*0.05=0.0025 at the shipped
+        # defaults), making the geometry term ~20x smaller than intended and than the
+        # distance term it is supposed to complement.
+        geom_loss = torch.zeros((), device=device)
         if getattr(self, "cyclization_geometry_enabled", False):
             from proteinfoundation.cyclization.linkage_geometry import linkage_geometry_loss
 
@@ -1377,7 +1722,6 @@ class Proteina(L.LightningModule):
                 w_dihedral=self.cyclization_geometry_w_dihedral,
                 t_weight=t_weight,
             )
-            loss = loss + self.cyclization_geometry_weight * geom_loss
             metrics.update({f"geom_{k}": v for k, v in geom_metrics.items()})
 
         self.log(
@@ -1391,6 +1735,18 @@ class Proteina(L.LightningModule):
             sync_dist=True,
             add_dataloader_idx=False,
         )
+        if getattr(self, "cyclization_geometry_enabled", False):
+            self.log(
+                f"{log_prefix}/loss_cyclization_geometry",
+                geom_loss,
+                on_step=True,
+                on_epoch=True,
+                prog_bar=False,
+                logger=True,
+                batch_size=bs,
+                sync_dist=True,
+                add_dataloader_idx=False,
+            )
         for name, value in metrics.items():
             # NaN-by-design when the batch holds no supervisable bond. Log the key on
             # every rank regardless (DDP reduces over a shared key set) but with zero
@@ -1409,7 +1765,226 @@ class Proteina(L.LightningModule):
                 add_dataloader_idx=False,
             )
 
-        return loss, metrics
+        return loss, geom_loss, metrics
+
+    def compute_rollout_finetune_loss(
+        self,
+        batch: dict,
+        log_prefix: str,
+        bs: int,
+    ) -> torch.Tensor:
+        """Flat-bottom closing-bond penalty applied to a SAMPLE from the deployed sampler.
+
+        Integrates the design sampler from t=0 with gradients retained through the last
+        `grad_steps` steps (`full_simulation_draft`), decodes the endpoint, and scores it
+        with the same `cyclization_bond_loss` used on teacher-forced predictions. See
+        `_init_rollout_finetune` for why this is not redundant with the unrolled bond
+        loss: that one fixes the mean-vs-sample (Jensen) gap, this one fixes exposure
+        bias, and they are independent failures.
+
+        Returns a differentiable scalar; an exact (still differentiable) zero whenever the
+        term is skipped -- no cyclization labels, or an off-cadence optimizer step.
+
+        Logged under `{log_prefix}/rollout_*`. The metric to actually watch is
+        `rollout_window_success`: it is measured on generated structures, so unlike
+        `cyclization_bond_window_success` it cannot be high while design closure is low.
+        """
+        device = batch["mask"].device
+        zero = torch.zeros((), device=device)
+
+        # Cadence keyed off `global_step`, which is identical on every DDP rank, so all
+        # ranks either run this term or skip it. Deriving it from anything rank-local
+        # would deadlock the all-reduce.
+        if int(self.global_step) % self.rollout_ft_every_n != 0:
+            return zero
+
+        from proteinfoundation.cyclization.bond_loss import cyclization_bond_loss
+        from proteinfoundation.eval.cyclic_reconstruction_metrics import extract_cyclization_metadata
+
+        cyclization_metadata = extract_cyclization_metadata(batch)
+        if cyclization_metadata is None:
+            return zero
+
+        design = self._rollout_ft_sampler()
+        sampler_args, sampling_model_args = design.args, design.model
+        n_recycle = int(design.get("n_recycle", 0))
+        nsteps = self.rollout_ft_cfg.get("nsteps", None)
+        nsteps = int(sampler_args.nsteps if nsteps is None else nsteps)
+        self_cond = self.rollout_ft_cfg.get("self_cond", None)
+        self_cond = bool(sampler_args.self_cond if self_cond is None else self_cond)
+
+        # A rollout costs `nsteps` forwards, so it is normally run on far fewer samples
+        # than the flow loss. Truncation (not random choice) keeps the subset a pure
+        # function of the batch, so a rerun reproduces the step exactly.
+        n_keep = bs if self.rollout_ft_max_samples is None else min(bs, self.rollout_ft_max_samples)
+
+        # x_1/x_0/x_t/t/x_sc are the TRAINING interpolant. Carrying them into a rollout
+        # would leave stale ground-truth-derived state where `full_simulation_draft`
+        # expects to set its own, so drop them -- everything that remains (target coords,
+        # receptor surface, cyclization labels, conditioning) is what the sampler is
+        # legitimately allowed to see.
+        gen_batch = {
+            k: (v[:n_keep] if torch.is_tensor(v) and v.dim() >= 1 and v.shape[0] == bs else v)
+            for k, v in batch.items()
+            if k not in ("x_1", "x_0", "x_t", "t", "x_sc", "x_recycle")
+        }
+        gen_mask = batch["mask"][:n_keep].bool()
+        gen_batch["mask"] = gen_mask
+        n_samples, n = gen_mask.shape
+        cyclization_metadata = {k: v[:n_keep] for k, v in cyclization_metadata.items()}
+
+        self.apply_cyclization_type_conditioning(gen_batch, bs=n_samples)
+
+        gen_samples = self.fm.full_simulation_draft(
+            batch=gen_batch,
+            predict_for_sampling=partial(self.predict_for_sampling, n_recycle=n_recycle),
+            nsteps=nsteps,
+            nsamples=n_samples,
+            n=n,
+            self_cond=self_cond,
+            sampling_model_args=sampling_model_args,
+            device=device,
+            grad_steps=self.rollout_ft_grad_steps,
+            guidance_w=float(sampler_args.get("guidance_w", 1.0)),
+            # Autoguidance needs a second ("bad model") checkpoint that training has no
+            # way to load, and is off in `validation_step_generate` for the same reason.
+            ag_ratio=0.0,
+        )
+
+        # Decoded here rather than through `sample_formatting` because this decode must
+        # carry gradient, and because `sample_formatting` returns ANGSTROM while
+        # `cyclization_bond_loss` (like the rest of the training path) works in nm.
+        decoded = self.autoencoder.decode(
+            z_latent=gen_samples["local_latents"],
+            ca_coors_nm=gen_samples["bb_ca"],
+            mask=gen_mask,
+        )
+        decoded_mask = decoded["atom_mask"].bool() & gen_mask[..., None]
+
+        # No `t_weight`: the ramp exists to suppress a clean-structure prediction made
+        # from noise, and a completed rollout is not that -- it is a finished sample, so
+        # every labelled example in it is fully supervisable.
+        loss, metrics = cyclization_bond_loss(
+            pred_atom37=decoded["coors_nm"],
+            atom37_mask=decoded_mask,
+            seq_tokens=decoded["residue_type"].long(),
+            cyclization_metadata=cyclization_metadata,
+            t_weight=None,
+        )
+
+        if self.rollout_ft_geometry:
+            from proteinfoundation.cyclization.linkage_geometry import linkage_geometry_loss
+
+            geom_loss, geom_metrics = linkage_geometry_loss(
+                pred_atom37=decoded["coors_nm"],
+                atom37_mask=decoded_mask,
+                seq_tokens=decoded["residue_type"].long(),
+                cyclization_metadata=cyclization_metadata,
+                w_angle=self.cyclization_geometry_w_angle,
+                w_dihedral=self.cyclization_geometry_w_dihedral,
+                t_weight=None,
+            )
+            # Folded in at the geometry term's own relative weight, then the caller
+            # applies `rollout_ft_weight` to the sum -- so the distance:geometry ratio
+            # inside the rollout term matches the one in the teacher-forced term.
+            loss = loss + (self.cyclization_geometry_weight / max(self.cyclization_bond_loss_weight, 1e-8)) * geom_loss
+            metrics.update({f"geom_{k}": v for k, v in geom_metrics.items()})
+
+        self.log(
+            f"{log_prefix}/loss_rollout_finetune",
+            loss,
+            on_step=True,
+            on_epoch=True,
+            prog_bar=False,
+            logger=True,
+            batch_size=n_samples,
+            sync_dist=True,
+            add_dataloader_idx=False,
+        )
+        for name, value in metrics.items():
+            v = float(value)
+            is_nan = math.isnan(v)
+            self.log(
+                f"{log_prefix}/rollout_{name}",
+                0.0 if is_nan else v,
+                on_step=True,
+                on_epoch=True,
+                prog_bar=False,
+                logger=True,
+                batch_size=0 if is_nan else n_samples,
+                sync_dist=True,
+                add_dataloader_idx=False,
+            )
+        return loss
+
+    def compute_chirality_loss(
+        self,
+        batch: dict,
+        nn_out: dict,
+        log_prefix: str,
+        bs: int,
+    ) -> torch.Tensor:
+        """Computes the differentiable D-amino-acid penalty for one training batch.
+
+        Unlike `compute_cyclization_bond_loss`, this needs no cyclization label
+        (chirality is a per-residue property of every binder residue, not just
+        linkage atoms) -- it is a safe no-op (zero loss) only when the batch
+        lacks `local_latents`/the autoencoder, not when cyclization is absent.
+
+        Runs **with gradients**, same reasoning as `compute_cyclization_bond_loss`:
+        the point is for the penalty to reach the flow model's predicted latents
+        and Ca trace, and the frozen autoencoder still passes gradient through to
+        its inputs.
+        """
+        from proteinfoundation.cyclization.chirality_loss import chirality_loss
+
+        binder_mask = batch["mask"]
+        x_1_pred = self.fm.nn_out_to_clean_sample_prediction(batch=batch, nn_out=nn_out)
+        decoded = self.autoencoder.decode(
+            z_latent=x_1_pred["local_latents"],
+            ca_coors_nm=x_1_pred["bb_ca"],
+            mask=binder_mask,
+        )
+        decoded_mask = decoded["atom_mask"].bool() & binder_mask.bool()[..., None]
+        t_weight = self._bond_loss_t_weight(batch, t_lower=self.chirality_loss_t_lower)
+
+        loss, metrics = chirality_loss(
+            pred_atom37=decoded["coors_nm"],
+            atom37_mask=decoded_mask,
+            binder_mask=binder_mask,
+            t_weight=t_weight,
+            margin=self.chirality_loss_margin,
+        )
+
+        self.log(
+            f"{log_prefix}/loss_chirality",
+            loss,
+            on_step=True,
+            on_epoch=True,
+            prog_bar=False,
+            logger=True,
+            batch_size=bs,
+            sync_dist=True,
+            add_dataloader_idx=False,
+        )
+        for name, value in metrics.items():
+            # NaN-by-design when nothing in the batch is checkable. Log the key on
+            # every rank regardless (DDP reduces over a shared key set) but with zero
+            # weight, so one inapplicable batch cannot poison the epoch mean.
+            v = float(value)
+            is_nan = math.isnan(v)
+            self.log(
+                f"{log_prefix}/chirality_{name}",
+                0.0 if is_nan else v,
+                on_step=True,
+                on_epoch=True,
+                prog_bar=False,
+                logger=True,
+                batch_size=0 if is_nan else bs,
+                sync_dist=True,
+                add_dataloader_idx=False,
+            )
+        return loss
 
     @torch.no_grad()
     def log_unified_validation_metrics(
@@ -1846,6 +2421,31 @@ class Proteina(L.LightningModule):
                 metrics[f"val_gen/cyc/{s}"] = 0.0 if s in CYCLIC_COUNT_SUFFIXES else float("nan")
             metrics["val_gen/cyc/type_satisfied"] = float("nan")
 
+        # Rosetta sidecar: dump a capped sample of complexes to disk so a SEPARATE CPU job can score
+        # interface dG offline (see eval/val_gen_dump.py). OFF unless `val_generation.rosetta_dump_dir`
+        # is set. dG never runs on this GPU path -- it would stall training for minutes per batch.
+        dump_dir = vg.get("rosetta_dump_dir", None)
+        if dump_dir:
+            from proteinfoundation.eval.val_gen_dump import dump_val_gen_complexes
+
+            cyc_i = cyc.get("pred_cyclization_i") if "pred_cyclization_i" in cyc else None
+            dump_val_gen_complexes(
+                out_dir=dump_dir,
+                step=int(self.global_step),
+                epoch=int(self.current_epoch),
+                coors_nm=coors,
+                aatype=aatype,
+                mask=gen_mask,
+                x_target=gen_batch.get("x_target"),
+                seq_target=gen_batch.get("seq_target"),
+                target_mask=gen_batch.get("target_mask"),
+                cyc_i=cyc_i,
+                cyc_j=cyc.get("pred_cyclization_j") if cyc_i is not None else None,
+                cyc_type=cyc.get("pred_cyclization_type") if cyc_i is not None else None,
+                rank=int(self.global_rank),
+                max_samples=int(vg.get("rosetta_dump_max", 8)),
+            )
+
         # NaN (not 0) for inapplicable metrics -- e.g. isopeptide closure in a batch with no
         # isopeptides. 0 would read as "nothing closes", which is a different claim from "not
         # measurable here". `log_nan_safe` aggregates over the epoch while skipping the NaNs, and
@@ -1920,6 +2520,63 @@ class Proteina(L.LightningModule):
         # structural metrics every val epoch) and currently under rework for
         # the new group-based collation.  Training loss validation still runs.
         # self.on_validation_epoch_end_lens()
+        self._rosetta_sidecar_epoch_end()
+
+    def _rosetta_sidecar_epoch_end(self):
+        """Backfill sidecar dG into this wandb run and (re)submit it every N validations.
+
+        Rank-0 only, and only when `val_generation.rosetta_dump_dir` is set. The training process is
+        the sole wandb writer (the CPU sidecar only writes JSONL), and the submit is guarded so at
+        most one sidecar is ever in flight. All best-effort: a failure here never breaks validation.
+        """
+        vg = self.val_gen_cfg
+        if not vg:
+            return
+        dump_dir = vg.get("rosetta_dump_dir", None)
+        if not dump_dir or int(self.global_rank) != 0:
+            return
+
+        from proteinfoundation.eval.val_gen_dump import (
+            log_rosetta_dg_to_wandb,
+            maybe_submit_rosetta_sidecar,
+        )
+
+        # dG rows land next to the dump unless the config names another path (keep them in step with
+        # the dir the sidecar is told to read).
+        out_jsonl = vg.get("rosetta_out_jsonl", None) or os.path.join(dump_dir, "val_gen_dg.jsonl")
+
+        # Log any settled dG rows the sidecar has produced so far into the SAME run.
+        wandb_run = getattr(getattr(self, "logger", None), "experiment", None)
+        if not hasattr(self, "_rosetta_logged_steps"):
+            self._rosetta_logged_steps = set()
+        try:
+            log_rosetta_dg_to_wandb(out_jsonl, wandb_run, self._rosetta_logged_steps)
+        except Exception:
+            pass  # never let logging break validation.
+
+        # Every N validations, submit a fresh (resumable) sidecar unless one is already running.
+        every_n = int(vg.get("rosetta_auto_submit_every_n_vals", 0))
+        if every_n <= 0:
+            return
+        self._rosetta_val_count = getattr(self, "_rosetta_val_count", 0) + 1
+        if self._rosetta_val_count % every_n != 0:
+            return
+        # Per-run job name so concurrent runs each own their sidecar (a shared name would let one
+        # run's squeue guard block every other run's submit).
+        run_name = str(getattr(self.cfg_exp, "run_name", "") or "run")
+        job_name = vg.get("rosetta_job_name", None) or (
+            "vgros_" + re.sub(r"[^A-Za-z0-9_]", "_", run_name)[:40]
+        )
+        try:
+            maybe_submit_rosetta_sidecar(
+                dump_dir=dump_dir,
+                out_jsonl=out_jsonl,
+                repo_dir=os.environ.get("SLURM_SUBMIT_DIR", os.getcwd()),
+                max_per_step=int(vg.get("rosetta_dump_max", 8)),
+                job_name=job_name,
+            )
+        except Exception:
+            pass  # submit is best-effort; the manual submitter is always available as a fallback.
 
     def on_validation_epoch_end_data(self):
         self.validation_output_data = []

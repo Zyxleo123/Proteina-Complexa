@@ -1,0 +1,34 @@
+# @package _global_
+# Receptor-pocket surface experiment -- non-circular counterpart to
+# training_cpsea_peptide_surface_oracle.yaml.
+#
+# That "oracle" arm conditions on the GROUND-TRUTH PEPTIDE's own interface surface, which
+# is close to leaking the answer (the receptor is already given separately via x_target,
+# so telling the model roughly where its own surface should sit is barely new information).
+# This arm conditions on the RECEPTOR pocket's surface facing the peptide instead -- the
+# shape of the site the binder needs to fit into, which x_target's atom coordinates do not
+# supply. Everything else (architecture, cyclization recipe, loss weights, schedule) is
+# copied verbatim from the oracle config so the surface-source swap is the only variable.
+#
+# Requires precomputed RECEPTOR caches (a SEPARATE extraction pass from the peptide-surface
+# ones -- see scripts/slurm/extract_receptor_surfaces.sbatch):
+#   python scripts/extract_peptide_surfaces.py --role receptor --dataset-config ... \
+#     --output-dir $CPSEA_RECEPTOR_SURFACE_DIR
+#
+# Decision gate: same as the oracle arm's (val_gen/iface/*, val_gen/place/ca_rmsd_nm), plus
+# a direct oracle-vs-receptor comparison on those metrics to see whether receptor-shape
+# conditioning helps, hurts, or is a wash relative to the (answer-adjacent) peptide-shape
+# conditioning it replaces.
+#
+# To also turn on the Cβ-attraction auxiliary loss (compute_surface_attraction_loss) instead
+# of only the cross-attention conditioning tested here, add a `surface_loss: {enabled: true,
+# loss_weight: ..., t_lower_lim: ...}` block as training_cpsea_peptide_surface_levers.yaml
+# does -- pulling toward the RECEPTOR pocket surface is now a meaningful "sit in the pocket"
+# signal, unlike pulling toward the peptide's own (circular) surface.
+
+defaults:
+  - training_cpsea_peptide_surface_oracle
+  - override /dataset/unified: cpsea_peptide_surface_receptor
+  - _self_
+
+run_name: cpsea_peptide_surface_receptor_oracle

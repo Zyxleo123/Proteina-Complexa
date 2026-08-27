@@ -75,9 +75,16 @@ NUM_SHARDS="${NUM_SHARDS:-1}"
 SMOKE="${SMOKE:-false}"
 SEARCH="${SEARCH:-single-pass}"
 
+# Parse the targets YAML with the repo venv, NOT whatever `python` the caller's shell resolves to
+# (a base conda env lacks `pyyaml` -> "No module named 'yaml'" -> 0 targets selected -> the shard
+# error). Overridable via PYTHON_EXEC.
+PY="${PYTHON_EXEC:-${REPO}/.venv/bin/python}"
+[[ -x "$PY" ]] || { echo "ERROR: python not found at $PY (set PYTHON_EXEC)"; exit 1; }
+"$PY" -c "import yaml" 2>/dev/null || { echo "ERROR: $PY lacks pyyaml; set PYTHON_EXEC to an interpreter that has it"; exit 1; }
+
 # Read target names straight from the generated file, so this can never drift from the set
 # that was actually selected and appended to targets_dict.yaml.
-mapfile -t ALL_TARGETS < <(python - "$TARGETS_YAML" <<'PY'
+mapfile -t ALL_TARGETS < <("$PY" - "$TARGETS_YAML" <<'PY'
 import sys, yaml
 d = yaml.safe_load(open(sys.argv[1]))["target_dict_cfg"]
 # Sort by chemistry then name so shards stay balanced across linkage types: a shard that
@@ -89,7 +96,7 @@ PY
 
 if [[ "${SMOKE}" == "true" ]]; then
   # One target per chemistry, so a smoke run still exercises all three code paths.
-  mapfile -t ALL_TARGETS < <(python - "$TARGETS_YAML" <<'PY'
+  mapfile -t ALL_TARGETS < <("$PY" - "$TARGETS_YAML" <<'PY'
 import sys, yaml
 d = yaml.safe_load(open(sys.argv[1]))["target_dict_cfg"]
 seen = {}

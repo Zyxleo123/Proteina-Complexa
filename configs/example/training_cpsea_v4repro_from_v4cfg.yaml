@@ -1,0 +1,437 @@
+# @package _global_
+# V4 BASELINE, as a config file. This is `cpsea_cyc_ringpe_bond_v4`'s resolved config with
+# NOTHING added -- byte-identical to training_cpsea_bondunroll_from_v4cfg.yaml minus the
+# `cyclization.bond_loss.unroll` block, which is the only key the two runs ever differed by.
+#
+# VERIFIED, not asserted: diffing the two stored resolved configs
+#   store/cpsea_cyc_ringpe_bond_v4/checkpoints/exp_config_cpsea_cyc_ringpe_bond_v4.json
+#   store/cpsea_bondunroll_from_v4cfg/checkpoints/exp_config_cpsea_bondunroll_from_v4cfg.json
+# yields exactly: the five `cyclization.bond_loss.unroll.*` keys, `run_name`, and
+# `autoencoder_ckpt_path` -- the last a path difference only (v4 pointed at a COPY of the
+# pinned AE inside its own store dir; same size, same mtime, same file). This config uses
+# ${oc.env:CPSEA_AE_CKPT_PATH}, the pinned original, so the AE cannot drift.
+#
+# WHY THIS EXISTS. The five-arm ablation ran one seed per arm, so arm C's disulfide
+# +0.117 (z = +3.1) has no run-to-run variance to be measured against. Re-running arm C
+# alone at a second seed would only bound C's OWN spread -- it cannot tell you whether the
+# gap to v4 survives, because v4's spread is equally unknown. The replicate has to be
+# PAIRED: this arm and the unroll arm, both at seed 43, submitted together.
+#
+# READ THE RESULT LIKE THIS. Let d42 = 0.117 (measured) and d43 = C@43 - v4@43. If d43
+# lands near d42 the effect replicates and the ablation's headline stands. If d43 is near
+# zero, +0.117 was seed noise and the Jensen-gap story loses its only direct evidence
+# (the chemistry ORDERING would still stand, since it was predicted in advance). If the
+# two disagree in sign, seed variance dominates the effect and no number of extra arms at
+# one seed each will be interpretable -- which is itself the finding.
+#
+# Everything else -- pinned AE, dataset, lr, effective batch 128 (16 x 8), distance-only
+# bond loss, ring PE, type conditioning, geometry loss OFF -- is untouched.
+#
+# Run (submit BOTH; they are one experiment). PARTITION/TIME are set to reproduce the
+# original arms' conditions -- 1 x a6000, 48 h wall on `general` -- rather than the
+# submitter's preempt/7-day default, because a replicate that trains for a different
+# length is not a replicate:
+#   CONFIG_NAME=example/training_cpsea_v4repro_from_v4cfg \
+#     RUN_NAME=cpsea_v4repro_seed43 EXTRA_OVERRIDES="++seed=43" \
+#     PARTITION=general QOS=qos_general TIME=2-00:00:00 \
+#     bash scripts/submit_replay_ablation_train.sh
+#
+#   CONFIG_NAME=example/training_cpsea_bondunroll_from_v4cfg \
+#     RUN_NAME=cpsea_bondunroll_seed43 EXTRA_OVERRIDES="++seed=43" \
+#     PARTITION=general QOS=qos_general TIME=2-00:00:00 \
+#     bash scripts/submit_replay_ablation_train.sh
+
+ae_reg_weight: 1.0
+autoencoder_ckpt_path: ${oc.env:CPSEA_AE_CKPT_PATH}
+cyclization:
+  allow_asn_gln_isopeptide: true
+  bond_loss:
+    enabled: true
+    loss_weight: 0.05
+    t_lower_lim: 0.5
+  detach_link_inputs: true
+  enabled: true
+  force_gold_valid: true
+  hidden_dim: 256
+  loss_weight: 0.1
+  target_type: null
+  terminal_only: true
+  type_conditioning: true
+dataset:
+  datamodule:
+    batch_size: 16
+    num_workers: 8
+  unified:
+    datamodule:
+      _target_: proteinfoundation.datasets.structure_data.StructureDataModule
+      atom37_transforms:
+      - _target_: proteinfoundation.datasets.transforms.SegmentAwareResidueFeaturesTransform
+        cn_break_cutoff: 2.0
+        segment_fix_level: full
+      - _target_: proteinfoundation.datasets.transforms.CoordsToNanometers
+      - _target_: proteinfoundation.datasets.transforms.GlobalRotationTransform
+      - _target_: proteinfoundation.datasets.transforms.CroppingTransform2
+        binder_max_length: 16
+        binder_min_length: 5
+        binder_padding_length: 0
+        crop_binder: false
+        crop_size: 256
+        data_mode: all-atom
+        dist_mode: bb_ca
+        interface_threshold: 8.0
+        max_num_target_chains: -1
+        target_min_length: 30
+        target_spatial_crop_threshold: 15.0
+      - _target_: proteinfoundation.datasets.transforms.ContactTransform
+        contact_dropout_prob: 0.5
+        contact_prob: 1.0
+        cutoff: 8.0
+        hotspot_dropout_prob: 0.5
+        max_perc: 0.2
+        min_perc: 0.0
+      - _target_: proteinfoundation.datasets.transforms.OpenFoldFrameTransform
+      - _target_: proteinfoundation.datasets.transforms.ChainBreakPerResidueTransform
+      - _target_: proteinfoundation.datasets.transforms.CenteringTransform
+        center_mode: target
+        data_mode: all-atom
+      - _target_: proteinfoundation.datasets.transforms.ExtractTargetCoordinatesTransform
+        compact_mode: true
+      - _target_: proteinfoundation.datasets.transforms.FilterTargetResiduesTransform
+      - _target_: proteinfoundation.datasets.transforms.CyclizationLabelTransform
+        default_binder_chain_id: B
+      base_dir: ''
+      batch_size: 6
+      columns_to_load:
+      - example_id
+      - path
+      - binder_chain_id
+      - cluster_id
+      - peptide_length
+      - cyclization_type
+      id_column: example_id
+      metadata_file: /zfsauton/scratch/yixiz/CPSea/CPSea_full/CPSea/preprocessed/metadata/cpsea_train.parquet
+      num_workers: 8
+      path_column: path
+      pin_memory: true
+      use_parse: false
+      val_metadata_file: /zfsauton/scratch/yixiz/CPSea/CPSea_full/CPSea/preprocessed/metadata/cpsea_val.parquet
+ema:
+  cpu_offload: false
+  decay: 0.999
+  every_n_steps: 1
+  validate_original_weights: false
+force_precision_f32: true
+freeze_autoencoder: true
+generation:
+  args:
+    ag_ckpt_path: null
+    ag_ratio: 0.0
+    fold_cond: false
+    guidance_w: 1.0
+    nsteps: 200
+    self_cond: false
+  dataloader:
+    _target_: torch.utils.data.DataLoader
+    batch_size: 5
+    collate_fn:
+      _partial_: true
+      _target_: proteinfoundation.datasets.gen_dataset.collate_fn
+      padding_values:
+        chains: -1
+        target_chains: -1
+    dataset:
+      _target_: proteinfoundation.datasets.gen_dataset.GenDataset
+      conditional_features: null
+      nrepeat_per_sample: 20
+      nres:
+      - 50
+      - 100
+      task_name: null
+      transforms: null
+    shuffle: false
+  metric:
+    compute_designability: false
+    compute_novelty_afdb: false
+    compute_novelty_pdb: false
+  model:
+    ode:
+      bb_ca:
+        gt:
+          clamp_val: null
+          mode: tan
+          p: 1.0
+        schedule:
+          mode: uniform
+          p: 1.0
+        simulation_step_params:
+          center_every_step: true
+          sampling_mode: vf
+          sc_scale_noise: 0.0
+          sc_scale_score: 0.0
+          t_lim_ode: 0.98
+          t_lim_ode_below: 0.02
+      local_latents:
+        gt:
+          clamp_val: null
+          mode: tan
+          p: 1.0
+        schedule:
+          mode: uniform
+          p: 1.0
+        simulation_step_params:
+          center_every_step: false
+          sampling_mode: vf
+          sc_scale_noise: 0.0
+          sc_scale_score: 0.0
+          t_lim_ode: 0.98
+          t_lim_ode_below: 0.02
+    temp_035_all:
+      bb_ca:
+        gt:
+          clamp_val: null
+          mode: tan
+          p: 1.0
+        schedule:
+          mode: uniform
+          p: 1.0
+        simulation_step_params:
+          center_every_step: true
+          sampling_mode: sc
+          sc_scale_noise: 0.35
+          sc_scale_score: 1.0
+          t_lim_ode: 0.98
+          t_lim_ode_below: 0.02
+      local_latents:
+        gt:
+          clamp_val: null
+          mode: tan
+          p: 1.0
+        schedule:
+          mode: uniform
+          p: 1.0
+        simulation_step_params:
+          center_every_step: false
+          sampling_mode: sc
+          sc_scale_noise: 0.35
+          sc_scale_score: 1.0
+          t_lim_ode: 0.98
+          t_lim_ode_below: 0.02
+    temp_035_only_ca:
+      bb_ca:
+        gt:
+          clamp_val: null
+          mode: tan
+          p: 1.0
+        schedule:
+          mode: uniform
+          p: 1.0
+        simulation_step_params:
+          center_every_step: true
+          sampling_mode: sc
+          sc_scale_noise: 0.35
+          sc_scale_score: 1.0
+          t_lim_ode: 0.98
+          t_lim_ode_below: 0.02
+      local_latents:
+        gt:
+          clamp_val: null
+          mode: tan
+          p: 1.0
+        schedule:
+          mode: uniform
+          p: 1.0
+        simulation_step_params:
+          center_every_step: false
+          sampling_mode: vf
+          sc_scale_noise: 0.0
+          sc_scale_score: 0.0
+          t_lim_ode: 0.98
+          t_lim_ode_below: 0.02
+hardware:
+  accelerator: gpu
+  ncpus_per_task_prepro_: 4
+  ncpus_per_task_train_: 8
+  ngpus_per_node_: 1
+  nnodes_: 1
+log:
+  checkpoint: true
+  checkpoint_every_n_steps: null
+  last_ckpt_every_n_steps: 1500
+  log_every_n_steps: 1
+  log_wandb: true
+  save_extra_checkpoints: false
+  wandb_entity: null
+  wandb_project: cpsea_cyclization
+lora:
+  lora_alpha: 32.0
+  lora_dropout: 0.0
+  r: null
+  train_bias: none
+loss:
+  t_distribution:
+    bb_ca:
+      loss_t_clamp: 1.0
+      name: mix_unif_beta
+      p1: 1.9
+      p2: 1.0
+      p3: 0.02
+    local_latents:
+      name: uniform
+      p1: 1.0
+      p2: 1.0
+    shared_groups: []
+nn:
+  concat_features:
+    enable_ligand: false
+    enable_motif: false
+    enable_target: true
+    ligand_pair_features: false
+    motif_pair_features: false
+    target_pair_features: true
+  cyc_emb_dim: 256
+  dim_cond: 256
+  feats_cond_seq:
+  - time_emb_bb_ca
+  - time_emb_local_latents
+  - cyclization_type_emb
+  feats_pair_cond:
+  - time_emb_bb_ca
+  - time_emb_local_latents
+  feats_pair_repr:
+  - rel_seq_sep
+  - xt_bb_ca_pair_dists
+  - x_sc_bb_ca_pair_dists
+  - optional_ca_pair_dist
+  - chain_idx_pair
+  - hotspot_mask_pair
+  - cyclization_ring_pe
+  feats_seq:
+  - xt_bb_ca
+  - xt_local_latents
+  - x_sc_bb_ca
+  - x_sc_local_latents
+  - optional_ca_coors_nm_seq_feat
+  - optional_res_type_seq_feat
+  - hotspot_mask_seq
+  - res_seq_pdb_idx
+  idx_emb_dim: 256
+  name: local_latents_transformer
+  nheads: 12
+  nlayers: 14
+  output_parameterization:
+    bb_ca: v
+    local_latents: v
+  pair_repr_dim: 256
+  parallel_mha_transition: false
+  ring_sep_dim: 32
+  seq_sep_dim: 127
+  strict_feats: false
+  t_emb_dim: 256
+  token_dim: 768
+  update_pair_repr: false
+  update_pair_repr_every_n: 3
+  use_qkln: true
+  use_tri_mult: false
+  x_sc_pair_dist_dim: 30
+  x_sc_pair_dist_max: 3
+  x_sc_pair_dist_min: 0.1
+  xt_pair_dist_dim: 30
+  xt_pair_dist_max: 3
+  xt_pair_dist_min: 0.1
+opt:
+  accumulate_grad_batches: 8
+  dist_strategy: auto
+  grad_and_weight_analysis: false
+  limit_train_batches: null
+  lr: 0.0001
+  max_epochs: 10000000
+  skip_nan_grad: true
+  val_check_interval: 5000
+  warmup_steps: 500
+pretrain_ckpt_path: /zfsauton/scratch/yixiz/Proteina-Complexa/ckpts/complexa.ckpt
+product_flowmatcher:
+  bb_ca:
+    dim: 3
+    guidance_enabled: true
+    zero_com_noise: false
+  local_latents:
+    dim: null
+    guidance_enabled: true
+    zero_com_noise: false
+run_name: cpsea_v4repro_from_v4cfg
+seed: 42
+show_prog_bar: true
+training:
+  cyclization_type_dropout_rate: 0.15
+  fold_cond: false
+  fold_label_sample_ratio:
+  - 0.5
+  - 0.1
+  - 0.15
+  - 0.25
+  mask_A_prob: 0.5
+  mask_C_prob: 0.5
+  mask_T_prob: 0.5
+  motif_conditioning: false
+  n_recycle: 0
+  p_folding_n_inv_folding_iters: 0.15
+  self_cond: true
+  target_cond: false
+val_generation:
+  design_sampling:
+    args:
+      ag_ckpt_path: null
+      ag_ratio: 0.0
+      fold_cond: false
+      guidance_w: 1.0
+      nsteps: 400
+      save_trajectory_every: 0
+      self_cond: true
+    model:
+      bb_ca:
+        gt:
+          clamp_val: null
+          mode: 1/t
+          p: 1.0
+        schedule:
+          mode: log
+          p: 2.0
+        simulation_step_params:
+          center_every_step: false
+          sampling_mode: sc
+          sc_scale_noise: 0.1
+          sc_scale_score: 1.0
+          t_lim_ode: 0.98
+          t_lim_ode_below: 0.02
+          tsr_k: 1.0
+          tsr_sigma: 1.0
+      local_latents:
+        gt:
+          clamp_val: null
+          mode: tan
+          p: 1.0
+        schedule:
+          mode: power
+          p: 2.0
+        simulation_step_params:
+          center_every_step: false
+          sampling_mode: sc
+          sc_scale_noise: 0.1
+          sc_scale_score: 1.0
+          t_lim_ode: 0.98
+          t_lim_ode_below: 0.02
+          tsr_k: 1.0
+          tsr_sigma: 1.0
+    n_recycle: 0
+  enabled: true
+  # Rosetta interface-dG sidecar (CPU, off the GPU path). The training job dumps a capped
+  # sample of complexes here and (rank-0) resubmits scripts/submit_val_gen_rosetta.sh every
+  # N validations, guarded so at most one runs per run_name; dG is logged back into THIS
+  # wandb run as val_gen_rosetta/* by the training process (sole writer). See eval/val_gen_dump.py.
+  rosetta_dump_dir: store/${run_name}/val_gen_rosetta_dump
+  rosetta_auto_submit_every_n_vals: 1
+  rosetta_dump_max: 8
+  n_batches: 2
+  n_repeat: 4
+  nsteps: null
+  self_cond: null

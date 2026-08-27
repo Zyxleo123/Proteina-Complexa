@@ -870,6 +870,114 @@ class ProductSpaceFlowMatcher(L.LightningModule):
 
             return x
 
+    def full_simulation_draft(
+        self,
+        batch: dict,
+        predict_for_sampling: Callable,
+        nsteps: int,
+        nsamples: int,
+        n: int,
+        self_cond: bool,
+        sampling_model_args: dict[str, dict],
+        device: torch.device,
+        grad_steps: int = 1,
+        guidance_w: float = 1.0,
+        ag_ratio: float = 0.0,
+    ) -> dict[str, Tensor]:
+        r"""Full t=0 -> t=1 rollout that keeps gradients through the LAST `grad_steps` steps.
+
+        This is `full_simulation` with a hole cut in its `no_grad`: identical schedule,
+        identical `simulation_step`, identical noise -- so what comes out is a sample from
+        the sampler that will actually be deployed, not from a training-time surrogate --
+        but the tail carries an autograd graph, so a loss defined on the FINAL sample can
+        reach the weights. That is truncated backprop through the sampler, i.e. DRaFT-K
+        (Clark et al., 2023); the alternative of differentiating all `nsteps` is both
+        intractable in memory and, empirically, no better.
+
+        Why the tail and not the head: the gradient of a terminal reward w.r.t. an early
+        step is exactly the pathology this is meant to fix -- it is mediated by the whole
+        remaining trajectory and is what makes naive backprop-through-sampling unstable.
+        Truncating is a biased estimator of the true policy gradient and is chosen with
+        that known: the bias buys a variance reduction large enough to be usable. Use
+        adjoint matching instead if the bias ever proves to matter.
+
+        Args:
+            grad_steps: number of FINAL steps to differentiate through, clamped to
+                `[1, nsteps]`. Each one keeps a full forward's activations alive, so this
+                is the memory knob; 1-2 is the usual setting.
+            (everything else): as `full_simulation`.
+
+        Returns:
+            `{data_mode: Tensor}` final sample, differentiable w.r.t. the model
+            parameters through the last `grad_steps` network evaluations.
+        """
+        if "mask" in batch and batch["mask"] is not None:
+            mask = batch["mask"]
+        else:
+            mask = torch.ones(nsamples, n).long().bool().to(device)
+        assert mask.shape == (nsamples, n)
+
+        nsteps = int(nsteps)
+        grad_steps = max(1, min(int(grad_steps), nsteps))
+        first_grad_step = nsteps - grad_steps
+
+        # Schedule built the way `full_simulation` builds it, NOT via `sample_schedule`:
+        # the latter always uses `get_schedule`, while `full_simulation` switches to
+        # `get_schedule_tsr_safe` under `vf_tsr`. A rollout that trains on a different time
+        # grid than the deployed sampler defeats the entire point of rolling out.
+        ts = {}
+        for data_mode in self.data_modes:
+            if sampling_model_args[data_mode]["simulation_step_params"]["sampling_mode"] == "vf_tsr":
+                schedule_func = get_schedule_tsr_safe
+            else:
+                schedule_func = get_schedule
+            ts[data_mode] = schedule_func(
+                mode=sampling_model_args[data_mode]["schedule"]["mode"],
+                nsteps=nsteps,
+                p1=sampling_model_args[data_mode]["schedule"]["p"],
+            )
+        gt = {
+            data_mode: get_gt(
+                t=ts[data_mode][:-1],
+                mode=sampling_model_args[data_mode]["gt"]["mode"],
+                param=sampling_model_args[data_mode]["gt"]["p"],
+                clamp_val=sampling_model_args[data_mode]["gt"]["clamp_val"],
+            )
+            for data_mode in self.data_modes
+        }
+        simulation_step_params = {
+            data_mode: sampling_model_args[data_mode]["simulation_step_params"] for data_mode in self.data_modes
+        }
+
+        with torch.no_grad():
+            x = self.sample_noise(n, shape=(nsamples,), device=device, mask=mask)
+
+        common = dict(
+            batch=batch,
+            mask=mask,
+            predict_for_sampling=predict_for_sampling,
+            self_cond=self_cond,
+            ts=ts,
+            gt=gt,
+            simulation_step_params=simulation_step_params,
+            device=device,
+            guidance_w=guidance_w,
+            ag_ratio=ag_ratio,
+        )
+
+        x_1_pred = None
+        if first_grad_step > 0:
+            x, x_1_pred = self.partial_simulation(
+                x=x, x_1_pred=x_1_pred, start_step=0, end_step=first_grad_step, grad_enabled=False, **common
+            )
+            # Belt and braces: these were produced under no_grad and so are already leaves.
+            x = {dm: v.detach() for dm, v in x.items()}
+
+        x, _ = self.partial_simulation(
+            x=x, x_1_pred=x_1_pred, start_step=first_grad_step, end_step=nsteps, grad_enabled=True, **common
+        )
+        return x
+
     def sample_schedule(self, nsteps: int, sampling_model_args: dict[str, dict]) -> dict[str, Float[Tensor, "nsteps"]]:
         """
         Samples t for each data mode. Can use different distributions for each mode,
@@ -895,7 +1003,6 @@ class ProductSpaceFlowMatcher(L.LightningModule):
         }
         return ts, gt
 
-    @torch.no_grad()
     def partial_simulation(
         self,
         batch: dict,
@@ -912,6 +1019,7 @@ class ProductSpaceFlowMatcher(L.LightningModule):
         device: torch.device,
         guidance_w: float = 1.0,
         ag_ratio: float = 0.0,
+        grad_enabled: bool = False,
     ) -> dict[str, Tensor]:
         """
         Generates samples by simulating the
@@ -938,6 +1046,13 @@ class ProductSpaceFlowMatcher(L.LightningModule):
             device (torch.device): Device to run simulation on
             guidance_w (float): Guidance weight
             ag_ratio (float): Autoguidance ratio
+            grad_enabled (bool): Build an autograd graph through these steps. Default
+                False, which reproduces the `@torch.no_grad()` this used to carry, so
+                every inference caller (beam search, FK steering, MCTS) is unchanged.
+                Set True only for truncated-backprop rollout training (DRaFT-K), where
+                a reward defined on the FINAL sample must reach the weights: activations
+                for `end_step - start_step` network evaluations are then kept alive, so
+                keep that window short.
 
         Returns:
             Tuple of (x, x_1_pred):
@@ -946,6 +1061,46 @@ class ProductSpaceFlowMatcher(L.LightningModule):
         """
         nsamples = mask.shape[0]
 
+        # `grad_enabled and torch.is_grad_enabled()`: an enclosing no_grad always wins,
+        # so asking for gradients inside `validation_step` cannot silently allocate a graph.
+        with torch.set_grad_enabled(grad_enabled and torch.is_grad_enabled()):
+            return self._simulation_loop(
+                batch=batch,
+                x=x,
+                x_1_pred=x_1_pred,
+                mask=mask,
+                nsamples=nsamples,
+                predict_for_sampling=predict_for_sampling,
+                start_step=start_step,
+                end_step=end_step,
+                self_cond=self_cond,
+                ts=ts,
+                gt=gt,
+                simulation_step_params=simulation_step_params,
+                device=device,
+                guidance_w=guidance_w,
+                ag_ratio=ag_ratio,
+            )
+
+    def _simulation_loop(
+        self,
+        batch: dict,
+        x: dict[str, Tensor],
+        x_1_pred: dict[str, Tensor],
+        mask: Bool[Tensor, "nsamples n"],
+        nsamples: int,
+        predict_for_sampling: Callable,
+        start_step: int,
+        end_step: int,
+        self_cond: bool,
+        ts: dict[str, Float[Tensor, "nsteps + 1"]],
+        gt: dict[str, Float[Tensor, "nsteps + 1"]],
+        simulation_step_params: dict[str, dict],
+        device: torch.device,
+        guidance_w: float,
+        ag_ratio: float,
+    ) -> dict[str, Tensor]:
+        """Euler loop shared by `partial_simulation`; carries no grad policy of its own."""
         for step in range(start_step, end_step):
             t = {data_mode: ts[data_mode][step] * torch.ones(nsamples, device=device) for data_mode in self.data_modes}
             dt = {data_mode: ts[data_mode][step + 1] - ts[data_mode][step] for data_mode in self.data_modes}
@@ -955,9 +1110,12 @@ class ProductSpaceFlowMatcher(L.LightningModule):
             batch["x_t"] = x
             batch["t"] = t
             batch["mask"] = mask
-            # self conditioning
+            # self conditioning. Detached, matching training (`handle_self_cond`), and a
+            # no-op under inference's no_grad. It matters when `grad_enabled=True`: without
+            # the detach the graph would also chain through x_sc, so memory would grow with
+            # the square of the backprop window instead of linearly.
             if step > 0 and self_cond and x_1_pred is not None:
-                batch["x_sc"] = x_1_pred
+                batch["x_sc"] = {dm: v.detach() for dm, v in x_1_pred.items()}
 
             # get clean prediction and guided vector
             nn_out = self.get_clean_pred_n_guided_vector(

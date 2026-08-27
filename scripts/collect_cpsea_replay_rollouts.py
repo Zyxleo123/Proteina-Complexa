@@ -80,6 +80,25 @@ def _slice_batch(batch: dict, start: int, end: int) -> dict:
     return out
 
 
+def _extract_receptor_condition(batch_slice: dict) -> dict:
+    """Pulls every receptor-conditioning tensor (any key containing "target") out of a 1-example batch slice.
+
+    Matches the "target" substring convention `handle_target_dropout` and
+    `FilterTargetResiduesTransform` already use elsewhere for this exact
+    purpose, rather than hardcoding a field list that would silently go stale
+    if the dataset pipeline adds/renames a target feature.
+    """
+    cond = {}
+    for key, value in batch_slice.items():
+        if "target" not in key.lower() or not torch.is_tensor(value):
+            continue
+        t = value[0].detach().cpu()
+        if t.is_floating_point():
+            t = t.to(torch.float16)
+        cond[key] = t
+    return cond
+
+
 def _cat_dicts(parts: list[dict]) -> dict:
     """Concatenate a list of batch-dicts along dim 0 (tensors) / list-extend (lists)."""
     if not parts:
@@ -180,6 +199,10 @@ def collect(
         reward_means = []
         for receptor_idx in range(bs):
             single = _slice_batch(batch, receptor_idx, receptor_idx + 1)
+            # Stored once per receptor, not once per candidate: the K generated
+            # candidates below all share the same receptor, so `_repeat_batch`
+            # would otherwise duplicate these (larger) receptor tensors K times.
+            buffer.add_receptor_conditions({example_ids[receptor_idx]: _extract_receptor_condition(single)})
             repeated = _repeat_batch(single, k)
 
             gen_parts = []

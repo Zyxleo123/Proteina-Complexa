@@ -8,6 +8,16 @@ for: `target_or_dataset_id`, `linkage_type`, `linkage_sites`, `peptide_length`,
 duplicate receptors are grouped by cluster rather than exact receptor id, so
 balanced sampling/dominance diagnostics aren't fooled by redundant structures).
 
+Also stores `receptor_conditions`: a `target_or_dataset_id -> {feature_name:
+tensor}` side table of the receptor-conditioning features (every batch key
+whose name contains "target", e.g. `x_target`/`seq_target`/`target_mask`/
+`seq_target_mask`/`target_hotspot_mask`) that CPSea's `enable_target: true`
+config needs at training time. This is a side table rather than a per-entry
+field so the K candidates collected for one receptor share a single stored
+copy instead of duplicating (typically much larger) receptor tensors K times.
+Entries only carry the join key (`target_or_dataset_id`); `ReplayMixer`
+resolves it back to the actual tensors at draw time.
+
 Design tradeoff, stated explicitly: entries are held as an in-memory FIFO
 deque (not lazily memory-mapped per-shard), with `save`/`load` doing whole
 sharded-file snapshots. At the default `max_size=10_000` and typical CPSea
@@ -114,9 +124,28 @@ class ReplayBuffer:
         self.length_bin_edges = tuple(length_bin_edges)
         self._entries: collections.deque[dict] = collections.deque()
         self.reward_version: str | None = None
+        # target_or_dataset_id -> {feature_name: CPU tensor}, see module docstring.
+        self.receptor_conditions: dict[str, dict[str, torch.Tensor]] = {}
 
     def __len__(self) -> int:
         return len(self._entries)
+
+    # ------------------------------------------------------------------
+    # Receptor conditioning side table
+    # ------------------------------------------------------------------
+    def add_receptor_conditions(self, conditions_by_id: dict[str, dict]) -> None:
+        """Stores (or overwrites) the receptor-conditioning tensors for each id.
+
+        Called once per receptor at collection time (not once per candidate),
+        which is what keeps this a side table rather than a per-entry field.
+        """
+        for target_id, cond in conditions_by_id.items():
+            self.receptor_conditions[target_id] = {k: _detach_cpu(v) for k, v in cond.items()}
+
+    def _prune_unreferenced_receptor_conditions(self) -> None:
+        referenced = {e["target_or_dataset_id"] for e in self._entries}
+        for stale_id in [k for k in self.receptor_conditions if k not in referenced]:
+            del self.receptor_conditions[stale_id]
 
     # ------------------------------------------------------------------
     # Append / eviction
@@ -143,6 +172,7 @@ class ReplayBuffer:
             self._entries.append(self._validate_entry(entry))
         while len(self._entries) > self.max_size:
             self._entries.popleft()
+        self._prune_unreferenced_receptor_conditions()
 
     # ------------------------------------------------------------------
     # Stratified/balanced sampling
@@ -192,6 +222,62 @@ class ReplayBuffer:
             idx = rng.choice(strata[key])
             sampled.append(self._entries[idx])
         return sampled
+
+    def sample_grouped(
+        self,
+        batch_size: int,
+        group_size: int,
+        by: tuple[str, ...] = ("linkage_type", "length_bin"),
+        rng: random.Random | None = None,
+    ) -> list[dict]:
+        """Draws entries as intact `target_or_dataset_id` groups, for group-relative weighting.
+
+        `sample_balanced` draws each entry independently, so a 16-entry batch
+        almost always lands one candidate per `(cluster_id, linkage_type)`
+        group -- zero reward variance, zero weight under
+        `geocycler_group_relative_weights`. This instead samples whole
+        candidate groups (all K candidates generated for one receptor share
+        one `target_or_dataset_id`, the exact identity `_collate` uses for
+        `group_ids`), so within-group reward variance is actually available
+        for the group-relative weighting to use.
+
+        Groups with fewer than 2 members are excluded (a singleton group has
+        zero possible reward variance by construction, so including it would
+        just reproduce the bug this method exists to fix). Each selected
+        group contributes up to `group_size` of its members (all of them, if
+        it has fewer); stratum selection uses one representative entry per
+        group, which is safe because every candidate in a group shares the
+        same native cyclization label and generation length (see
+        `scripts/collect_cpsea_replay_rollouts.py`'s per-receptor repeat).
+        """
+        if len(self._entries) == 0:
+            raise ValueError("cannot sample from an empty replay buffer")
+        rng = rng or random
+
+        groups: dict[str, list[int]] = collections.defaultdict(list)
+        for idx, entry in enumerate(self._entries):
+            groups[entry["target_or_dataset_id"]].append(idx)
+        eligible = {gid: idxs for gid, idxs in groups.items() if len(idxs) >= 2}
+        if not eligible:
+            raise ValueError(
+                "no replay group has >= 2 candidates -- cannot draw group-relative "
+                "batches. This buffer has only singleton target_or_dataset_id "
+                "groups (check the collector wrote K > 1 candidates per receptor)."
+            )
+
+        strata: dict[tuple, list[str]] = collections.defaultdict(list)
+        for gid, idxs in eligible.items():
+            strata[self._stratum_key(self._entries[idxs[0]], by)].append(gid)
+        stratum_keys = list(strata.keys())
+
+        sampled: list[dict] = []
+        while len(sampled) < batch_size:
+            key = rng.choice(stratum_keys)
+            gid = rng.choice(strata[key])
+            idxs = eligible[gid]
+            take = idxs if len(idxs) <= group_size else rng.sample(idxs, group_size)
+            sampled.extend(self._entries[idx] for idx in take)
+        return sampled[:batch_size]
 
     # ------------------------------------------------------------------
     # Stats / diagnostics
@@ -244,9 +330,12 @@ class ReplayBuffer:
 
         previous_manifest_path = dir / "manifest.json"
         previous_shard_files: set[str] = set()
+        previous_receptor_conditions_file: str | None = None
         if previous_manifest_path.exists():
             with open(previous_manifest_path) as f:
-                previous_shard_files = set(json.load(f).get("shard_files", []))
+                previous_manifest = json.load(f)
+            previous_shard_files = set(previous_manifest.get("shard_files", []))
+            previous_receptor_conditions_file = previous_manifest.get("receptor_conditions_file")
 
         generation = uuid.uuid4().hex[:12]
         entries = list(self._entries)
@@ -257,6 +346,9 @@ class ReplayBuffer:
             torch.save(shard, dir / shard_name)
             shard_files.append(shard_name)
 
+        receptor_conditions_file = f"receptor_conditions_{generation}.pt"
+        torch.save(self.receptor_conditions, dir / receptor_conditions_file)
+
         manifest = {
             "max_size": self.max_size,
             "shard_size": self.shard_size,
@@ -264,6 +356,7 @@ class ReplayBuffer:
             "reward_version": self.reward_version,
             "n_entries": len(entries),
             "shard_files": shard_files,
+            "receptor_conditions_file": receptor_conditions_file,
         }
         tmp_manifest = dir / f".tmp-{os.getpid()}-{generation}-manifest.json"
         with open(tmp_manifest, "w") as f:
@@ -273,6 +366,11 @@ class ReplayBuffer:
         for stale_shard in previous_shard_files - set(shard_files):
             try:
                 (dir / stale_shard).unlink()
+            except OSError:
+                pass
+        if previous_receptor_conditions_file and previous_receptor_conditions_file != receptor_conditions_file:
+            try:
+                (dir / previous_receptor_conditions_file).unlink()
             except OSError:
                 pass
 
@@ -309,4 +407,8 @@ class ReplayBuffer:
         for shard_name in manifest["shard_files"]:
             shard = torch.load(dir / shard_name, weights_only=False)
             buffer._entries.extend(shard)
+
+        receptor_conditions_file = manifest.get("receptor_conditions_file")
+        if receptor_conditions_file:
+            buffer.receptor_conditions = torch.load(dir / receptor_conditions_file, weights_only=False)
         return buffer

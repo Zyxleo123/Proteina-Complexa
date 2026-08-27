@@ -40,4 +40,5 @@ replay_buffer:
   n_replayed_per_update: 2 # 1:1 with dataset.datamodule.batch_size (2) above
   reward_std_threshold: 0.05 # geocycler_group_relative only
   near_weight: 0.3 # success_only only
+  group_size: 8 # geocycler_group_relative only -- max candidates drawn per sampled receptor group, see ReplayBuffer.sample_grouped
   max_size: 10000

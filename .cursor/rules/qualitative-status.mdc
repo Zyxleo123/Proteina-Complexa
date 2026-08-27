@@ -1,0 +1,30 @@
+---
+description: Call out when numbers/status look wrong or right; prefer qualitative judgment
+alwaysApply: true
+---
+
+# Qualitative status commentary
+
+When reporting progress, benchmarks, ETAs, rates, or config choices, **do not just dump numbers**. Add a short qualitative judgment.
+
+## Do
+
+- **Flag suspicious numbers** immediately (e.g. "74 days is not acceptable for this corpus — something is wrong").
+- **Say when something looks healthy** (e.g. "shard sizes are even; ~5h ETA is in the right ballpark").
+- **Compare against a sanity baseline** when you have one (solo ms/complex × workers, prior run rate, wall-clock vs compute).
+- **Name the likely bottleneck** if the number is off (OpenMP oversub, ZFS small-file I/O, jobs packed on one node, etc.).
+- Prefer one blunt sentence first, then the numbers.
+
+## Don't
+
+- Present a catastrophic ETA or tiny speedup as a neutral fact with no comment.
+- Hide uneven shard sizes, cancelled jobs, or double-booking nodes inside a table.
+- Wait for the user to notice that 2× vs expected 50× is a failure mode.
+
+## Examples
+
+- Bad: "Extract is at 25/s; full run ≈ 30h."
+- Good: "25/s is only ~2× PyMOL — SAS compute is fine (~30ms); we're ZFS-bound / oversubscribed, not algorithm-bound. At this rate full overwrite is ~5–30h depending on node count."
+
+- Bad: "One log shows [54/1947]."
+- Good: "That [54/1947] is tee interleaving from multiple shards, not a tiny shard — real sizes are ~678k each (even)."

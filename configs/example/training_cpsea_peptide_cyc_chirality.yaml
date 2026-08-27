@@ -1,0 +1,40 @@
+# @package _global_
+# Adds the differentiable chirality penalty (proteinfoundation.cyclization.chirality_loss)
+# on top of the typed-topology + linkage-geometry recipe.
+#
+# Why this exists: `gate_chirality` in scripts/collect_cpsea_replay_rollouts.py only REJECTS
+# D-configured replay candidates after generation -- it supplies no gradient, so nothing in
+# the objective ever taught the flow model to stop producing them in the first place. This
+# closes that gap with its own top-level loss term (chirality_loss.py), independent of
+# cyclization (it checks every binder residue, not just linkage atoms) and independent of
+# replay (it runs on the real CPSea batch, every step).
+#
+# Full copy of training_cpsea_peptide_cyc_typed_geom.yaml with chirality_loss turned on.
+# Warm-startable from either that run or plain v4: chirality_loss adds no new NN parameters
+# (it only reads the already-decoded structure), so there is no shape change to warm-start
+# across -- resuming an existing typed_geom run and just adding this config also works.
+#
+# Run:
+#   CONFIG=example/training_cpsea_peptide_cyc_chirality \
+#     RUN_NAME=cpsea_cyc_chirality_v5 WANDB_PROJECT=cpsea_cyclization CHECKPOINT=true \
+#     bash ~/slurm/cpsea/cpsea_peptide_train_finetune.sh full
+
+defaults:
+  - training_cpsea_peptide_cyc_typed_geom
+  - _self_
+
+run_name: cpsea_cyc_chirality_v5
+
+chirality_loss:
+  enabled: true
+  # Applied directly (own top-level weight, not nested/multiplied like the old
+  # bond_loss.geometry bug -- see proteina.py's compute_chirality_loss). Start at the
+  # same modest scale as the other structure-quality terms (bond/geometry both 0.05).
+  loss_weight: 0.05
+  # Small positive margin so training pushes PAST the gate's exact decision boundary
+  # (triple > 0) rather than stopping exactly at it, where the gate could still flip a
+  # borderline residue to invalid under float noise.
+  margin: 0.05
+  # Same reasoning as bond_loss.t_lower_lim: the decoded structure is read off the
+  # PREDICTED clean sample, meaningless as a chirality check below this t.
+  t_lower_lim: 0.5

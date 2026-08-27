@@ -36,7 +36,13 @@ echo "Node: $(hostname)  GPU: ${CUDA_VISIBLE_DEVICES:-?}"
 echo "Python: $PY"
 "$PY" -c "import proteinfoundation" || { echo "FATAL: proteinfoundation not importable from $PY"; exit 1; }
 
-echo "Launching config=$CONFIG_NAME run_name=$RUN_NAME"
+# Unquoted on purpose: EXTRA_OVERRIDES is a space-separated list of Hydra overrides
+# that must word-split into separate argv entries. It is appended LAST so it beats both
+# the config file and ++run_name. Empty by default, in which case this adds nothing.
+EXTRA_OVERRIDES="${EXTRA_OVERRIDES:-}"
+echo "Launching config=$CONFIG_NAME run_name=$RUN_NAME extra=${EXTRA_OVERRIDES:-<none>}"
+# shellcheck disable=SC2086
 srun "$PY" -m proteinfoundation.train \
   --config-name "$CONFIG_NAME" \
-  "++run_name=$RUN_NAME"
+  "++run_name=$RUN_NAME" \
+  $EXTRA_OVERRIDES

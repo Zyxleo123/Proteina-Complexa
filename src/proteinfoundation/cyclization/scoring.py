@@ -23,15 +23,10 @@ from __future__ import annotations
 
 import torch
 
+from proteinfoundation.cyclization.chirality_loss import chirality_triple_product
 from proteinfoundation.cyclization.constants import DISULFIDE, ISOPEPTIDE, MAINCHAIN
 from proteinfoundation.cyclization.linkage_geometry import linkage_geometry_terms
-from proteinfoundation.eval.cyclic_reconstruction_metrics import (
-    C_IDX,
-    CA_IDX,
-    CB_IDX,
-    N_IDX,
-    per_sample_requested_bond_distance,
-)
+from proteinfoundation.eval.cyclic_reconstruction_metrics import CA_IDX, per_sample_requested_bond_distance
 
 _EPS = 1e-6
 
@@ -67,32 +62,15 @@ def _chirality_valid_per_residue(
 ) -> torch.Tensor:
     """Per-residue L-amino-acid stereo check, `[..., L]` bool.
 
-    Uses the sign of the `(N-CA) x (C-CA) . (CB-CA)` scalar triple product.
-    `virtual_cb_from_backbone` (used elsewhere in this codebase to reconstruct
-    CB for glycine) places its output CB at a strictly positive sign under
-    this convention for any non-degenerate backbone frame (the cross-product
-    term in its formula is orthogonal to both inputs of this triple product by
-    construction, so the sign is frame-independent, not merely
-    dataset-typical) -- so a real, correctly-chiral L-amino-acid CB must also
-    be positive; a reflected/D-amino-acid CB is negative. Only defined where
-    N/CA/C/CB are all present; residues without a resolvable CB (e.g. glycine,
-    or a masked-out slot) have nothing to check and are treated as valid.
+    Thin wrapper around `chirality_loss.chirality_triple_product` (the shared
+    geometry both this boolean gate and `chirality_loss.chirality_loss`'s
+    differentiable penalty are built on, so they cannot silently drift apart
+    -- see that module for the full geometric argument). Residues without a
+    resolvable CB (e.g. glycine, or a masked-out slot) have nothing to check
+    and are treated as valid.
     """
-    mask = atom37_mask.bool()
-    n = atom37[..., N_IDX, :]
-    ca = atom37[..., CA_IDX, :]
-    c = atom37[..., C_IDX, :]
-    cb = atom37[..., CB_IDX, :]
-    has_cb = mask[..., CB_IDX]
-    has_backbone = mask[..., N_IDX] & mask[..., CA_IDX] & mask[..., C_IDX]
-
-    v1 = n - ca
-    v2 = c - ca
-    v3 = cb - ca
-    triple = (torch.cross(v1, v2, dim=-1) * v3).sum(dim=-1)
+    triple, checkable = chirality_triple_product(atom37, atom37_mask)
     is_l = triple > 0.0
-
-    checkable = has_backbone & has_cb
     return is_l | ~checkable
 
 

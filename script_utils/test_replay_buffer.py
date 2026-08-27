@@ -264,9 +264,111 @@ def test_variable_length_entries_survive_round_trip_when_collated():
         shutil.rmtree(tmpdir)
 
 
+# ---------------------------------------------------------------------------
+# E. Receptor-conditioning side table
+# ---------------------------------------------------------------------------
+def test_receptor_conditions_survive_save_load_round_trip():
+    tmpdir = tempfile.mkdtemp()
+    try:
+        buf = ReplayBuffer(max_size=100, shard_size=4)
+        entries = [_make_entry(i) for i in range(3)]
+        buf.append(entries)
+        buf.add_receptor_conditions(
+            {
+                f"cpsea_target_{i}": {
+                    "x_target": torch.randn(5, 37, 3),
+                    "target_mask": torch.ones(5, 37, dtype=torch.bool),
+                }
+                for i in range(3)
+            }
+        )
+        buf.save(tmpdir)
+        loaded = ReplayBuffer.load(tmpdir)
+
+        assert set(loaded.receptor_conditions.keys()) == {f"cpsea_target_{i}" for i in range(3)}
+        for i in range(3):
+            orig = buf.receptor_conditions[f"cpsea_target_{i}"]
+            rt = loaded.receptor_conditions[f"cpsea_target_{i}"]
+            assert torch.equal(orig["x_target"], rt["x_target"])
+            assert torch.equal(orig["target_mask"], rt["target_mask"])
+    finally:
+        shutil.rmtree(tmpdir)
+
+
+def test_receptor_conditions_pruned_on_eviction():
+    """A receptor condition with no referencing entry left in the buffer must be dropped,
+    so the side table does not grow unboundedly as FIFO eviction churns through entries."""
+    buf = ReplayBuffer(max_size=3)
+    buf.append([_make_entry(i) for i in range(3)])
+    buf.add_receptor_conditions({f"cpsea_target_{i}": {"x_target": torch.randn(2, 37, 3)} for i in range(3)})
+    assert set(buf.receptor_conditions.keys()) == {f"cpsea_target_{i}" for i in range(3)}
+
+    # Evicts cpsea_target_0 (oldest-first FIFO at max_size=3).
+    buf.append([_make_entry(3)])
+    buf.add_receptor_conditions({"cpsea_target_3": {"x_target": torch.randn(2, 37, 3)}})
+    assert "cpsea_target_0" not in buf.receptor_conditions
+    assert set(buf.receptor_conditions.keys()) == {f"cpsea_target_{i}" for i in range(1, 4)}
+
+
+# ---------------------------------------------------------------------------
+# F. Group-preserving sampling for geocycler_group_relative weighting
+# ---------------------------------------------------------------------------
+def _make_grouped_entries(n_groups: int, group_size: int, linkage_type: int = 0) -> list[dict]:
+    """`n_groups` groups of `group_size` entries each, all sharing one `target_or_dataset_id` per group
+    (as the collector writes for the K candidates generated from one receptor)."""
+    entries = []
+    for g in range(n_groups):
+        for m in range(group_size):
+            e = _make_entry(g * group_size + m, linkage_type=linkage_type)
+            e["target_or_dataset_id"] = f"receptor_{g}"
+            entries.append(e)
+    return entries
+
+
+def test_sample_grouped_keeps_groups_intact():
+    buf = ReplayBuffer(max_size=1000)
+    buf.append(_make_grouped_entries(n_groups=5, group_size=4))
+
+    rng = random.Random(0)
+    sampled = buf.sample_grouped(batch_size=100, group_size=4, by=("linkage_type",), rng=rng)
+    assert len(sampled) == 100
+
+    from collections import Counter
+
+    counts = Counter(e["target_or_dataset_id"] for e in sampled)
+    # Every drawn receptor should contribute more than one candidate in a 100-entry
+    # draw across only 5 groups -- i.i.d. `sample_balanced` would instead scatter
+    # draws near-uniformly across all 20 entries, mostly landing singletons.
+    assert all(c >= 2 for c in counts.values()), counts
+
+
+def test_sample_grouped_excludes_singleton_groups():
+    buf = ReplayBuffer(max_size=1000)
+    entries = _make_grouped_entries(n_groups=3, group_size=1)  # every group has exactly 1 member
+    buf.append(entries)
+    try:
+        buf.sample_grouped(batch_size=10, group_size=4)
+        assert False, "expected ValueError: no group has >= 2 candidates"
+    except ValueError:
+        pass
+
+
+def test_sample_grouped_caps_at_group_size():
+    buf = ReplayBuffer(max_size=1000)
+    buf.append(_make_grouped_entries(n_groups=1, group_size=10))
+    rng = random.Random(0)
+    sampled = buf.sample_grouped(batch_size=3, group_size=3, rng=rng)
+    assert len(sampled) == 3
+
+
 ALL_TESTS = [
     test_fifo_eviction_drops_oldest_first,
     test_fifo_eviction_incremental_appends,
+    test_receptor_conditions_survive_save_load_round_trip,
+    test_receptor_conditions_pruned_on_eviction,
+    test_sample_grouped_keeps_groups_intact,
+    test_sample_grouped_excludes_singleton_groups,
+    test_sample_grouped_caps_at_group_size,
     test_save_load_round_trip_lossless,
     test_save_load_recovers_from_interrupted_run,
     test_save_interrupted_before_manifest_swap_leaves_old_snapshot_intact,

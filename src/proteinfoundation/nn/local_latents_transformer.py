@@ -192,6 +192,10 @@ class LocalLatentsTransformer(torch.nn.Module):
             rbf_n = int(surface_cfg.get("rbf_n", 16))
             pair_dim = int(surface_cfg.get("pair_dim", kwargs["pair_repr_dim"]))
             gate_init = float(surface_cfg.get("gate_init", 0.0))
+            # `gate_learnable: false` pins `g` at `gate_init` so the surface encoder always
+            # gets a nonvanishing gradient. See GatedSurfaceCrossAttention's docstring for the
+            # measured zero-init deadlock this exists to break.
+            gate_learnable = bool(surface_cfg.get("gate_learnable", True))
             self.surface_encoder = SurfaceEncoder(
                 token_dim=self.token_dim,
                 pair_dim=pair_dim,
@@ -210,6 +214,7 @@ class LocalLatentsTransformer(torch.nn.Module):
                         nheads=kwargs["nheads"],
                         use_qkln=self.use_qkln,
                         gate_init=gate_init,
+                        gate_learnable=gate_learnable,
                     )
                     for i in self.surface_gate_layers
                 }

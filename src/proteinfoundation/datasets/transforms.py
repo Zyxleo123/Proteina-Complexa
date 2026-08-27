@@ -487,6 +487,12 @@ class AttachPeptideSurfaceTransform(BaseTransform):
     ``CoordsToNanometers`` / ``GlobalRotationTransform`` / ``CenteringTransform`` keep it
     aligned with binder CA.
 
+    CAUTION -- this is the ground-truth PEPTIDE's own surface, close to leaking the answer
+    when used to condition/supervise binder generation (the receptor is already given
+    separately via ``x_target``). See ``AttachReceptorSurfaceTransform`` below for the
+    non-circular counterpart (the receptor pocket's surface facing the peptide), which is a
+    drop-in replacement -- both attach to the same ``graph.surface_xyz``/... keys.
+
     Args:
         surface_dir: Directory of ``*.surface.npz`` caches.
         num_points: Expected sample count ``M`` (default 96). Caches with a different
@@ -499,6 +505,13 @@ class AttachPeptideSurfaceTransform(BaseTransform):
             reading caches from one specific backend/resolution rather than
             whatever happens to be on disk (e.g. a stale mixed-backend cache dir).
     """
+
+    # Subclass hook: `resolve_cache_path`'s filename suffix and the extractor-version this
+    # role's caches are stamped with -- see `proteinfoundation.surface.peptide_surface`'s
+    # `cache_path_for`/`RECEPTOR_SURFACE_EXTRACTOR_VERSION` docstrings for why these two
+    # things together are what keeps a peptide cache and a receptor cache from ever being
+    # silently read as each other, even if both roles share one `surface_dir`.
+    _CACHE_SUFFIX = "surface"
 
     def __init__(
         self,
@@ -514,11 +527,16 @@ class AttachPeptideSurfaceTransform(BaseTransform):
         self.backend = backend
         self.sas_points_per_atom = sas_points_per_atom
 
+    def _extractor_version(self) -> str:
+        from proteinfoundation.surface.peptide_surface import EXTRACTOR_VERSION
+
+        return EXTRACTOR_VERSION
+
     def _example_id(self, graph: Data) -> str:
         for key in ("example_id", "id"):
             if hasattr(graph, key) and getattr(graph, key) is not None:
                 return str(getattr(graph, key))
-        raise ValueError("AttachPeptideSurfaceTransform needs graph.example_id or graph.id")
+        raise ValueError(f"{type(self).__name__} needs graph.example_id or graph.id")
 
     def _empty(self, dtype=torch.float32) -> tuple[torch.Tensor, ...]:
         m = self.num_points
@@ -530,19 +548,18 @@ class AttachPeptideSurfaceTransform(BaseTransform):
 
     def __call__(self, graph: Data) -> Data:
         from proteinfoundation.surface.peptide_surface import (
-            EXTRACTOR_VERSION,
             is_cache_valid,
             load_surface_cache,
             resolve_cache_path,
         )
 
         example_id = self._example_id(graph)
-        cache_path = resolve_cache_path(self.surface_dir, example_id)
+        cache_path = resolve_cache_path(self.surface_dir, example_id, suffix=self._CACHE_SUFFIX)
 
         if not is_cache_valid(
             cache_path,
             num_points=self.num_points,
-            version=EXTRACTOR_VERSION,
+            version=self._extractor_version(),
             backend=self.backend,
             sas_points_per_atom=self.sas_points_per_atom,
         ):
@@ -569,6 +586,31 @@ class AttachPeptideSurfaceTransform(BaseTransform):
         graph.surface_mask = mask
         graph.surface_distance = dist
         return graph
+
+
+class AttachReceptorSurfaceTransform(AttachPeptideSurfaceTransform):
+    """Load a precomputed RECEPTOR pocket-surface cache onto the sample.
+
+    The non-circular counterpart to ``AttachPeptideSurfaceTransform``: reads caches built
+    by ``extract_receptor_surface`` (see that function's docstring for why the receptor's
+    own pocket-facing surface, not the peptide's, is a sound conditioning/attraction
+    signal -- the receptor is already given via ``x_target`` as atom coordinates, but not
+    as a molecular surface, so this is genuinely new shape information rather than a
+    coarse restatement of the generation target). Everything else -- the cache lookup,
+    validity check, padding/masking, and the ``graph.surface_xyz``/``surface_normals``/
+    ``surface_mask``/``surface_distance`` attachment keys -- is identical to the peptide
+    version, so swapping which of the two transforms is composed into the pipeline is a
+    complete, drop-in change; no downstream consumer (``compute_surface_attraction_loss``,
+    the surface cross-attention block, ``eval.surface_metrics``) needs to know which one
+    produced the batch's `surface_*` keys.
+    """
+
+    _CACHE_SUFFIX = "receptor_surface"
+
+    def _extractor_version(self) -> str:
+        from proteinfoundation.surface.peptide_surface import RECEPTOR_SURFACE_EXTRACTOR_VERSION
+
+        return RECEPTOR_SURFACE_EXTRACTOR_VERSION
 
 
 class ShufflePeptideSurfaceTransform(BaseTransform):
