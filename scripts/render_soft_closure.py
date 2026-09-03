@@ -196,6 +196,19 @@ def load_projection(npz_path: Path):
     z = np.load(npz_path, allow_pickle=True)
     meta = json.loads(str(z["meta_json"]))
     stages = json.loads(str(z["stages_json"]))
+    # Backfill identity from the filename ("<example_id>__proj<k>.npz") for npz written before
+    # the writer stamped example_id into meta_json. Every other field the panels read is
+    # produced inside project_once and has always been present; only the identity added later
+    # in the main loop could be missing.
+    stem = npz_path.stem
+    if "example_id" not in meta:
+        meta["example_id"] = stem.split("__proj")[0]
+    if "replica" not in meta and "__proj" in stem:
+        try:
+            meta["replica"] = int(stem.split("__proj")[1])
+        except ValueError:
+            meta["replica"] = 0
+    meta.setdefault("input_nc_gap_A", float("nan"))
     names = [str(x) for x in z["pep_heavy_names"]]
     resid = z["pep_heavy_resid"]
     resnames = [str(x) for x in z["pep_resnames"]]
@@ -453,6 +466,27 @@ def main() -> None:
         raise SystemExit(f"FATAL: no projection .npz files in {stage_dir}")
 
     projections = [load_projection(f) for f in files]
+    # Enrich any npz whose meta_json predates the example_id/gap stamp from the sibling
+    # projections.jsonl (which was always written with the full row). One read, keyed by tag,
+    # so re-rendering an older run recovers real gaps instead of the nan filename fallback.
+    jsonl = stage_dir.parent / "projections.jsonl"
+    if jsonl.is_file():
+        by_tag = {}
+        for line in jsonl.read_text().splitlines():
+            if not line.strip():
+                continue
+            try:
+                r = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if r.get("tag"):
+                by_tag[r["tag"]] = r
+        for p in projections:
+            src = by_tag.get(p["tag"])
+            if src:
+                for key in ("example_id", "replica", "input_nc_gap_A", "accepted"):
+                    if key in src:
+                        p["meta"][key] = src[key]
     if args.accepted_only:
         projections = [p for p in projections if p["meta"].get("accepted")]
         if not projections:

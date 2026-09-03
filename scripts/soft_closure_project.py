@@ -696,6 +696,18 @@ def main() -> None:
                 n_pep_atoms = write_projected_pdb(
                     pdb_dir / f"{tag}.pdb", header, orig_chains, ec.topology, xyz_final,
                     tag, args.keep_added_atoms)
+                # Stamp identity/provenance onto the row BEFORE serialising meta_json: the npz
+                # is the renderer's only input, and example_id / tag / input_nc_gap_A live in
+                # this update, not in what project_once returns. Writing the npz first (as an
+                # earlier version did) left meta_json without example_id and the figure job
+                # died on KeyError.
+                row.update(run_key=run_key, example_id=example_id, status="ok", tag=tag,
+                           projected_pdb=str((pdb_dir / f"{tag}.pdb").resolve()),
+                           n_peptide_atoms=n_pep_atoms, n_atoms_added_by_fixer=n_added,
+                           mutations=";".join(muts), seconds=round(time.time() - t0, 1),
+                           input_nc_gap_A=float(mrow["nc_gap_angstrom"]),
+                           peptide_length=int(mrow["peptide_length"]),
+                           binder_chain_id="B", cluster_id=str(mrow.get("cluster_id", example_id)))
                 np.savez_compressed(
                     stage_dir / f"{tag}.npz",
                     pep_heavy_xyz=trace.astype(np.float32),
@@ -711,16 +723,10 @@ def main() -> None:
                     # trace[0] is the perturbed pose, not the crystal one).
                     pep_heavy_ref=ref["xyz_A_ref"][ec.pep_heavy_idx].astype(np.float32),
                     rec_ca=ref["rec_ca_A"].astype(np.float32),
-                    meta_json=json.dumps({k2: v for k2, v in row.items() if k2 != "stages"}),
+                    meta_json=json.dumps({k2: v for k2, v in row.items()
+                                          if k2 not in ("stages",)}),
                     stages_json=json.dumps(row["stages"]),
                 )
-                row.update(run_key=run_key, example_id=example_id, status="ok", tag=tag,
-                           projected_pdb=str((pdb_dir / f"{tag}.pdb").resolve()),
-                           n_peptide_atoms=n_pep_atoms, n_atoms_added_by_fixer=n_added,
-                           mutations=";".join(muts), seconds=round(time.time() - t0, 1),
-                           input_nc_gap_A=float(mrow["nc_gap_angstrom"]),
-                           peptide_length=int(mrow["peptide_length"]),
-                           binder_chain_id="B", cluster_id=str(mrow.get("cluster_id", example_id)))
                 fh.write(json.dumps(row) + "\n"); fh.flush()
                 print(f"  {tag}: pull {row['pull_dist_start_A']:6.2f} -> "
                       f"{row['pull_dist_final_A']:5.2f} A  CB {row['terminal_cb_final_A']:5.2f} A  "
