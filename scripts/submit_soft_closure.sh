@@ -24,17 +24,27 @@ cd "$REPO"
 GPU_PARTITION="general"; GPU_NODELIST=""; CPU_PARTITION="cpu"
 PROJ_TIME="04:00:00"; GPU_TIME="06:00:00"; CPU_TIME="01:00:00"
 SHARDS=4; SMOKE=0; DRYRUN=0
+# Projection force/gate knobs. Defaults are the first-run values; the first real OpenMM run
+# accepted 0/126 because the single N-C spring translated the whole peptide off the interface
+# (closure and retention came out mutually exclusive). Raising the contact restraints pins the
+# body so the TERMINI curl instead -- exposed here so that retune is a flag, not an edit.
+K_PULL=2000.0; K_CONTACT=500.0; CONTACTS_PER_RESIDUE=1; ACCEPT_RETENTION=0.8
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --gpu-partition) GPU_PARTITION="$2"; shift 2 ;;
-    --gpu-nodelist)  GPU_NODELIST="$2";  shift 2 ;;
-    --cpu-partition) CPU_PARTITION="$2"; shift 2 ;;
-    --shards)        SHARDS="$2";        shift 2 ;;
-    --smoke)         SMOKE=1;            shift ;;
-    --dry-run)       DRYRUN=1;           shift ;;
+    --gpu-partition)       GPU_PARTITION="$2";       shift 2 ;;
+    --gpu-nodelist)        GPU_NODELIST="$2";        shift 2 ;;
+    --cpu-partition)       CPU_PARTITION="$2";       shift 2 ;;
+    --shards)              SHARDS="$2";              shift 2 ;;
+    --k-pull)              K_PULL="$2";              shift 2 ;;
+    --k-contact)           K_CONTACT="$2";           shift 2 ;;
+    --contacts-per-residue) CONTACTS_PER_RESIDUE="$2"; shift 2 ;;
+    --accept-retention)    ACCEPT_RETENTION="$2";    shift 2 ;;
+    --smoke)               SMOKE=1;                  shift ;;
+    --dry-run)             DRYRUN=1;                 shift ;;
     *) echo "unknown arg: $1" >&2; exit 1 ;;
   esac
 done
+case "$CONTACTS_PER_RESIDUE" in 1|2) ;; *) echo "FATAL: --contacts-per-residue must be 1 or 2" >&2; exit 1 ;; esac
 
 STAMP="$(date +%Y%m%d_%H%M%S)"
 RUN_ID="softclose_${STAMP}"; [[ $SMOKE == 1 ]] && RUN_ID="softclose_smoke_${STAMP}"
@@ -73,15 +83,15 @@ TEST_BED_EXAMPLES="${TEST_BED}"
 CYC_TYPE=mainchain
 N_PROJECTIONS=$([[ $SMOKE == 1 ]] && echo 2 || echo 16)
 TORSION_SIGMA_DEG=12.0
-K_PULL=2000.0
-K_CONTACT=500.0
+K_PULL=${K_PULL}
+K_CONTACT=${K_CONTACT}
 CONTACT_TOL_A=0.75
-CONTACTS_PER_RESIDUE=1
+CONTACTS_PER_RESIDUE=${CONTACTS_PER_RESIDUE}
 LADDER_A="20 15 12 9 6 3"
 MIN_MAX_ITERATIONS=$([[ $SMOKE == 1 ]] && echo 100 || echo 1000)
 # Stop once the generator can finish the job: the sweep closed rings reliably from this range.
 STOP_CB_A=9.0
-ACCEPT_RETENTION=0.8
+ACCEPT_RETENTION=${ACCEPT_RETENTION}
 KEEP_PER_EXAMPLE=$([[ $SMOKE == 1 ]] && echo 1 || echo 4)
 PROJ_SEED=0
 
