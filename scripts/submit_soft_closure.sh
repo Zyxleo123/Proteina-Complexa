@@ -56,8 +56,11 @@ TRAJ_DIR=${REPO}/evaluation_results/${RUN_ID}/traj
 FIG_DIR=${REPO}/evaluation_results/${RUN_ID}/figures
 LNR_METADATA=${REPO}/CPSea_data/lnr_staged/metadata/lnr_test.parquet
 # OpenMM cannot be installed alongside the training environment's pins, so it lives in its
-# own venv. Recreate with:
-#   uv venv --python 3.11 .venv_openmm
+# own venv. Build it against a SHARED-FILESYSTEM interpreter: a venv made from
+# /usr/bin/python3.11 works on the login node and dangles on the compute nodes, which do not
+# ship that interpreter. Recreate with:
+#   uv python install 3.11
+#   uv venv --python "\$HOME/.local/share/uv/python/cpython-3.11-linux-x86_64-gnu/bin/python3.11" .venv_openmm
 #   uv pip install --python .venv_openmm/bin/python openmm pdbfixer numpy pandas pyarrow
 OPENMM_PYTHON=${REPO}/.venv_openmm/bin/python
 # Same frozen pin the original LNR sweep used, so the flow model and the AE match and the
