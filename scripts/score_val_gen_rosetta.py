@@ -52,7 +52,17 @@ def main() -> int:
     ap.add_argument("--dump-dir", required=True, help="Root dir containing step_*/ dumps.")
     ap.add_argument("--out", required=True, help="Output JSONL (one row per scored complex).")
     ap.add_argument("--max-per-step", type=int, default=0, help="Cap complexes scored per step (0=all).")
+    ap.add_argument("--shard-index", type=int, default=0,
+                    help="This task's shard id in [0, shard-count). Manifests (= step dirs = batches) "
+                         "are partitioned across shards for a CPU array job; each shard writes its own "
+                         "--out, so there is exactly one writer per file (no concurrent-append corruption). "
+                         "Default 0/1 = score everything, identical to the pre-sharding behaviour that "
+                         "the training auto-submit relies on.")
+    ap.add_argument("--shard-count", type=int, default=1, help="Total number of shards.")
     args = ap.parse_args()
+    if args.shard_count < 1 or not (0 <= args.shard_index < args.shard_count):
+        print(f"FATAL: bad shard {args.shard_index}/{args.shard_count}", flush=True)
+        return 1
 
     if not is_pyrosetta_available():
         # A gate-failure, not an error: exit 0 so an afterok chain is not stranded (CLAUDE.md rule).
@@ -66,6 +76,11 @@ def main() -> int:
     if not manifests:
         print(f"No manifests under {args.dump_dir}; nothing to score. Exiting 0.", flush=True)
         return 0
+    # Partition whole manifests (one per batch) across shards -- every complex lands in exactly one
+    # shard, so per-shard --out files never share a writer. Strided so a short run still balances.
+    if args.shard_count > 1:
+        manifests = manifests[args.shard_index::args.shard_count]
+        print(f"shard {args.shard_index}/{args.shard_count}: {len(manifests)} manifests", flush=True)
 
     n_new = 0
     with open(args.out, "a") as out_f:

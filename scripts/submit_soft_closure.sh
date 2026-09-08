@@ -14,6 +14,7 @@
 # Stage 3  GPU   SDEdit trajectory dump for the GIF      (soft_closure_traj.sbatch)
 # Stage 4  CPU   before/after PNG + GIF                  (soft_closure_render.sbatch)
 # Stage 5  CPU   paired-arm table                        (soft_closure_summarize.sbatch)
+# Stage 6  CPU   Rosetta dG before/after + figure        (sdedit_rosetta{,_plot}.sbatch)
 #
 # Stage 2b depends only on stage 1, so it never waits behind 2a.
 
@@ -104,6 +105,15 @@ T_LAT_GRID="$([[ $SMOKE == 1 ]] && echo "0.4" || echo "0.4 0.2")"
 SEEDS="$([[ $SMOKE == 1 ]] && echo "0" || echo "0 1 2")"
 NSTEPS=$([[ $SMOKE == 1 ]] && echo 50 || echo 0)
 
+# --- Rosetta dG, before (the arm's input) vs after (the edited complex) ---
+# The complexes are written by the GPU arms themselves (--complex-pdb-dir): the loader frame
+# is per-process, so they cannot be rebuilt afterwards. Scoring is CPU and off the GPU path.
+ROSETTA_SHARDS=${SHARDS}
+# Score EVERY edit, abstentions and open rings included -- the interesting comparison is
+# closed vs not-closed vs abstained, and dropping the failures throws away the control half
+# of it. The arm is 96 edits, minutes each on CPU, so there is no reason to subset.
+ROSETTA_ONLY_SCORABLE=0
+
 # --- trajectory / figures ---
 TRAJ_T_CA=0.8
 TRAJ_T_LAT=0.4
@@ -163,6 +173,21 @@ SUM_ID=$(sbatch --parsable \
   --dependency=afterok:"$EDIT_ID":"$CTRL_ID" --job-name="${RUN_ID}_sum" \
   scripts/soft_closure_summarize.sbatch "$ENV_FILE")
 echo "stage 5  CPU  paired-arm table      job ${SUM_ID} (afterok:${EDIT_ID},${CTRL_ID})"
+
+# Stage 6, once per arm: score, then plot. Each arm is a sibling chain, so the control's
+# figure does not wait behind the projected arm (which may be gated out entirely).
+for ARM in control projected; do
+  case "$ARM" in projected) DEP="$EDIT_ID" ;; control) DEP="$CTRL_ID" ;; esac
+  ROS_ID=$(sbatch --parsable \
+    --partition="$CPU_PARTITION" --time="04:00:00" \
+    --array=0-$((SHARDS - 1)) --dependency=afterok:"$DEP" --job-name="${RUN_ID}_dg_${ARM}" \
+    scripts/sdedit_rosetta.sbatch "$ENV_FILE" "$ARM")
+  ROSFIG_ID=$(sbatch --parsable \
+    --partition="$CPU_PARTITION" --time="$CPU_TIME" \
+    --dependency=afterok:"$ROS_ID" --job-name="${RUN_ID}_dg_${ARM}_fig" \
+    scripts/sdedit_rosetta_plot.sbatch "$ENV_FILE" "$ARM")
+  echo "stage 6  CPU  Rosetta dG ${ARM}   jobs ${ROS_ID} -> ${ROSFIG_ID} (afterok:${DEP})"
+done
 
 echo
 echo "results: ${REPO}/evaluation_results/${RUN_ID}"

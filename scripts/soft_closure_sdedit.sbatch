@@ -74,6 +74,7 @@ srun "$PY" scripts/sdedit_cyclize.py \
   --metadata "$METADATA" \
   --out "${OUT_DIR}/edits_shard${SHARD_INDEX}.jsonl" \
   --pdb-dir "${OUT_DIR}/pdbs" \
+  --complex-pdb-dir "${OUT_DIR}/complexes" \
   --cyc-types ${CYC_TYPE:-mainchain} \
   --t-ca ${T_CA_GRID} \
   --t-lat ${T_LAT_GRID} \
