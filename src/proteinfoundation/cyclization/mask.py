@@ -17,8 +17,8 @@ from proteinfoundation.cyclization.constants import (
     DISULFIDE,
     ISOPEPTIDE,
     MAINCHAIN,
+    NON_RING_COND_TYPES,
     NUM_CYCLIZATION_TYPES,
-    UNSPECIFIED,
 )
 
 
@@ -52,12 +52,12 @@ def build_cyclization_validity_mask(
         allow_asn_gln_isopeptide: If True, also allow ASN/GLN as isopeptide
             partners (some CPSea isopeptide labels use amide side chains
             rather than pure acids).
-        cond_type: [B] requested cyclization type, values in `0..UNSPECIFIED`.
+        cond_type: [B] requested cyclization type, values in `0..LINEAR`.
             For rows with a real type, every other type slice is zeroed out, so
             the downstream global softmax over the flattened candidate space
             becomes exactly `p(i, j | type)` -- restricting the support of a
             softmax and renormalizing *is* conditioning, which is why the head
-            itself needs no type input. Rows at `UNSPECIFIED` (and `cond_type=None`)
+            itself needs no type input. Rows at `UNSPECIFIED` or `LINEAR` (and `cond_type=None`)
             keep the full 3-type candidate set, recovering the unconditional
             joint `p(i, j, type)`.
         terminal_only: Restrict *every* type to the terminal pair `(0, L_b - 1)`,
@@ -137,7 +137,12 @@ def build_cyclization_validity_mask(
     if cond_type is not None:
         type_ids = torch.arange(NUM_CYCLIZATION_TYPES, device=device)  # [3]
         requested = cond_type[:, None] == type_ids[None, :]  # [B, 3]
-        unconditional = (cond_type == UNSPECIFIED)[:, None]  # [B, 1]
+        # LINEAR joins UNSPECIFIED here rather than restricting to an empty slice. A
+        # LINEAR row asks for no ring at all, carries `has_cyclization=False`, and is
+        # excluded from the linkage loss upstream -- but an all-False validity mask
+        # would still feed a fully-masked softmax to any metric that reads this, so
+        # leave its candidate set unrestricted and let the loss's own mask drop it.
+        unconditional = torch.isin(cond_type, torch.as_tensor(NON_RING_COND_TYPES, device=device))[:, None]  # [B, 1]
         allowed_types = requested | unconditional  # [B, 3]
         valid = valid & allowed_types[:, None, None, :]
 

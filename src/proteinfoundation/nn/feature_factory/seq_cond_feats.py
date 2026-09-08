@@ -6,7 +6,11 @@ import torch
 from loguru import logger
 from torch_scatter import scatter_mean
 
-from proteinfoundation.cyclization.constants import NUM_CYCLIZATION_COND_TYPES, UNSPECIFIED
+from proteinfoundation.cyclization.constants import (
+    COND_TYPE_TO_NAME,
+    NUM_CYCLIZATION_COND_TYPES,
+    UNSPECIFIED,
+)
 from proteinfoundation.nn.feature_factory.base_feature import Feature
 from proteinfoundation.nn.feature_factory.feature_utils import (
     get_index_embedding,
@@ -432,6 +436,53 @@ class CyclizationTypeSeqFeat(Feature):
         super().__init__(dim=cyc_emb_dim)
         self.embedding = torch.nn.Embedding(NUM_CYCLIZATION_COND_TYPES, cyc_emb_dim)
         self._has_logged = False
+        # Set by `_load_from_state_dict` when an older checkpoint is padded; None means the
+        # weights match the current type table and every index is trained.
+        self._trained_num_types = None
+
+    def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict,
+                              missing_keys, unexpected_keys, error_msgs):
+        """Accept checkpoints trained before a conditioning type was added.
+
+        `NUM_CYCLIZATION_COND_TYPES` sizes this embedding, so appending a type (LINEAR, taking
+        the table from 4 to 5) makes every earlier checkpoint fail to load with a bare
+        `size mismatch ... [4, 256] vs [5, 256]` -- not just in training but in every design,
+        eval and editing script. That is a code-vs-weights version skew, which is exactly what
+        this hook exists for, so the rows are padded here rather than at each call site.
+
+        This is only sound because new types are APPENDED. Rows 0..n_old-1 of an old
+        checkpoint keep their meaning only if the indices they were trained on still mean the
+        same thing -- MAINCHAIN=0, DISULFIDE=1, ISOPEPTIDE=2, UNSPECIFIED=3. RENUMBERING an
+        existing type (say inserting LINEAR at 3 and pushing UNSPECIFIED to 4) would leave
+        this padding silently reading a row trained as one type as though it were another,
+        and nothing here can detect that -- the checkpoint stores indices, not names. If the
+        table is ever reordered rather than extended, old checkpoints must be remapped or
+        retrained, not padded.
+
+        The new rows are ZERO, not random: zero is the codebase's representation of "no
+        information" for an absent feature, and a random row would inject a fixed nonzero bias
+        into the conditioning vector of a type the checkpoint never learned. Either way the
+        row is untrained, so `forward` REFUSES to embed it -- padding makes an old checkpoint
+        loadable, it does not make it able to honour a type it has never seen.
+        """
+        key = prefix + "embedding.weight"
+        w = state_dict.get(key)
+        if w is not None and w.dim() == 2 and w.shape[0] < self.embedding.num_embeddings:
+            n_old = w.shape[0]
+            state_dict[key] = torch.cat(
+                [w, w.new_zeros(self.embedding.num_embeddings - n_old, w.shape[1])], dim=0)
+            self._trained_num_types = n_old
+            added = ", ".join(
+                f"{i}={COND_TYPE_TO_NAME.get(i, '?')}"
+                for i in range(n_old, self.embedding.num_embeddings))
+            logger.warning(
+                "CyclizationTypeSeqFeat: checkpoint was trained with {} cyclization "
+                "conditioning types but the code now defines {}. Padding the embedding with "
+                "zero rows for [{}] so the checkpoint loads. These types are UNTRAINED and "
+                "requesting one is a hard error, not a silent fallback.",
+                n_old, self.embedding.num_embeddings, added)
+        return super()._load_from_state_dict(state_dict, prefix, local_metadata, strict,
+                                             missing_keys, unexpected_keys, error_msgs)
 
     def forward(self, batch):
         b, n = self.extract_bs_and_n(batch)
@@ -443,5 +494,19 @@ class CyclizationTypeSeqFeat(Feature):
                 logger.warning("No cyclization_type_cond in batch, using UNSPECIFIED for CyclizationTypeSeqFeat")
                 self._has_logged = True
             cond_type = torch.full((b,), UNSPECIFIED, dtype=torch.long, device=device)
+        if self._trained_num_types is not None:
+            # A padded checkpoint has zero rows for the types added after it was trained.
+            # Embedding one would return a zero vector that looks like an ordinary
+            # conditioning signal, so the run would appear to honour the request and quietly
+            # ignore it. Fail instead.
+            worst = int(cond_type.max())
+            if worst >= self._trained_num_types:
+                raise RuntimeError(
+                    f"cyclization type {worst} ({COND_TYPE_TO_NAME.get(worst, '?')}) was "
+                    f"requested, but this checkpoint was trained with only "
+                    f"{self._trained_num_types} conditioning types "
+                    f"({', '.join(COND_TYPE_TO_NAME.get(i, '?') for i in range(self._trained_num_types))}) "
+                    f"and its embedding row for that type is an untrained zero. Retrain, or "
+                    f"request a type the checkpoint knows.")
         emb = self.embedding(cond_type)  # [b, cyc_emb_dim]
         return emb[:, None, :].expand(b, n, -1)  # [b, n, cyc_emb_dim]

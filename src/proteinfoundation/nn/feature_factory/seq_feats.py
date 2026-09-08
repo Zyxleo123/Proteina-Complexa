@@ -7,6 +7,7 @@ from torch.nn import functional as F
 from proteinfoundation.nn.feature_factory.base_feature import Feature
 from proteinfoundation.nn.feature_factory.feature_utils import bin_and_one_hot, compute_backbone_continuity_mask
 from proteinfoundation.utils.angle_utils import bond_angles, signed_dihedral_angle
+from proteinfoundation.utils.seq_conditioning import resolve_sequence_conditioning_mask
 
 
 class XscBBCASeqFeat(Feature):
@@ -180,9 +181,16 @@ class ResidueTypeSeqFeat(Feature):
 
 class OptionalResidueTypeSeqFeat(ResidueTypeSeqFeat):
     """
-    If `use_residue_type_feature` in batch and true, adds residue type feature of shape [b, n, 20].
+    Reveals (part of) the BINDER sequence to the network, feature of shape [b, n, 20].
 
-    If `use_residue_type_feature` not in batch, defaults to False.
+    Driven by `batch["use_residue_type_feature"]`, which may be False/absent (reveal
+    nothing -- the default), True (reveal everything), a [b] bool tensor (per-example
+    all-or-nothing) or a [b, n] bool tensor (per-residue: a partial sequence). See
+    `proteinfoundation.utils.seq_conditioning` for why the per-residue form exists and why
+    an unrevealed position is the all-zero vector rather than a 21st channel.
+
+    A revealed position is a one-hot; an unrevealed one is all zeros. Padding is always
+    zeroed, both by `ResidueTypeSeqFeat` and by the pad-intersection below.
     """
 
     def __init__(self, **kwargs):
@@ -190,17 +198,29 @@ class OptionalResidueTypeSeqFeat(ResidueTypeSeqFeat):
         self._has_logged = False
 
     def forward(self, batch):
-        if batch.get("use_residue_type_feature", False):  # defaults to False
-            return super().forward(batch)
+        b, n = self.extract_bs_and_n(batch)
+        device = self.extract_device(batch)
+
+        # Same precedence as ResidueTypeSeqFeat.forward, so the pad mask used to gate the
+        # reveal cannot disagree with the one used to zero the one-hot.
+        if "mask_dict" in batch:
+            pad_mask = batch["mask_dict"].get("residue_type", None)
         else:
-            b, n = self.extract_bs_and_n(batch)
-            device = self.extract_device(batch)
+            pad_mask = batch.get("mask", None)
+        provided = resolve_sequence_conditioning_mask(
+            batch.get("use_residue_type_feature", False), b, n, device, pad_mask=pad_mask
+        )  # [b, n] bool, or None
+
+        if provided is None:
             if not self._has_logged:
                 logger.warning(
                     "use_residue_type_feature disabled or not in batch, returning zeros for OptionalResidueTypeSeqFeat"
                 )
                 self._has_logged = True
             return torch.zeros(b, n, 20, device=device)
+
+        feat = super().forward(batch)  # [b, n, 20], one-hot, padding already zeroed
+        return feat * provided[..., None].to(feat.dtype)
 
 
 class AtomisticCoorsSeqFeat(Feature):

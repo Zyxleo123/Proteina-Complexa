@@ -8,11 +8,12 @@ import numpy as np
 import torch
 from atomworks.io.tools.rdkit import atom_array_from_rdkit
 from loguru import logger
+from openfold.np.residue_constants import restype_order
 from rdkit import Chem
 from torch.nn import functional as F
 from torch.utils.data import Dataset
 
-from proteinfoundation.cyclization.constants import NAME_TO_CYCLIZATION_TYPE, UNSPECIFIED
+from proteinfoundation.cyclization.constants import LINEAR, NAME_TO_CYCLIZATION_TYPE, UNSPECIFIED
 from proteinfoundation.datasets.atomworks_ligand_transforms import get_af3_raw_molecule_features, get_laplacian_pe
 from proteinfoundation.nn.feature_factory.feature_utils import BOND_ORDER_MAP
 from proteinfoundation.utils.motif_utils import parse_motif, save_motif_csv
@@ -384,19 +385,25 @@ def _parse_cyclization_type_request(cyclization_type: str | None) -> int | None:
     """Resolve a configured cyclization-type name to its conditioning index.
 
     Accepts a name from the canonical vocabulary ("mainchain", "disulfide", "isopeptide"),
-    or "unspecified" / None to leave the choice to the model. Raises on an unknown name
-    rather than falling through to UNSPECIFIED: a typo'd type would otherwise look exactly
-    like a successful run whose conditioning did nothing.
+    "linear" to request an explicitly acyclic binder, or "unspecified" / None to leave the
+    choice to the model. Raises on an unknown name rather than falling through to
+    UNSPECIFIED: a typo'd type would otherwise look exactly like a successful run whose
+    conditioning did nothing.
+
+    "none" and "null" mean UNSPECIFIED, not LINEAR -- they meant that before the LINEAR
+    token existed and configs in the wild rely on it. Ask for "linear" explicitly.
     """
     if cyclization_type is None:
         return None
     name = str(cyclization_type).strip().lower()
     if name in ("", "none", "null", "unspecified"):
         return UNSPECIFIED
+    if name == "linear":
+        return LINEAR
     if name not in NAME_TO_CYCLIZATION_TYPE:
         raise ValueError(
             f"Unknown cyclization_type {cyclization_type!r}. "
-            f"Expected one of {sorted(NAME_TO_CYCLIZATION_TYPE)}, 'unspecified', or null."
+            f"Expected one of {sorted(NAME_TO_CYCLIZATION_TYPE)}, 'linear', 'unspecified', or null."
         )
     return NAME_TO_CYCLIZATION_TYPE[name]
 
@@ -959,6 +966,122 @@ class MultimerFeatures(ConditionalFeature):
 
     def setup(self, nres: list[int]):
         pass
+
+
+class PeptideSequenceFeatures(ConditionalFeature):
+    """Reveal a user-supplied peptide sequence to the generator: "generate the rest".
+
+    Writes ``residue_type`` and a per-residue ``use_residue_type_feature`` mask into each
+    sample, which `OptionalResidueTypeSeqFeat` picks up. Nothing else in the sampler needs to
+    change -- conditioning on sequence is an input feature, not a constraint on the generated
+    variables (see `proteinfoundation.utils.seq_conditioning`).
+
+    Sequences are one-letter, and any character that is NOT one of the 20 standard residues
+    (conventionally ``X`` or ``-``) marks a position to LEAVE FREE. So::
+
+        ACDEFGHIK          fold this exact 9-mer
+        AC--FGH--K         keep these 6, design the other 3
+        XXXXXXXXX          equivalent to no conditioning at all
+
+    Lengths come from the sequences themselves. If ``nres`` was already populated by another
+    conditional feature, every sequence must match its slot's length -- a silent
+    truncate/pad here would produce structures for a peptide the user did not ask for.
+
+    Args:
+        sequences: list of one-letter sequences, or a path to a FASTA file.
+        cyclization_type: optional name ("mainchain" / "disulfide" / "isopeptide" /
+            "unspecified"), applied to every sequence. Per-sequence types can be given in
+            FASTA headers as ``>name cyclization_type=mainchain``.
+    """
+
+    def __init__(
+        self,
+        sequences: list[str] | str,
+        cyclization_type: str | None = None,
+    ):
+        super().__init__()
+        self.sequences, self.per_seq_types = self._load(sequences)
+        self.cyclization_type = cyclization_type
+        self.default_type_idx = _parse_cyclization_type_request(cyclization_type)
+        if not self.sequences:
+            raise ValueError("PeptideSequenceFeatures got no sequences.")
+
+    def __repr__(self):
+        return (
+            f"PeptideSequenceFeatures(n={len(self.sequences)}, "
+            f"cyclization_type={self.cyclization_type!r})"
+        )
+
+    @staticmethod
+    def _load(sequences: list[str] | str) -> tuple[list[str], list[str | None]]:
+        """Return (sequences, per-sequence cyclization type names)."""
+        if isinstance(sequences, str) and os.path.exists(sequences):
+            seqs, types, cur, cur_type = [], [], [], None
+            with open(sequences) as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    if line.startswith(">"):
+                        if cur:
+                            seqs.append("".join(cur))
+                            types.append(cur_type)
+                        cur, cur_type = [], None
+                        for tok in line[1:].split():
+                            if tok.lower().startswith("cyclization_type="):
+                                cur_type = tok.split("=", 1)[1]
+                    else:
+                        cur.append(line)
+            if cur:
+                seqs.append("".join(cur))
+                types.append(cur_type)
+            return seqs, types
+        if isinstance(sequences, str):
+            sequences = [sequences]
+        seqs = [str(x).strip() for x in sequences]
+        return seqs, [None] * len(seqs)
+
+    def setup(self, nres: list[int]):
+        lengths = [len(seq) for seq in self.sequences]
+        if any(n <= 0 for n in lengths):
+            raise ValueError("PeptideSequenceFeatures got an empty sequence.")
+        if len(nres) == 0:
+            nres.extend(lengths)
+            return
+        if len(nres) != len(self.sequences):
+            raise ValueError(
+                f"PeptideSequenceFeatures got {len(self.sequences)} sequences but nres has "
+                f"{len(nres)} entries. One sequence per generated peptide is required -- "
+                "recycling sequences across slots would silently mislabel the outputs."
+            )
+        for idx, (n, length) in enumerate(zip(nres, lengths, strict=True)):
+            if int(n) != length:
+                raise ValueError(
+                    f"Sequence {idx} has length {length} but nres[{idx}] is {int(n)}. "
+                    "Set nres from the sequences (leave it empty) or fix the mismatch; "
+                    "padding or truncating here would generate a different peptide."
+                )
+
+    def __call__(self, result: dict, sample_idx: int):
+        seq = self.sequences[sample_idx]
+        n = len(seq)
+        residue_type = torch.zeros(n, dtype=torch.long)
+        provided = torch.zeros(n, dtype=torch.bool)
+        for i, ch in enumerate(seq):
+            idx = restype_order.get(ch.upper())
+            if idx is not None:
+                residue_type[i] = int(idx)
+                provided[i] = True
+        result["residue_type"] = residue_type
+        # Per-residue, so an `X` in the sequence really is left to the model.
+        result["use_residue_type_feature"] = provided
+        result["peptide_sequence"] = seq
+
+        type_name = self.per_seq_types[sample_idx]
+        type_idx = self.default_type_idx if type_name is None else _parse_cyclization_type_request(type_name)
+        if type_idx is not None:
+            result["cyclization_type_cond"] = torch.tensor(type_idx, dtype=torch.long)
+        return result
 
 
 def collate_fn(batch: list[dict], padding_values: dict | None = None):

@@ -10,6 +10,7 @@ from typing import Any
 import torch
 
 from proteinfoundation.utils.fold_utils import mask_cath_code_by_level
+from proteinfoundation.utils.seq_conditioning import sample_sequence_conditioning_mask
 
 
 def _safe_get(cfg: Any, key: str, default: Any) -> Any:
@@ -224,13 +225,20 @@ def handle_batch_conditioning(
     # Must run before self-conditioning, so the inner NN call sees the same
     # (possibly dropped) type the outer one will.
     batch = handle_cyclization_type_dropout(batch, cyclization_type_dropout_rate)
+    # Also must run before self-conditioning, and for the same reason: `handle_self_cond`
+    # does an inner NN forward whose output is fed back as `x_sc`. Deciding what sequence is
+    # revealed AFTER that forward means the inner pass runs unconditioned while the outer
+    # pass runs conditioned, so the model is trained to consume an `x_sc` produced without
+    # the very sequence it is being asked to honour -- and at sampling time every step sees
+    # a conditioned `x_sc`. (This ordering bug affected the pre-existing
+    # `p_folding_n_inv_folding_iters` path too; it is fixed here for both.)
+    batch = handle_folding_n_inverse_folding(batch, training_cfg)
     batch = handle_self_cond(batch, training_cfg, call_nn_fn, fm)
     # DEPRECATED: target conditioning is now handled via conditional features
     # in the data pipeline, not during the training step.
     # batch = handle_target_cond(batch, target_cond)
     batch = handle_target_dropout(batch, target_dropout_rate)
     batch = handle_motif_dropout(batch, motif_dropout_rate)
-    batch = handle_folding_n_inverse_folding(batch, training_cfg)
 
     return batch, n_recycle
 
@@ -252,8 +260,16 @@ def handle_folding_n_inverse_folding(batch: dict, training_cfg: Any) -> dict:
     """
     With probability p, enable folding or inverse folding iteration for the batch.
 
-    Adds use_ca_coors_nm_feature (folding) or use_residue_type_feature
-    (inverse folding) to batch, each with 50% of the probability mass.
+    Adds use_ca_coors_nm_feature (inverse folding: Ca trace given) or
+    use_residue_type_feature (folding: sequence given) to batch, each with 50% of the
+    probability mass.
+
+    When `training.sequence_conditioning.enabled` is set, the residue-type half is replaced
+    by a per-example, per-residue reveal mask drawn by
+    `sample_sequence_conditioning_mask` -- see `proteinfoundation.utils.seq_conditioning`.
+    That is the path that supports "here is the peptide sequence, generate the rest";
+    the legacy all-or-nothing draw is far too coarse to train it (one bit per BATCH, at
+    7.5% of steps).
 
     Args:
         batch: Training batch.
@@ -264,6 +280,21 @@ def handle_folding_n_inverse_folding(batch: dict, training_cfg: Any) -> dict:
     """
     batch["use_ca_coors_nm_feature"] = False
     batch["use_residue_type_feature"] = False
+
+    seq_cfg = _safe_get(training_cfg, "sequence_conditioning", None)
+    if seq_cfg is not None and bool(_safe_get(seq_cfg, "enabled", False)):
+        # Sequence conditioning supersedes the coarse folding-iteration draw for the
+        # residue-type channel: it is the same channel, sampled at per-residue resolution
+        # and per example. The inverse-folding (Ca-given) draw is left alone below.
+        batch["use_residue_type_feature"] = sample_sequence_conditioning_mask(
+            pad_mask=batch["mask"],
+            p=float(_safe_get(seq_cfg, "p", 0.5)),
+            keep_frac_min=float(_safe_get(seq_cfg, "keep_frac_min", 0.25)),
+            keep_frac_max=float(_safe_get(seq_cfg, "keep_frac_max", 1.0)),
+            p_full=float(_safe_get(seq_cfg, "p_full", 0.5)),
+        )
+        return batch
+
     prob = _safe_get(training_cfg, "p_folding_n_inv_folding_iters", 0.0)
     if random.random() < prob:
         if random.random() < 0.5:

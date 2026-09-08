@@ -24,7 +24,7 @@ import numpy as np
 import pandas as pd
 import torch
 from loguru import logger
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 
 from proteinfoundation.datasets.transforms import Data
 from proteinfoundation.utils.constants import UNIFIED_ATOM37_ENCODING
@@ -799,6 +799,18 @@ class StructureDataModule(L.LightningDataModule):
         pipeline_target: Optional path to pipeline build function (e.g. "module.build_pipeline").
         atomarray_transforms: List of transforms for AtomArray (simple mode).
         atom37_transforms: Transforms for atom37 Data (applied after conversion).
+        source_column: Metadata column naming which dataset each row came from. Only
+            read when `source_fractions` is set.
+        source_fractions: Optional {source name: share of each batch}. Turns the train
+            dataloader from uniform shuffling into weighted sampling with replacement,
+            so a small dataset mixed into a large one gets the share you asked for
+            instead of its natural proportion. See `_compute_sample_weights`.
+
+            NOTE: single-device only. Lightning's `use_distributed_sampler` replaces a
+            custom sampler under DDP, which would silently drop the weighting; every
+            config using this runs `hardware.ngpus_per_node_: 1`. Revisit before
+            scaling out.
+        val_source_fractions: Refused if set -- see `__init__`.
     """
 
     def __init__(
@@ -823,6 +835,9 @@ class StructureDataModule(L.LightningDataModule):
         val_filters: list[str] | None = None,
         pad_max_total_tokens: int | None = None,
         pad_group_priority: list[str] | None = None,
+        source_column: str = "dataset_source",
+        source_fractions: dict[str, float] | None = None,
+        val_source_fractions: dict[str, float] | None = None,
         **pipeline_kwargs,
     ):
         super().__init__()
@@ -845,10 +860,24 @@ class StructureDataModule(L.LightningDataModule):
         self.val_filters = val_filters
         self.pad_max_total_tokens = pad_max_total_tokens
         self.pad_group_priority = pad_group_priority
+        self.source_column = source_column
+        self.source_fractions = dict(source_fractions) if source_fractions else None
+        if val_source_fractions:
+            # Refused at construction, not at setup(): the val dataloader iterates the
+            # whole val split in order and has nowhere to apply a weighting, so accepting
+            # the key would report a val loss over a mix the config does not describe.
+            # Failing here means a bad config dies at composition time, before a job has
+            # queued for a GPU.
+            raise ValueError(
+                "val_source_fractions is not supported: the val dataloader iterates the whole val "
+                "split in order, unshuffled and unweighted. Control the val mix when you build the "
+                "val metadata (build_mixed_metadata --val-cpsea-sample), or use val_filters."
+            )
         self.pipeline_kwargs = pipeline_kwargs
 
         self.train_dataset = None
         self.val_dataset = None
+        self.train_sample_weights = None
 
     def setup(self, stage: str | None = None):
         # Load metadata
@@ -876,6 +905,8 @@ class StructureDataModule(L.LightningDataModule):
             n_train = int(len(full_metadata) * self.train_split)
             train_metadata = full_metadata.iloc[:n_train].reset_index(drop=True)
             val_metadata = full_metadata.iloc[n_train:].reset_index(drop=True)
+
+        self.train_sample_weights = self._compute_sample_weights(train_metadata, self.source_fractions)
 
         # Instantiate atom37_transforms if they're config dicts
         atom37_transforms = []
@@ -916,15 +947,83 @@ class StructureDataModule(L.LightningDataModule):
                 **self.pipeline_kwargs,
             )
 
+    def _compute_sample_weights(self, metadata: pd.DataFrame, fractions: dict[str, float]) -> np.ndarray | None:
+        """Per-row sampling weights that make each source occupy its requested share.
+
+        A weighted sampler draws row `k` with probability `w_k / sum(w)`. To give source
+        `s` an expected fraction `f_s` of every batch, every row of `s` gets the same
+        weight `f_s / n_s`, so the source's rows sum to `f_s` regardless of how many
+        there are. This is what lets a 45k linear-peptide pool sit beside 2.44M CPSea
+        rows at a 1:3 ratio instead of vanishing into 1.8% of the data.
+
+        Oversampling is the price: at 25% of a 2.44M-row epoch the 45k pool is drawn
+        ~13x per epoch. That is intended, and it is the reason `sampling_stats` logs the
+        implied repetition factor -- a source repeated too hard will overfit, and you
+        want that number in the run log rather than inferred later from a loss curve.
+
+        Args:
+            metadata: the split's metadata frame; must carry `self.source_column`.
+            fractions: source name -> requested share. Need not sum to 1 (renormalized).
+                Every name must be present in the data, and every source present in the
+                data must be named -- an unmentioned source would silently get weight 0.
+
+        Returns:
+            float64 array of length `len(metadata)`, or None if `fractions` is empty.
+        """
+        if not fractions:
+            return None
+        if self.source_column not in metadata.columns:
+            raise ValueError(
+                f"source_fractions was given but metadata has no {self.source_column!r} column "
+                f"(columns: {list(metadata.columns)}). Either build a mixed metadata file with "
+                f"that column, add it to `columns_to_load`, or drop source_fractions."
+            )
+        counts = metadata[self.source_column].value_counts()
+        requested = set(fractions)
+        present = set(counts.index)
+        if requested != present:
+            raise ValueError(
+                f"source_fractions keys must match the sources present in the metadata exactly. "
+                f"Requested {sorted(requested)}, found {sorted(present)}. "
+                f"Missing from data: {sorted(requested - present)}; "
+                f"unweighted in config (would be sampled never): {sorted(present - requested)}."
+            )
+        total_frac = float(sum(fractions.values()))
+        if total_frac <= 0:
+            raise ValueError(f"source_fractions must sum to a positive number, got {fractions}")
+
+        per_row = {s: (float(f) / total_frac) / int(counts[s]) for s, f in fractions.items()}
+        weights = metadata[self.source_column].map(per_row).to_numpy(dtype=np.float64)
+
+        n_total = len(metadata)
+        lines = []
+        for s in sorted(fractions):
+            frac = float(fractions[s]) / total_frac
+            n_s = int(counts[s])
+            lines.append(f"{s}: n={n_s} natural={n_s / n_total:.4f} -> target={frac:.4f} (repeat x{frac * n_total / n_s:.1f})")
+        logger.info(f"[StructureDataModule] weighted sampling over {n_total} rows | " + " | ".join(lines))
+        return weights
+
     def train_dataloader(self):
         collate_fn = make_collate_fn(
             pad_max_total_tokens=self.pad_max_total_tokens,
             pad_group_priority=self.pad_group_priority,
         )
+        sampler = None
+        if self.train_sample_weights is not None:
+            # `replacement=True` is what oversampling a small source requires; an epoch
+            # is defined as len(dataset) draws so step counts stay comparable to an
+            # unweighted run of the same metadata.
+            sampler = WeightedRandomSampler(
+                weights=torch.as_tensor(self.train_sample_weights, dtype=torch.double),
+                num_samples=len(self.train_dataset),
+                replacement=True,
+            )
         return DataLoader(
             self.train_dataset,
             batch_size=self.batch_size,
-            shuffle=True,
+            shuffle=sampler is None,
+            sampler=sampler,
             num_workers=self.num_workers,
             pin_memory=self.pin_memory,
             collate_fn=collate_fn,

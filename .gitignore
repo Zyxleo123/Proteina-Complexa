@@ -108,6 +108,7 @@ params
 # Per-submission SLURM env files and job logs (scripts/submit_*.sh write one timestamped
 # env file per submission and pass its path positionally to the batch script).
 .slurm_envs/
+env_files/
 slurm_logs/
 
 # Rosetta native-baseline calibration outputs -- relaxed PDBs plus timing CSVs, one dir

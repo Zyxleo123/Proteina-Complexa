@@ -1020,6 +1020,7 @@ class ProductSpaceFlowMatcher(L.LightningModule):
         guidance_w: float = 1.0,
         ag_ratio: float = 0.0,
         grad_enabled: bool = False,
+        guidance_fn: Callable | None = None,
     ) -> dict[str, Tensor]:
         """
         Generates samples by simulating the
@@ -1053,6 +1054,13 @@ class ProductSpaceFlowMatcher(L.LightningModule):
                 a reward defined on the FINAL sample must reach the weights: activations
                 for `end_step - start_step` network evaluations are then kept alive, so
                 keep that window short.
+            guidance_fn (Callable): Optional per-step correction applied AFTER the Euler
+                step: `x = guidance_fn(x, batch=..., x_pre=..., x_1_pred=..., t=..., dt=...,
+                mask=..., step=...)`. Default None, which is exactly the un-hooked loop --
+                every existing caller (beam search, FK steering, MCTS, design) is unaffected.
+                Post-step rather than a correction to `v` on purpose: `sampling_mode: sc`
+                converts v -> score -> v with a 1/(1-t) factor, so a delta added to `v`
+                would be silently rescaled by a factor that diverges as t -> 1.
 
         Returns:
             Tuple of (x, x_1_pred):
@@ -1080,6 +1088,7 @@ class ProductSpaceFlowMatcher(L.LightningModule):
                 device=device,
                 guidance_w=guidance_w,
                 ag_ratio=ag_ratio,
+                guidance_fn=guidance_fn,
             )
 
     def _simulation_loop(
@@ -1099,6 +1108,7 @@ class ProductSpaceFlowMatcher(L.LightningModule):
         device: torch.device,
         guidance_w: float,
         ag_ratio: float,
+        guidance_fn: Callable | None = None,
     ) -> dict[str, Tensor]:
         """Euler loop shared by `partial_simulation`; carries no grad policy of its own."""
         for step in range(start_step, end_step):
@@ -1132,6 +1142,7 @@ class ProductSpaceFlowMatcher(L.LightningModule):
             x_1_pred = self.nn_out_to_clean_sample_prediction(batch=batch, nn_out=nn_out)
             # Dict[data_mode, torch.Tensor]
 
+            x_pre = x
             x = self.simulation_step(
                 x_t=x,
                 nn_out=nn_out,
@@ -1141,6 +1152,15 @@ class ProductSpaceFlowMatcher(L.LightningModule):
                 mask=mask,
                 simulation_step_params=simulation_step_params,
             )
+
+            if guidance_fn is not None:
+                # `batch` still carries this step's x_t / t / conditioning, which a gradient
+                # guidance that re-runs the network (DPS) needs; `x_pre` lets the hook size
+                # its correction against the sampler's own step for this data mode.
+                x = guidance_fn(
+                    x, batch=batch, x_pre=x_pre, x_1_pred=x_1_pred, t=t, dt=dt,
+                    mask=mask, step=step,
+                )
 
         return x, x_1_pred
 

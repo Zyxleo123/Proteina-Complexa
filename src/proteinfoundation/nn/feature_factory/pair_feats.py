@@ -145,7 +145,8 @@ class CyclizationGraphPositionalPairFeat(Feature):
       - **Endpoints**: ``cyclization_i``/``cyclization_j`` when the batch carries them
         (the CPSea training labels); otherwise the binder termini, which is what every
         native and generated cyclic peptide measured here actually closes.
-      - **Active**: ``cyclization_type_cond != UNSPECIFIED``. That key is what the
+      - **Active**: ``is_ring_request(cyclization_type_cond)`` -- a concrete chemistry,
+        so neither ``UNSPECIFIED`` ("any") nor ``LINEAR`` ("none"). That key is what the
         type-dropout handler rewrites and what the generation pipeline stamps, so
         dropped rows, unlabeled rows, and unconditional sampling all correctly get the
         all-zero feature -- the cycle graph and the type conditioning switch off
@@ -215,10 +216,14 @@ class CyclizationGraphPositionalPairFeat(Feature):
 
     def _resolve_active(self, batch, b, device):
         """[b] bool: is a cyclization actually requested for this sample?"""
-        from proteinfoundation.cyclization.constants import UNSPECIFIED
+        from proteinfoundation.cyclization.constants import is_ring_request
 
         if "cyclization_type_cond" in batch:
-            return batch["cyclization_type_cond"].to(device=device).long() != UNSPECIFIED
+            # `is_ring_request`, not `!= UNSPECIFIED`: LINEAR is an explicit request for
+            # *no* ring, so it must produce the all-zero feature exactly as a dropped row
+            # does. Handing a linear peptide a cycle graph would assert a bond it does
+            # not have.
+            return is_ring_request(batch["cyclization_type_cond"].to(device=device).long())
         if "has_cyclization" in batch:
             return batch["has_cyclization"].to(device=device).bool()
         return torch.zeros(b, dtype=torch.bool, device=device)

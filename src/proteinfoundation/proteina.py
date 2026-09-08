@@ -30,12 +30,14 @@ from proteinfoundation.eval.sampled_binder_metrics import (
     atom37_mask_from_aatype,
     sampled_binder_metrics,
 )
+from proteinfoundation.eval.sequence_recovery_metrics import sequence_recovery_metrics
 from proteinfoundation.eval.surface_metrics import batch_surface_agreement_from_ca
 from proteinfoundation.flow_matching.product_space_flow_matcher import ProductSpaceFlowMatcher
 from proteinfoundation.logging.metric_schema import finalize_metrics, init_metric_dict
 from proteinfoundation.nn.genie2 import Genie2Denoiser
 from proteinfoundation.utils.file_utils import create_dir as _create_dir
 from proteinfoundation.utils.sample_utils import add_clean_samples, sample_formatting
+from proteinfoundation.utils.seq_conditioning import sequence_conditioning_fraction
 from proteinfoundation.utils.training_handlers import _safe_get as _safe_cfg_get
 from proteinfoundation.utils.training_handlers import handle_batch_conditioning
 from proteinfoundation.utils.validation_utils import (
@@ -991,7 +993,15 @@ class Proteina(L.LightningModule):
                     add_dataloader_idx=False,
                 )
 
-                f_fold = batch["use_residue_type_feature"] * 1.0 / p_aux
+                # `use_residue_type_feature` may now be a [b] or [b, n] bool tensor
+                # (per-residue sequence conditioning), not just a python bool -- reduce it
+                # to the scalar revealed-fraction so this stays a scalar log.
+                f_fold = (
+                    sequence_conditioning_fraction(
+                        batch["use_residue_type_feature"], bs, batch["mask"].shape[1], self.device
+                    )
+                    / p_aux
+                )
                 self.log(
                     f"{log_prefix}_fold_iter/loss_{log_name}",
                     loss * f_fold,
@@ -2234,13 +2244,35 @@ class Proteina(L.LightningModule):
         # batch exactly as the design pipeline would.
         if self.val_gen_enabled:
             self.validation_step_generate(batch, batch_idx)
+            # Second pass, sequence conditioned. Costs one more ODE integration per val batch,
+            # so it is off unless asked for. It is a SEPARATE pass rather than a fraction of
+            # the first because mixing conditioned and unconditioned samples into one set of
+            # metrics makes both unreadable.
+            if _safe_cfg_get(_safe_cfg_get(self.val_gen_cfg, "seq_cond", None), "enabled", False):
+                self.validation_step_generate(
+                    batch, batch_idx, seq_cond=True, prefix="val_gen_seqcond"
+                )
         with torch.no_grad():
             loss = self.training_step(batch, batch_idx=-1)
             self.validation_output_data.append(loss.item())
 
     @torch.no_grad()
-    def validation_step_generate(self, batch: dict, batch_idx: int) -> None:
+    def validation_step_generate(
+        self,
+        batch: dict,
+        batch_idx: int,
+        seq_cond: bool = False,
+        prefix: str = "val_gen",
+    ) -> None:
         """Integrates the ODE from t=0 on a real val complex and scores what comes out.
+
+        With ``seq_cond=True`` the binder's true sequence (or a random subset of it, per
+        ``val_generation.seq_cond.keep_frac``) is revealed to the network first, so this
+        measures the "sequence given, generate the rest" query rather than the free one, and
+        logs under ``prefix`` (``val_gen_seqcond`` by default) alongside a sequence-recovery
+        rate. Recovery is the load-bearing number: it is the only thing that distinguishes a
+        model that HONOURS the conditioning from one that quietly ignores the channel while
+        its closure and geometry metrics look identical.
 
         This is the only validation signal here that is NOT teacher-forced. Every other logged
         metric (flow loss, t-binned loss, `run_four_way_decode_eval`) builds `x_t` by interpolating
@@ -2330,6 +2362,25 @@ class Proteina(L.LightningModule):
 
         self.apply_cyclization_type_conditioning(gen_batch, bs=bs)
 
+        # Sequence conditioning. Reveal the binder sequence (or a subset) BEFORE integrating,
+        # so every ODE step sees it -- including the self-conditioning input, which is exactly
+        # the consistency the training-time ordering fix in `handle_batch_conditioning` buys.
+        seq_cond_mask = None
+        if seq_cond:
+            if "residue_type" not in gen_batch:
+                logger.warning("seq-conditioned val_generation requested but batch has no `residue_type`; skipping.")
+                return
+            keep_frac = float(vg.get("seq_cond", {}).get("keep_frac", 1.0))
+            if keep_frac >= 1.0:
+                seq_cond_mask = gen_mask.clone()
+            else:
+                seq_cond_mask = (torch.rand_like(gen_mask, dtype=torch.float32) < keep_frac) & gen_mask
+            gen_batch["use_residue_type_feature"] = seq_cond_mask
+        else:
+            # A val batch is a plain data batch, but be explicit: an unconditioned pass must
+            # not inherit a flag from anywhere.
+            gen_batch["use_residue_type_feature"] = False
+
         gen_samples = self.fm.full_simulation(
             batch=gen_batch,
             predict_for_sampling=partial(self.predict_for_sampling, n_recycle=n_recycle),
@@ -2373,7 +2424,7 @@ class Proteina(L.LightningModule):
             target_mask=gen_batch.get("target_mask"),
             target_hotspot_mask=gen_batch.get("target_hotspot_mask"),
             n_repeat=n_repeat,
-            prefix="val_gen",
+            prefix=prefix,
         )
 
         # Surface agreement on the ODE sample (oracle / shuffle arms). Teacher-forced FM loss
@@ -2386,7 +2437,7 @@ class Proteina(L.LightningModule):
                     surface_xyz_nm=gen_batch["surface_xyz"],
                     surface_mask=gen_batch["surface_mask"],
                     surface_normals=gen_batch.get("surface_normals"),
-                    prefix="val_gen/surface",
+                    prefix=f"{prefix}/surface",
                 )
             )
 
@@ -2407,24 +2458,43 @@ class Proteina(L.LightningModule):
                 atom37_mask=atom37_mask_from_aatype(aatype) & gen_mask[..., None],
                 seq_tokens=aatype.long(),
                 cyclization_metadata=meta,
-                prefix="val_gen/cyc",
+                prefix=f"{prefix}/cyc",
             )
-            metrics.update({f"val_gen/cyc/{s}": raw[f"val_gen/cyc/{s}"] for s in CYCLIC_PRED_ONLY_SUFFIXES})
+            metrics.update({f"{prefix}/cyc/{s}": raw[f"{prefix}/cyc/{s}"] for s in CYCLIC_PRED_ONLY_SUFFIXES})
             if "cyclization_type_satisfied" in cyc:
-                metrics["val_gen/cyc/type_satisfied"] = float(
+                metrics[f"{prefix}/cyc/type_satisfied"] = float(
                     cyc["cyclization_type_satisfied"].float().mean().item()
                 )
         else:
             # Counts are a tally, not a measurement: "no examples" is 0, never NaN (a NaN count
             # would be indistinguishable from an unmeasured rate). Rates stay NaN.
             for s in CYCLIC_PRED_ONLY_SUFFIXES:
-                metrics[f"val_gen/cyc/{s}"] = 0.0 if s in CYCLIC_COUNT_SUFFIXES else float("nan")
-            metrics["val_gen/cyc/type_satisfied"] = float("nan")
+                metrics[f"{prefix}/cyc/{s}"] = 0.0 if s in CYCLIC_COUNT_SUFFIXES else float("nan")
+            metrics[f"{prefix}/cyc/type_satisfied"] = float("nan")
+
+        # Sequence recovery: did the decoded latents actually produce the residues we asked for?
+        # Split into the conditioned positions (should approach 1.0 -- this is compliance, not
+        # prediction) and the free ones (a genuine design/prediction number, and the thing the
+        # user means by "generate the rest").
+        if seq_cond_mask is not None:
+            metrics.update(
+                sequence_recovery_metrics(
+                    pred_aatype=aatype.long(),
+                    true_aatype=gen_batch["residue_type"].long(),
+                    mask=gen_mask,
+                    cond_mask=seq_cond_mask,
+                    prefix=f"{prefix}/seq",
+                )
+            )
 
         # Rosetta sidecar: dump a capped sample of complexes to disk so a SEPARATE CPU job can score
         # interface dG offline (see eval/val_gen_dump.py). OFF unless `val_generation.rosetta_dump_dir`
         # is set. dG never runs on this GPU path -- it would stall training for minutes per batch.
-        dump_dir = vg.get("rosetta_dump_dir", None)
+        # Never dumped from the sequence-conditioned pass: the sidecar writes one flat pool of
+        # complexes keyed by step, so mixing conditioned and unconditioned samples would give a
+        # dG distribution that is an average over two different experiments with no way to
+        # separate them after the fact.
+        dump_dir = None if seq_cond else vg.get("rosetta_dump_dir", None)
         if dump_dir:
             from proteinfoundation.eval.val_gen_dump import dump_val_gen_complexes
 

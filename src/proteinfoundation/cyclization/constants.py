@@ -24,12 +24,54 @@ NAME_TO_CYCLIZATION_TYPE = {v: k for k, v in CYCLIZATION_TYPE_TO_NAME.items()}
 NO_CYCLIZATION_INDEX = -1
 
 # Conditioning vocabulary. When the desired cyclization type is given as an
-# *input* (see `cyclization.type_conditioning`), it needs a value meaning "no
-# type requested", which the head's 3-way output space cannot express. This
-# extra index is only ever an embedding input; `NUM_CYCLIZATION_TYPES` stays 3
-# so the head's output width -- and every existing checkpoint -- is untouched.
+# *input* (see `cyclization.type_conditioning`), it needs values the head's 3-way
+# output space cannot express. These extra indices are only ever embedding inputs;
+# `NUM_CYCLIZATION_TYPES` stays 3 so the head's output width -- and every existing
+# checkpoint -- is untouched.
+#
+# UNSPECIFIED means "no type requested": the classifier-free-guidance null, and what
+# `cyclization_type_dropout_rate` rewrites rows to.
+#
+# LINEAR means the opposite of a request for "any ring": an explicit request for *no*
+# ring at all. It exists so linear-peptide training data (PepBench / ProtFrag) can be
+# mixed into a cyclic-peptide run without being labeled UNSPECIFIED -- if it were, the
+# CFG null branch would come to mean "linear peptide" rather than "any peptide", which
+# silently changes what `guidance_w > 1` pushes away from. It is also what you request
+# at generation time to sample a linear binder in-distribution.
+#
+# Neither index is a ring request. Anything gating on "is a cycle being asked for"
+# must use `is_ring_request`, never `!= UNSPECIFIED`.
 UNSPECIFIED = 3
-NUM_CYCLIZATION_COND_TYPES = 4
+LINEAR = 4
+NUM_CYCLIZATION_COND_TYPES = 5
+
+# Conditioning indices that are NOT a request for a specific ring chemistry. Both are
+# excluded from the cycle-graph pair features and from the head's candidate-set
+# restriction; see `is_ring_request`.
+NON_RING_COND_TYPES = (UNSPECIFIED, LINEAR)
+
+COND_TYPE_TO_NAME = dict(CYCLIZATION_TYPE_TO_NAME) | {
+    UNSPECIFIED: "unspecified",
+    LINEAR: "linear",
+}
+NAME_TO_COND_TYPE = {v: k for k, v in COND_TYPE_TO_NAME.items()}
+
+
+def is_ring_request(cond_type):
+    """[B] bool: does this row actually ask for a cyclization edge?
+
+    True only for a concrete chemistry (MAINCHAIN / DISULFIDE / ISOPEPTIDE). Both
+    UNSPECIFIED ("any") and LINEAR ("none") are False, so the ring positional encoding
+    and the typed pair channels switch off for them together -- a linear row must not be
+    handed a cycle graph, and an unconditional row must not be told where the ring is.
+
+    Args:
+        cond_type: integer tensor of conditioning indices, any shape.
+
+    Returns:
+        Boolean tensor of the same shape.
+    """
+    return (cond_type != UNSPECIFIED) & (cond_type != LINEAR)
 
 # Amino-acid integer ids, using the project's canonical ordering
 # (`openfold.np.residue_constants.restype_order`, alphabetical one-letter

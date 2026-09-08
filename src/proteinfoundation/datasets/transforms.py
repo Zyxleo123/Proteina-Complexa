@@ -4,6 +4,7 @@ import os
 import random
 import re
 from collections import Counter, defaultdict
+from collections.abc import Iterable
 from pathlib import Path
 from typing import Any, Literal
 
@@ -3081,9 +3082,10 @@ class CyclizationLabelTransform(BaseTransform):
             (sorted i < j), or -1 if unknown.
         cyclization_type: int in {0=MAINCHAIN, 1=DISULFIDE, 2=ISOPEPTIDE}, or
             -1 if unknown. This is the *supervision target*.
-        cyclization_type_cond: same value, but with UNSPECIFIED (3) instead of -1
-            for unlabeled samples. This is the *conditioning input* fed to the
-            network, so it must always be a valid embedding index.
+        cyclization_type_cond: same value, but never -1 -- this is the
+            *conditioning input* fed to the network, so it must always be a valid
+            embedding index. Unlabeled samples become UNSPECIFIED (3); samples the
+            metadata declares linear become LINEAR (4), see `linear_type_names`.
         has_cyclization: bool, False whenever the type/endpoints could not be
             inferred safely (excluded from linkage loss downstream).
 
@@ -3098,15 +3100,47 @@ class CyclizationLabelTransform(BaseTransform):
     `proteinfoundation.cyclization.parse_labels.infer_cyclization_label`.
     """
 
-    def __init__(self, default_binder_chain_id: str = "B", log_every: int = 200):
+    #: Metadata `cyclization_type` values that mean "this peptide is linear by
+    #: construction". Rows carrying one of these skip CONECT parsing entirely and are
+    #: labeled `LINEAR` -- see `__call__`.
+    #:
+    #: Deliberately excludes "none"/"null": on the *generation* side
+    #: `gen_dataset._parse_cyclization_type_request` has long read those as UNSPECIFIED
+    #: ("model's choice"), and one string meaning LINEAR in the dataset while meaning
+    #: UNSPECIFIED at sampling time is exactly the kind of silent mismatch that produces
+    #: a run whose conditioning did nothing.
+    LINEAR_TYPE_NAMES = frozenset({"linear", "acyclic"})
+
+    def __init__(
+        self,
+        default_binder_chain_id: str = "B",
+        log_every: int = 200,
+        linear_type_names: Iterable[str] | None = None,
+    ):
+        """
+        Args:
+            default_binder_chain_id: chain used when the graph carries no `binder_chain_id`.
+            log_every: emit a running label-tally every N examples (0 disables).
+            linear_type_names: metadata `cyclization_type` strings to treat as
+                known-linear. Defaults to `LINEAR_TYPE_NAMES`. These rows get
+                `cyclization_type_cond=LINEAR` instead of `UNSPECIFIED`, which is the
+                whole point of mixing linear-peptide data into a cyclic run: without it
+                the linear examples would train the classifier-free-guidance null rather
+                than a topology of their own. Set to an empty collection to restore the
+                pre-mixing behaviour (every unlabeled row becomes UNSPECIFIED).
+        """
         self.default_binder_chain_id = default_binder_chain_id
         self.log_every = log_every
+        self.linear_type_names = (
+            self.LINEAR_TYPE_NAMES if linear_type_names is None else frozenset(str(n).lower() for n in linear_type_names)
+        )
         self._counts: Counter = Counter()
         self._type_counts: Counter = Counter()
 
     def __call__(self, graph: Data) -> Data:
         from proteinfoundation.cyclization.constants import (
             CYCLIZATION_TYPE_TO_NAME,
+            LINEAR,
             NO_CYCLIZATION_INDEX,
             UNSPECIFIED,
         )
@@ -3117,6 +3151,21 @@ class CyclizationLabelTransform(BaseTransform):
         peptide_length_hint = getattr(graph, "peptide_length", None)
         pdb_path = getattr(graph, "file_path", None)
         residue_pdb_idx = getattr(graph, "residue_pdb_idx", None)
+
+        # Known-linear rows short-circuit: there is no ring to find, so parsing the PDB
+        # for CONECT records would only cost a file read per example (~45k linear rows
+        # per epoch) to arrive at "no label" anyway. `has_cyclization` stays False, so
+        # these contribute nothing to the linkage loss; only the conditioning input
+        # differs from an unlabeled row, and that difference is the topology token.
+        if cyclization_type_hint is not None and str(cyclization_type_hint).lower() in self.linear_type_names:
+            graph.cyclization_i = NO_CYCLIZATION_INDEX
+            graph.cyclization_j = NO_CYCLIZATION_INDEX
+            graph.cyclization_type = NO_CYCLIZATION_INDEX
+            graph.has_cyclization = False
+            graph.cyclization_type_cond = LINEAR
+            self._counts["total"] += 1
+            self._counts["linear"] += 1
+            return graph
 
         label = {
             "i": NO_CYCLIZATION_INDEX,
@@ -3162,6 +3211,7 @@ class CyclizationLabelTransform(BaseTransform):
             logger.info(
                 f"[CyclizationLabelTransform] sanity total={self._counts['total']} "
                 f"labeled={self._counts['labeled']} missing={self._counts['missing']} "
+                f"linear={self._counts['linear']} "
                 f"types={dict(self._type_counts)}"
             )
         return graph

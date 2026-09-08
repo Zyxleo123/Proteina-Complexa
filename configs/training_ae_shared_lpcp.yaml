@@ -1,0 +1,236 @@
+# Shared sidechain-VAE (AutoEncoder) trained on CYCLIC + LINEAR peptide binders.
+#
+# Entry point: python -m proteinfoundation.partial_autoencoder.train --config-name training_ae_shared_lpcp
+# Launcher:    scripts/train_shared_ae.sbatch  (via scripts/submit_lp_mixing.sh)
+#
+# WHAT THIS IS. A sibling of the pinned production AE `finetune_full_128` that differs in
+# exactly one thing: the data. Same warm start (`complexa_ae.ckpt`), same losses, same
+# optimizer, same effective batch of 128 (32 x accum 4), same EMA. Only `metadata_file`
+# and `source_fractions` change. Keeping every other knob byte-identical is what makes a
+# later "did the shared AE cost us anything on cyclic peptides?" question answerable by
+# comparing `val/ae_recon/*` against finetune_full_128 rather than by guesswork.
+#
+# WHY. The downstream flow run mixes linear peptide data (PepBench + ProtFrag) into CPSea
+# so its target-conditioning trunk sees experimental PDB receptors of the kind LNR
+# contains. But the AE defines the `local_latents` regression target, and it only ever
+# sees the BINDER chain -- so if it has never encoded a linear peptide, the flow model is
+# being asked to regress latents that are out-of-distribution for a quarter of its
+# batches. This trains one latent space that covers both topologies.
+#
+# The receptor is NOT part of this. It is never encoded by the AE (see
+# ExtractTargetCoordinatesTransform + FilterTargetResiduesTransform below, which strip it
+# before the encoder sees anything). Target OOD is fixed in the flow model, not here.
+#
+# MIXING. `source_fractions` makes every batch ~25% linear, which is not what the raw
+# counts give you: CPSea full is 2.44M rows against ~45k in-range linear rows, so
+# unweighted sampling would put linear peptides at 1.8% of the data -- present in the
+# manifest, absent from the gradient. The 45k pool is consequently drawn ~13x per epoch;
+# `val/ae_recon/*` split by source is the thing to watch for the linear side overfitting.
+#
+# PIN THE RESULT. Whatever checkpoint this produces becomes the AE for BOTH downstream
+# flow arms (mix and control). Two flow runs loading different AEs have different
+# regression targets and their loss curves are not comparable -- see the project note on
+# the AE checkpoint pin. Snapshot the exact file and record it.
+
+run_name: shared_ae_lpcp_128
+
+# Warm-start from the public Complexa autoencoder (matches nn_ae schema below).
+# Absolute, not ${oc.env:CKPT_PATH}: env.sh does not export CKPT_PATH, so that
+# interpolation only resolves by accident of ordering. This is the exact path
+# finetune_full_128 recorded, so the warm start is identical.
+pretrain_ckpt_path: /zfsauton/scratch/yixiz/Proteina-Complexa/ckpts/complexa_ae.ckpt
+
+force_precision_f32: True
+seed: 42
+
+hardware:
+  ncpus_per_task_train_: 8
+  ncpus_per_task_prepro_: 8
+  accelerator: gpu
+  ngpus_per_node_: 1
+  nnodes_: 1
+
+nn_ae:
+  name: transformer_ae
+  latent_z_dim: &latent_z_dim 8
+  encoder:
+    nlayers: 12
+    token_dim: 768
+    nheads: 12
+    parallel_mha_transition: false
+    strict_feats: false
+    feats_seq:
+      - chain_break_per_res
+      - x1_aatype
+      - x1_a37coors_nm
+      - x1_a37coors_nm_rel
+      - x1_bb_angles
+      - x1_sidechain_angles
+    feats_cond_seq: null
+    dim_cond: 128
+    idx_emb_dim: 128
+    feats_pair_repr:
+      - rel_seq_sep
+      - x1_bb_pair_dists_nm
+      - x1_bb_pair_orientation
+    seq_sep_dim: 127
+    pair_repr_dim: 256
+    update_pair_repr: false
+    update_pair_repr_every_n: 3
+    use_tri_mult: false
+    use_qkln: true
+    normalize_latent: false
+    latent_z_dim: *latent_z_dim
+  decoder:
+    nlayers: 12
+    token_dim: 768
+    abs_coors: false
+    nheads: 12
+    parallel_mha_transition: false
+    strict_feats: false
+    feats_seq:
+      - ca_coors_nm
+      - z_latent_seq
+    feats_cond_seq: null
+    dim_cond: 128
+    idx_emb_dim: 128
+    feats_pair_repr:
+      - rel_seq_sep
+      - ca_coors_nm_pair_dists
+    seq_sep_dim: 127
+    pair_repr_dim: 256
+    update_pair_repr: false
+    update_pair_repr_every_n: 3
+    use_tri_mult: false
+    use_qkln: true
+    latent_z_dim: *latent_z_dim
+
+loss:
+  kl:
+    weight: 1.0e-05
+    anneal: false
+    patience: 10000
+  struct:
+    type: l2
+    weight: 1.0
+  seq:
+    weight: 1.0
+
+opt:
+  lr: 0.0001
+  max_epochs: 10000000
+  accumulate_grad_batches: 4  # 32 x 4 = effective 128, matching finetune_full_128
+  skip_nan_grad: True
+  grad_and_weight_analysis: False
+  dist_strategy: auto
+  val_check_interval: 5000
+  skip_large_grad_updates:
+    use: false
+    moving_avg_size: 100
+    factor_threshold: 10
+    min_opt_steps: 1500
+
+log:
+  wandb_project: cpsea_ae
+  log_wandb: true
+  wandb_entity: null
+  log_every_n_steps: 1
+  checkpoint: true
+  checkpoint_every_n_steps: 10000
+  last_ckpt_every_n_steps: 1500
+  save_extra_checkpoints: true  # legacy: also write chk_* and ignore* in addition to last*
+
+ema:
+  decay: 0.999
+  validate_original_weights: False
+  every_n_steps: 1
+  cpu_offload: False
+
+# CPSea peptide dataset (binder chain). Inlined StructureDataModule so this config is
+# self-contained regardless of Hydra group packaging. Root: ${oc.env:CPSEA_DATA_PATH}.
+dataset:
+  datamodule:
+    _target_: proteinfoundation.datasets.structure_data.StructureDataModule
+    # Mixed CPSea + PepBench + ProtFrag metadata, built by
+    # `script_utils/build_mixed_metadata.py` (see scripts/build_lp_data.sbatch). Written
+    # out absolutely rather than via ${oc.env:...}: an env var that resolves lazily is
+    # not worth betting a multi-day run on.
+    metadata_file: /zfsauton/scratch/yixiz/LPData/preprocessed/metadata_mixed/mixed_train.parquet
+    val_metadata_file: /zfsauton/scratch/yixiz/LPData/preprocessed/metadata_mixed/mixed_val.parquet
+    base_dir: ""
+    batch_size: 32
+    num_workers: 8
+    # Share of every batch, by dataset. Must name EVERY source present in the metadata --
+    # an unnamed source would be sampled with probability zero, silently.
+    source_column: dataset_source
+    #
+    # The 25% linear budget is split ~sqrt-proportionally to pool size (PepBench 3.4k,
+    # ProtFrag 42.4k in range), a compromise between the natural split -- which would
+    # bury PepBench at 1.9% -- and an even one, which would draw its 3.4k rows ~91x per
+    # epoch. At these numbers PepBench repeats ~44x and ProtFrag ~11x.
+    #
+    # PepBench is the higher-quality half: real peptide-protein complexes, the same kind
+    # of data LNR is. ProtFrag fragments are cut from monomeric protein contexts, so
+    # their "interface" is intramolecular packing rather than a genuine binding event.
+    # If PepBench turns out not to repeat badly, shifting toward it (0.125 / 0.125) is a
+    # one-line change and the more aggressive version of this arm.
+    source_fractions:
+      cpsea: 0.75
+      pepbench: 0.06
+      protfrag: 0.19
+    path_column: path
+    id_column: example_id
+    pin_memory: true
+    use_parse: false
+    columns_to_load:
+      - example_id
+      - path
+      - binder_chain_id
+      - cluster_id
+      - peptide_length
+      - cyclization_type
+    atom37_transforms:
+      # Must run first: detects continuous backbone segments (segment_id, pos_in_segment,
+      # effective_chain_id) from the raw, un-cropped, un-rotated residue order and Angstrom
+      # coordinates. CPSea receptor/target chains are discontinuous receptor/pocket crops;
+      # see docs/README_DATA_SEQ_BREAK_ISSUE.md.
+      - _target_: proteinfoundation.datasets.transforms.SegmentAwareResidueFeaturesTransform
+        cn_break_cutoff: 2.0
+        segment_fix_level: full  # mild | aggressive | full (see relaunch_cpseaae_seqfix_experiments.sh)
+      - _target_: proteinfoundation.datasets.transforms.CoordsToNanometers
+      - _target_: proteinfoundation.datasets.transforms.GlobalRotationTransform
+      - _target_: proteinfoundation.datasets.transforms.CroppingTransform2
+        crop_size: 256
+        interface_threshold: 8.0
+        dist_mode: "bb_ca"
+        data_mode: "all-atom"
+        binder_min_length: 5
+        binder_max_length: 16
+        binder_padding_length: 0
+        target_min_length: 30
+        target_spatial_crop_threshold: 15.0
+        max_num_target_chains: -1
+      - _target_: proteinfoundation.datasets.transforms.OpenFoldFrameTransform
+      - _target_: proteinfoundation.datasets.transforms.ChainBreakPerResidueTransform
+      - _target_: proteinfoundation.datasets.transforms.CenteringTransform
+        center_mode: "target"
+        data_mode: "all-atom"
+      # Reduce the main features to the binder (peptide) chain only, so the AE trains on the
+      # same residues the flow model encodes into local_latents. Without these two, the AE
+      # would treat the whole peptide+receptor complex as one ~200-residue chain
+      # (Pad binder=192, groups={}). ExtractTargetCoordinatesTransform separates the target,
+      # FilterTargetResiduesTransform drops it from the main features (and syncs num_nodes).
+      - _target_: proteinfoundation.datasets.transforms.ExtractTargetCoordinatesTransform
+        compact_mode: true
+      - _target_: proteinfoundation.datasets.transforms.FilterTargetResiduesTransform
+      # Must run after FilterTargetResiduesTransform: needs binder-local (0..L_b-1) indexing.
+      # Derives the single ground-truth cyclization edge (cyclization_i/j/type, has_cyclization)
+      # so val/ae_recon/{cyclic,mainchain_cn,disulfide}_* metrics populate during AE finetune
+      # instead of NaN. Label-only; never touches coordinates. Opt out of the metrics (not the
+      # labels) via ++log_cyclic_recon_metrics=false.
+      # Linear rows (cyclization_type="linear") short-circuit to the LINEAR token and
+      # never touch the CONECT parser; cyclic rows are labeled from CONECT as before. The
+      # AE itself does not consume the label -- it only feeds val/ae_recon/{cyclic,...}
+      # metrics, which stay restricted to the cyclic rows.
+      - _target_: proteinfoundation.datasets.transforms.CyclizationLabelTransform
+        default_binder_chain_id: "B"

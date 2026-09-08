@@ -23,6 +23,7 @@ from typing import Any
 
 import pytorch_lightning as pl
 import torch
+from loguru import logger
 from lightning.pytorch.callbacks import Callback, ModelCheckpoint
 from lightning.pytorch.utilities.exceptions import MisconfigurationException
 from lightning.pytorch.utilities.rank_zero import rank_zero_info
@@ -357,8 +358,33 @@ class EMAOptimizer(torch.optim.Optimizer):
     def load_state_dict(self, state_dict):
         self.join()
 
-        self.optimizer.load_state_dict(state_dict["opt"])
-        self.ema_params = tuple(param.to(self.device) for param in copy.deepcopy(state_dict["ema"]))
+        # Reconcile a checkpoint written before a conditioning type was appended. Both the
+        # inner optimizer's per-parameter moments and the EMA shadow weights are keyed by
+        # POSITION in `all_parameters()`, so they are matched up by index here rather than by
+        # name. See `_pad_appended_rows`.
+        live_params = list(self.all_parameters())
+
+        opt_state = state_dict["opt"]
+        inner = dict(opt_state)
+        inner["state"] = {
+            idx: {
+                k: (
+                    _pad_appended_rows(v, live_params[idx], f"optimizer state {k!r}")
+                    if torch.is_tensor(v) and v.dim() > 0 and idx < len(live_params)
+                    else v
+                )
+                for k, v in per_param.items()
+            }
+            for idx, per_param in opt_state["state"].items()
+        }
+        self.optimizer.load_state_dict(inner)
+
+        self.ema_params = tuple(
+            _pad_appended_rows(param, live_params[i], "EMA shadow weight").to(self.device)
+            if i < len(live_params)
+            else param.to(self.device)
+            for i, param in enumerate(copy.deepcopy(state_dict["ema"]))
+        )
         self.current_step = state_dict["current_step"]
         self.decay = state_dict["decay"]
         self.every_n_steps = state_dict["every_n_steps"]
@@ -367,6 +393,47 @@ class EMAOptimizer(torch.optim.Optimizer):
     def add_param_group(self, param_group):
         self.optimizer.add_param_group(param_group)
         self.rebuild_ema_params = True
+
+
+def _pad_appended_rows(src, ref, what):
+    """Zero-pad `src` along dim 0 so it matches `ref`, for an APPENDED-row parameter.
+
+    Companion to `CyclizationTypeSeqFeat._load_from_state_dict`, which pads the MODEL's
+    cyclization-type embedding when a type is appended (LINEAR took the table 4 -> 5).
+    That hook only reaches `checkpoint["state_dict"]`. The EMA shadow copy and the inner
+    optimizer's `exp_avg`/`exp_avg_sq` for the same parameter live in
+    `checkpoint["optimizer_states"]`, are stored POSITIONALLY (no names to match on), and
+    were left at the old size -- so a padded model resumed fine and then died on the first
+    EMA swap with `The size of tensor a (5) must match the size of tensor b (4)`, or (later,
+    and more quietly) on the first AdamW step.
+
+    Zero is the correct pad for all three: the model row is padded with zeros, so an EMA
+    shadow of zero agrees with it, and zero optimizer moments mean the appended row starts
+    from a clean slate rather than inheriting another type's momentum.
+
+    Only APPENDED rows are sound, exactly as in the model-side hook: this cannot detect a
+    REORDERED type table, which would silently pair a row with the wrong meaning.
+    """
+    if src.shape == ref.shape:
+        return src
+    if (
+        src.dim() == ref.dim()
+        and src.shape[0] < ref.shape[0]
+        and src.shape[1:] == ref.shape[1:]
+    ):
+        pad = src.new_zeros(ref.shape[0] - src.shape[0], *src.shape[1:])
+        logger.warning(
+            "EMAOptimizer: {} restored from checkpoint has shape {} but the current "
+            "parameter is {}. Zero-padding the {} appended row(s). This is only valid "
+            "because conditioning types are APPENDED, never reordered.",
+            what, tuple(src.shape), tuple(ref.shape), ref.shape[0] - src.shape[0],
+        )
+        return torch.cat([src, pad], dim=0)
+    raise RuntimeError(
+        f"EMAOptimizer: cannot reconcile {what} of shape {tuple(src.shape)} with the "
+        f"current parameter of shape {tuple(ref.shape)}. Only appending rows to dim 0 is "
+        f"supported; this looks like a different architecture, not a version skew."
+    )
 
 
 class EmaModelCheckpoint(ModelCheckpoint):
