@@ -1,0 +1,103 @@
+# Milestone 1.5 -- geometric ceiling audit.  Every constant the audit depends on lives
+# here; the sbatch preamble points at this file and nothing hard-codes a number.
+#
+# Nothing in this file builds a dataset.  It is the CPU-only measurement that has to
+# report before section 3's coverage target and section 5's filters are implemented.
+
+geometry:
+  # Contact definition, matched byte-for-byte to scripts/sdedit_cyclize.py's
+  # CONTACT_CUTOFF_NM = 1.0.  A ceiling computed against a different cutoff is a different
+  # quantity and must not be divided into a retention measured against this one.
+  contact_cutoff_A: 10.0
+  heavy_cutoff_A: 4.5
+
+  # CA-CA-CA pseudo-angle ceiling.  150 deg is the ideal-geometry extreme and gives
+  # 3.67 A of reach per residue; fully extended beta sits nearer 125-135 deg.  The
+  # permissive value is the default because a ceiling must not understate what is
+  # possible.  `tau_sensitivity_deg` is re-run as a second column so the conclusion can be
+  # checked against a realistic rather than extremal backbone.
+  tau_max_deg: 150.0
+  tau_sensitivity_deg: 135.0
+
+  # Tolerance on the head-to-tail C-N bond length when calling a ring closed.
+  mainchain_tol_A: 0.25
+
+  # Torsion-space confirmation of the analytic ceiling.  NOT optional in practice: the
+  # analytic bound over-licenses badly at the boundary (measured on LNR_1bjr, a 10-mer --
+  # analytic licenses closure with 1 free residue, the backbone needs 5), because a short
+  # flank's reachable set is a cone about the incoming chain direction, not a sphere.
+  # Without this the ceiling reads ~0.79 when the honest number is lower, and a real
+  # retention deficit hides behind the inflated headroom.
+  refine:
+    enabled: true
+    max_solves: 40          # per complex per chemistry; exhaustion is flagged, not hidden
+    n_restarts: 6
+    tol_A: 0.25
+    max_seconds: 15.0       # bounds ONE solve; only binds on failures
+    seed: 0
+
+calibration:
+  # Bridge distance windows are MEASURED on CPSea natives with CONECT-resolved linkages,
+  # not asserted from textbook chemistry.  An asserted window would make every ceiling
+  # below depend on a guess.
+  metadata: $CPSEA_FULL_META/cpsea_train.parquet
+  max_examples: 4000
+  pad_A: 0.5
+  seed: 0
+
+audit:
+  validate_frac: 0.15        # fraction of complexes given the torsion-space cross-check
+  validate_restarts: 6
+  seed: 0
+  sets:
+    lnr:
+      # The pocket-cropped staging, not the full-chain one: receptor segmentation alone is
+      # worth 22-34 points of closure, so the uncropped arm would measure the wrong thing.
+      metadata: CPSea_data/lnr_pocket14/metadata/lnr_test_pocket.parquet
+      source_filter: ""
+      max_examples: 0        # all 60
+      shards: 4
+    pepbench:
+      metadata: $LP_META/lp_train.parquet
+      source_filter: pepbench
+      max_examples: 600
+      shards: 8
+
+# Section 6 / Deliverable E: within-domain competitor pairs on CPSea_full.
+deliverable_e:
+  metadata: $CPSEA_FULL_META/cpsea_train.parquet
+  min_sequence_separation: 10   # residues between the two segments' sequence ranges
+  # Sequence-disjoint is necessary, not sufficient: two disjoint segments can still bind
+  # the same surface, which makes them near-duplicates rather than competitors.
+  max_contact_jaccard: 0.25
+  min_centroid_separation_A: 8.0
+  spatial_sample_cap: 20000     # pairs actually loaded from disk; the index counts are exact
+  spatial_shards: 8
+  seed: 0
+
+# Section 2: replica economics.
+timing:
+  # AFDB provenance, matching the build set (CPSea_full), not the PDB intermediate.
+  metadata: CPSea_data/preprocessed_sample100/metadata/cpsea_train.parquet
+  n_complexes: 20
+  # 10, not 30+. This job MEASURES cost per replica; it does not produce decoys, and the
+  # median of 10 pins the per-replica cost as well as the median of 32. At ~81 s a
+  # replica, 32 would take 14.8 h for 20 complexes -- over any sane wall limit, for no
+  # extra precision on the one number this stage exists to produce.
+  n_replicas: 10
+  torsion_sigma_deg: 8.0
+  # These five MUST match scripts/soft_closure_project.py's own defaults, or the measured
+  # marginal is not the cost of the protocol the build will actually run. max_iterations
+  # especially: 0 means "minimize to convergence, unbounded", which measured 51 s per
+  # replica against the reference protocol's 1000-iteration cap -- an error in the
+  # direction that makes replicas look far more expensive than they are.
+  contacts_per_residue: 1
+  k_pull: 2000.0
+  k_contact: 500.0
+  contact_tol_A: 0.75
+  tolerance: 10.0
+  max_iterations: 1000
+  ladder_rungs: 6
+  time_ladder: true
+  platform: CPU
+  seed: 0
