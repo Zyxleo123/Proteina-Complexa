@@ -1,0 +1,196 @@
+# LP -> CP pre-build check suite.  Every constant the four checks depend on lives here.
+#
+# Nothing in this file builds a dataset, trains a model, or tunes a threshold.  These are
+# measurements; a check that comes back bad is a result.
+#
+# `geometry` is INHERITED from the Milestone 1.5 audit rather than restated, so the contact
+# cutoff, the pseudo-angle bound and the torsion budget are the same numbers by
+# construction.  README_M15_CEILING_AUDIT.md is explicit that a retention computed against
+# a different cutoff is a different quantity; inheriting removes the chance of divergence.
+inherit: configs/pose_decoy/m15.yaml
+
+# ======================================================================================
+# Task 0 -- pin the SDEdit + guidance baseline.
+# ======================================================================================
+# Not a measurement run.  It records what the best known pocket14 configuration IS and
+# confirms it still executes, so the deferred frontier sweep can be resumed from a pin
+# rather than reconstructed from memory.
+task0_pin:
+  # The pocket-cropped staging, NOT the full-chain one.  Receptor segmentation alone is
+  # worth 22-34 points of ring closure (README: LNR receptor segmentation mismatch), so a
+  # baseline pinned on the uncropped set would pin the wrong number.
+  metadata: CPSea_data/lnr_pocket14/metadata/lnr_test_pocket.parquet
+  flow_ckpt_path: store/cpsea_bondunroll_pin20260828/checkpoints
+  flow_ckpt_name: last-EMA.ckpt
+
+  # The best known corner, from the full t_lat grid (README: LNR SDEdit full t_lat grid).
+  # t_lat = 1.0 is the frozen-sequence corner and CANNOT close (1/59 at every t_ca), so the
+  # sequence track has to move; 0.2-0.4 is where closure peaks without spending the whole
+  # interface.
+  t_ca: 0.8
+  t_lat: 0.4
+  cyc_types: "mainchain disulfide isopeptide"
+  seeds: "0"
+  nsteps: 0          # 0 = the sampler's production default
+
+  # Confirmation run only: 3 targets, enough to prove the path executes end to end.
+  n_targets: 3
+  # a5000 and a5000_min silently force self_cond=false, which changes what is being
+  # confirmed.  Pin a 48 GB card.
+  require_gpu_mem_gb: 40
+
+# ======================================================================================
+# Task 1 -- decoy filter calibration.
+# ======================================================================================
+# Can `contact_retention` substitute for Rosetta interface dG as the pose-decoy acceptance
+# filter, and where do the band bounds sit?
+decoy_calibration:
+  # CPSea_full, never CPSea_PDB: the PDB set is held out entirely as the AFDB->PDB
+  # intermediate-domain check (README_POSE_DECOY_INVENTORY section 4.1).  Pointing this at
+  # it would silently spend the held-out set on a calibration.
+  metadata: $CPSEA_FULL_META/cpsea_train.parquet
+  n_complexes: 300
+  seed: 0
+
+  # Stratified so the regression is not dominated by one regime.  Cells are the product of
+  # these two edge lists; the sampler fills each cell equally and reports any it could not.
+  strata:
+    peptide_length_edges: [0, 8, 11, 14, 100]
+    burial_edges: [0.0, 0.35, 0.50, 0.65, 1.01]
+
+  poses:
+    n_per_complex: 16          # the brief's 12-20 band
+    # Amplitudes span the full requested range.  The curriculum is a LADDER rather than a
+    # uniform draw so every complex contributes to every amplitude bin -- a uniform draw
+    # leaves the small-displacement end, which is the operating range the filter actually
+    # runs in, under-sampled exactly where the answer matters.
+    translation_A: [0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0]
+    rotation_deg: [0.0, 3.0, 6.0, 9.0, 12.0, 15.0, 18.0, 21.0, 24.0, 27.0, 30.0]
+    # The translation is drawn in the INTERFACE frame and logged decomposed into the
+    # interface normal and the two tangential directions.  Sliding along the interface and
+    # pulling away from it are different perturbations that a single scalar amplitude
+    # cannot distinguish, and the analysis needs them separable.
+    decompose_in_interface_frame: true
+    rotation_about: centroid   # peptide centroid, so rotation does not smuggle in translation
+
+  minimize:
+    # Frozen pocket: receptor particle masses set to 0 so it still contributes to the
+    # energy but cannot move.  Same scheme as scripts/soft_closure_project.py.
+    forcefield: ["amber14-all.xml", "implicit/obc2.xml"]
+    nonbonded: CutoffNonPeriodic
+    nonbonded_cutoff_nm: 1.0
+    max_iterations: 500
+    tolerance_kj_mol_nm: 10.0
+    # A ring-closure HOLD restraint, not the soft-closure PULL: the decoy starts closed and
+    # must stay closed, so the restraint keeps the bonded pair at its input distance rather
+    # than dragging termini down a ladder.
+    ring_hold_k_kj_mol_nm2: 5000.0
+    platform: CPU
+
+  score:
+    rosetta_scorefxn: ref2015
+    # FastRelax is minutes per complex and this is ~10k scorings, so the dG arm runs the
+    # cheaper InterfaceAnalyzer on the pose as given.  Relaxing before scoring would also
+    # undo the very perturbation being calibrated.
+    relax: false
+    contact_cutoff_A: 10.0     # matched to sdedit_cyclize / kinematic_ceiling
+    heavy_cutoff_A: 4.5
+
+  analysis:
+    # The operating range: where a decoy filter actually runs.  A correlation that holds
+    # globally can be useless inside this band, so this restricted result is the one that
+    # decides the question and the global one is context.
+    operating_range:
+      max_translation_A: 2.0
+      max_rotation_deg: 12.0
+      min_contact_retention: 0.70
+    collapse_rmsd_A: 1.0       # "returned to native" after minimization
+
+# ======================================================================================
+# Task 2 -- LNR closure feasibility frontier.
+# ======================================================================================
+lnr_feasibility:
+  metadata: CPSea_data/lnr_pocket14/metadata/lnr_test_pocket.parquet
+  # Anchors are the top-k peptide residues by BURIED SURFACE AREA, per the resolution at
+  # README_POSE_DECOY_INVENTORY section 4.3: global retention forces the solution to be a
+  # near-copy of the input, which is what caps the achievable gap.  The anchor subset is
+  # what a real binder has to keep; the rest is free to move.
+  n_anchors: 3
+  bridged: true
+  max_solves_per_spec: 60      # torsion confirmations per (complex, chemistry)
+
+  # Applied in the report, not stored per row -- it is a threshold on a number the rows
+  # already carry.
+  tolerance_grid: [0.0, 0.3, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
+
+  # Validity control.  These three never closed across 20 SDEdit grid points.  If the
+  # solver calls them easily feasible, either the solver or the SDEdit result needs
+  # explaining before any of this output is trusted.
+  #
+  # One correction the brief does not carry: the paired soft-closure CONTROL later closed
+  # 6 of 8 of that test bed UNPROJECTED, and 3cvl was among the ones that closed.  So only
+  # 1jrr (45.6 A) and 4x3h (26.4 A) are still genuine never-closed hold-outs, and 3cvl is
+  # a single-seed sampling artifact.  All three are reported; the report distinguishes them.
+  control_targets:
+    - LNR_1jrr_A_P
+    - LNR_4x3h_A_B
+    - LNR_3cvl_A_B
+  control_still_holding: [LNR_1jrr_A_P, LNR_4x3h_A_B]
+
+  shards: 4
+
+# ======================================================================================
+# Task 3 -- feature profile, reference distributions, adversarial harness.
+# ======================================================================================
+profile:
+  sets:
+    lnr:
+      metadata: CPSea_data/lnr_pocket14/metadata/lnr_test_pocket.parquet
+      max_examples: 0          # all 60
+      source_filter: ""
+    pepbench:
+      metadata: $LP_META/lp_train.parquet
+      source_filter: pepbench
+      max_examples: 1200
+    cpsea:
+      metadata: $CPSEA_FULL_META/cpsea_train.parquet
+      source_filter: ""
+      max_examples: 1200
+  shards: 6
+  seed: 0
+
+adversary:
+  # The three confounds from README_POSE_DECOY_INVENTORY section 2.5, all addressed at 4.5.
+  #
+  # 1. PepBench receptors are whole chains (median 223 residues) against CPSea's pocket
+  #    crops (139), so buried SASA, terminal exposure and contact order are all sensitive
+  #    to staging rather than conformation.  PepBench is pocket-cropped before profiling.
+  # 2. A control classifier is fitted on the STAGING vector alone and reported at every
+  #    iteration.  If the control alone separates the sets, the main AUC is void until it
+  #    does not -- it is measuring the staging.
+  # 3. Peptide length is stratified rather than pooled (PepBench median 9, CPSea 13).
+  pocket_crop_radius_A: 14.0
+  control_on_staging_features: true
+  stratify_by_peptide_length: true
+  length_bins: [0, 8, 11, 14, 100]
+
+  classifier: hist_gradient_boosting   # sklearn; neither xgboost nor lightgbm is installed
+  n_splits: 5
+  seed: 0
+
+  # The positive control runs FIRST.  CPSea cyclics against real linears are known to
+  # differ substantially, so AUC should come back near 1.0.  An AUC of 0.5 on the real
+  # comparison means nothing until the harness has shown it can detect a difference it
+  # should detect.
+  positive_control:
+    label_a: cpsea
+    label_b: pepbench
+    min_auc: 0.90
+
+ood:
+  # Fitted on the CPSea side only: the score answers "how far is this input from the
+  # distribution the model was trained on", so fitting it on the union would blunt exactly
+  # the signal it exists to give.
+  fit_on: cpsea
+  estimator: gaussian_kde_diag
+  standardize: true
