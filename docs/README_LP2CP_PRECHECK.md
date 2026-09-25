@@ -55,7 +55,8 @@ to the termini — the only thing it can express — collapses the result:
 Against a median LNR terminal CA gap of 16.3 Å. The three validity-control targets sit at
 42.8 / 24.5 / 13.4 Å — outside every window — so they remain hard under terminal bridging too.
 
-**Consequences.** Terminal gap *is* the right discriminator for this model, which contradicts
+**Consequences** (worked through in `README_LP2CP_ROUTE_DECISION.md`). Terminal gap *is* the
+right discriminator for this model, which contradicts
 `README_POSE_DECOY_INVENTORY.md` §4.4 ("the chain-terminal gap is the wrong discriminator for
 bridged linkages"). Milestone 1.5's routing of the 20–45 Å coverage band to bridged chemistries
 rests on §4.4, and M1.5's own bridged ceilings scan interior pairs, so they carry the same
@@ -75,6 +76,14 @@ uniform: 0.991 / 0.997 / 0.993 / 0.998 across the four length bins. **Do not cit
 
 Reported as 0.870 from a 240-row sample; **0.900 at full scale** (n = 2400), against 0.999
 before the uniform crop. Read every held-out AUC against 0.900, not against 0.5.
+
+**What this is not.** It is *not* a statement that decoys are distinguishable from real
+structures — there are no decoys in that comparison, and none exist yet. It is the staging
+control on the positive-control pair (CPSea cyclics vs PepBench real linears, both real), on
+the staging vector alone: it says you can tell which dataset a record came from by how its
+receptor was cropped. It matters as a **confound, not a grade** — a noise floor that will stop
+a future synthetic-vs-real AUC distinguishing "unrealistic synthetic states" from "different
+staging".
 
 ---
 
