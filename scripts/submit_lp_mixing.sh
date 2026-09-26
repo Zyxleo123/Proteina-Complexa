@@ -6,6 +6,7 @@
 # Stages:
 #   data          CPU   PepBench+ProtFrag -> processed PDBs + mixed metadata
 #   verify        CPU   prove the LINEAR token + sampler work on the real data
+#   ae-roundtrip  GPU   gate: does the EXISTING CPSea AE already encode linear peptides?
 #   ae            GPU   the shared VAE on CPSea + linear peptides
 #   flow-mix      GPU   flow arm: CPSea + 25% linear
 #   flow-control  GPU   flow arm: CPSea only (the control)
@@ -32,10 +33,11 @@ STAGE=""; DRYRUN=0
 GPU_PARTITION="general"; GPU_GRES="gpu:a6000:1"; GPU_NODELIST=""
 CPU_PARTITION="cpu"
 AE_TIME="2-00:00:00"; FLOW_TIME="2-00:00:00"; DATA_TIME="08:00:00"
+RT_TIME="02:00:00"
 SMOKE=0
 declare -a EXTRA_ENV=()
 
-usage() { sed -n '2,26p' "$0"; exit "${1:-0}"; }
+usage() { sed -n '2,27p' "$0"; exit "${1:-0}"; }
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -45,6 +47,7 @@ while [[ $# -gt 0 ]]; do
     --gpu-nodelist)    GPU_NODELIST="$2";   shift 2 ;;
     --cpu-partition)   CPU_PARTITION="$2";  shift 2 ;;
     --ae-time)         AE_TIME="$2";        shift 2 ;;
+    --rt-time)         RT_TIME="$2";        shift 2 ;;
     --flow-time)       FLOW_TIME="$2";      shift 2 ;;
     --data-time)       DATA_TIME="$2";      shift 2 ;;
     # Anything of the form VAR=value is written into the env file, so every knob in
@@ -105,6 +108,15 @@ if [[ "$STAGE" == "verify" || "$STAGE" == "all" ]]; then
     scripts/lp_verify.sbatch "$ENV_FILE")"
 fi
 
+# Excluded from `all` on purpose: this is a gate whose verdict a human acts on. Chaining
+# it would either commit the 2 days it exists to question, or skip them unread.
+if [[ "$STAGE" == "ae-roundtrip" ]]; then
+  submit ae-roundtrip \
+    --partition="$GPU_PARTITION" --gres="$GPU_GRES" --time="$RT_TIME" \
+    "${NODELIST_ARG[@]}" \
+    scripts/lp_ae_roundtrip.sbatch "$ENV_FILE" >/dev/null
+fi
+
 if [[ "$STAGE" == "ae" || "$STAGE" == "all" ]]; then
   # Behind verify, not merely data: the AE is a multi-day run, and the cheapest moment to
   # find out the topology token is mis-wired is before it starts rather than after.
@@ -132,7 +144,7 @@ for arm in mix control; do
 done
 
 case "$STAGE" in
-  data|verify|ae|flow-mix|flow-control|all) ;;
+  data|verify|ae-roundtrip|ae|flow-mix|flow-control|all) ;;
   *) echo "FATAL: unknown stage '$STAGE'" >&2; usage 1 >&2 ;;
 esac
 echo "submitted stage: $STAGE"
