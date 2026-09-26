@@ -289,46 +289,84 @@ def audit_one(st: dict, windows: dict, cfg: dict) -> dict:
     # Reporting only the metadata's "best" pair would answer a narrower question than the
     # one that matters -- whether SOME bridge preserves the interface, not whether the
     # closest-to-ideal one does.
-    for typ in ("disulfide", "isopeptide"):
-        w = windows.get(typ)
-        if w is None:
-            continue
-        best = None
-        for i in range(L):
-            for j in range(i + MIN_BRIDGE_SEP, L):
-                bspec = bridge_spec(typ, i, j, w["ca_lo"], w["ca_hi"])
-                # The bridged spec is already stated CA-to-CA, so the CA positions ARE
-                # the bonded-atom positions and no extra pinning is needed.
-                r = scan_windows(CA, contacts, rec_ca, bspec, tau, cfg["contact_cutoff_A"],
-                                 atom_i_xyz=CA[i], atom_j_xyz=CA[j])
-                if not r.feasible_any:
-                    continue
-                if best is None or r.ceiling_strict > best[0].ceiling_strict:
-                    best = (r, i, j)
-        if best is None:
-            row[f"{typ}_feasible_any"] = False
-            row[f"{typ}_ceiling_strict"] = float("nan")
-            row[f"{typ}_ceiling_permissive"] = float("nan")
-            continue
-        r, i, j = best
-        # A bridged ceiling of 1.0 means some (i, j) pair is ALREADY at bond distance, so
+    #
+    # That free scan is an upper bound the GENERATOR cannot reach: CPSea conditions on the
+    # chain termini, so the anchors it can actually place a bridge between are (0, L-1) and
+    # nothing else.  Both are recorded, under `{typ}_*` and `{typ}_term_*`.  The free scan
+    # is the geometric ceiling; the pinned scan is the reachable one, and only the pinned
+    # number may be quoted as a target the model is being measured against.
+    need_by_type = {"disulfide": ({"CYS"}, {"CYS"}),
+                    "isopeptide": ({"LYS"}, {"ASP", "GLU", "ASN", "GLN"})}
+    names = st["resnames"]
+
+    def _bridge_at(typ: str, w: dict, i: int, j: int):
+        """Unrefined ceiling for one anchor pair, or None when no window is feasible.
+
+        Refinement is deliberately NOT done here: it runs a torsion solve worth seconds,
+        and the free arm calls this O(L^2) times.  The winner is refined once, below.
+        """
+        bspec = bridge_spec(typ, i, j, w["ca_lo"], w["ca_hi"])
+        # The bridged spec is already stated CA-to-CA, so the CA positions ARE
+        # the bonded-atom positions and no extra pinning is needed.
+        r = scan_windows(CA, contacts, rec_ca, bspec, tau, cfg["contact_cutoff_A"],
+                         atom_i_xyz=CA[i], atom_j_xyz=CA[j])
+        if not r.feasible_any:
+            return None
+        return r, bspec
+
+    def _refine_at(hit, bspec, i: int, j: int):
+        return _refine(hit, st, contacts, rec_ca, bspec, cfg, tau, CA[i], CA[j])
+
+    def _emit(typ: str, prefix: str, hit, i: int, j: int) -> None:
+        # A bridged ceiling of 1.0 means the (i, j) pair is ALREADY at bond distance, so
         # nothing has to move -- but only if those two residues can carry the chemistry.
         # Record whether they natively do: a ceiling that silently assumes free mutation of
         # the anchors is a different claim from one that does not, and isopeptide failure
         # is about half anchor identity rather than geometry.
-        need = {"disulfide": ({"CYS"}, {"CYS"}),
-                "isopeptide": ({"LYS"}, {"ASP", "GLU", "ASN", "GLN"})}[typ]
-        names = st["resnames"]
-        row[f"{typ}_anchor_native_compatible"] = int(
-            (names[i] in need[0] and names[j] in need[1])
-            or (names[j] in need[0] and names[i] in need[1]))
-        bspec = bridge_spec(typ, i, j, w["ca_lo"], w["ca_hi"])
-        r = _refine(r, st, contacts, rec_ca, bspec, cfg, tau, CA[i], CA[j])
-        for k, v in r.__dict__.items():
+        lo, hi = need_by_type[typ]
+        row[f"{prefix}anchor_native_compatible"] = int(
+            (names[i] in lo and names[j] in hi) or (names[j] in lo and names[i] in hi))
+        for k, v in hit.__dict__.items():
             if k != "spec_name":
-                row[f"{typ}_{k}"] = v
-        row[f"{typ}_anchor_i"] = i
-        row[f"{typ}_anchor_j"] = j
+                row[f"{prefix}{k}"] = v
+        row[f"{prefix}anchor_i"] = i
+        row[f"{prefix}anchor_j"] = j
+
+    def _emit_infeasible(prefix: str) -> None:
+        row[f"{prefix}feasible_any"] = False
+        row[f"{prefix}ceiling_strict"] = float("nan")
+        row[f"{prefix}ceiling_permissive"] = float("nan")
+
+    for typ in ("disulfide", "isopeptide"):
+        w = windows.get(typ)
+        if w is None:
+            continue
+
+        best = None
+        for i in range(L):
+            for j in range(i + MIN_BRIDGE_SEP, L):
+                got = _bridge_at(typ, w, i, j)
+                if got is None:
+                    continue
+                r, bspec = got
+                if best is None or r.ceiling_strict > best[0].ceiling_strict:
+                    best = (r, i, j, bspec)
+        if best is None:
+            _emit_infeasible(f"{typ}_")
+        else:
+            r, i, j, bspec = best
+            _emit(typ, f"{typ}_", _refine_at(r, bspec, i, j), i, j)
+
+        # The reachable arm: same spec, same refinement, anchors forced to the termini.
+        if L - 1 < MIN_BRIDGE_SEP:
+            _emit_infeasible(f"{typ}_term_")
+            continue
+        got = _bridge_at(typ, w, 0, L - 1)
+        if got is None:
+            _emit_infeasible(f"{typ}_term_")
+        else:
+            r, bspec = got
+            _emit(typ, f"{typ}_term_", _refine_at(r, bspec, 0, L - 1), 0, L - 1)
     return row
 
 

@@ -23,13 +23,23 @@ import pandas as pd
 # (light surface): lightness band, chroma floor, CVD separation, normal-vision floor and
 # contrast all pass.
 HUE = {"mainchain": "#2f6fb8", "disulfide": "#d97706", "isopeptide": "#159467",
-       "other": "#8b5cf6"}
+       "other": "#8b5cf6",
+       # The terminal-pinned bridged arms: same hue family as their free counterpart,
+       # darkened, so a plot reads free-vs-pinned as one chemistry rather than two.
+       "disulfide_term": "#92400e", "isopeptide_term": "#0b5f43"}
 INK = "#1f2328"
 INK_MUTED = "#6b7280"
 GRID = "#e5e7eb"
 SURFACE = "#fcfcfb"
 
-CHEMISTRIES = ("mainchain", "disulfide", "isopeptide")
+# `*_term` are the bridged arms with anchors pinned to (0, L-1).  The unsuffixed bridged
+# arms maximise over all (i, j), which CPSea cannot reach -- it conditions on the chain
+# termini, so those are the only anchors it can place a bridge between.  Both are carried
+# so the free-vs-reachable difference is visible; only `*_term` is a target the model is
+# measured against.
+CHEMISTRIES = ("mainchain", "disulfide", "isopeptide",
+               "disulfide_term", "isopeptide_term")
+REACHABLE_CHEMISTRIES = ("mainchain", "disulfide_term", "isopeptide_term")
 GAP_BINS = [0, 5, 10, 15, 20, 25, 30, 45, 1e9]
 GAP_LABELS = ["<5", "5-10", "10-15", "15-20", "20-25", "25-30", "30-45", ">45"]
 LEN_BINS = [0, 8, 11, 14, 100]
@@ -87,6 +97,35 @@ def ceiling_col(df: pd.DataFrame, chem: str) -> str:
     if refined in df and df[refined].notna().any():
         return refined
     return f"{chem}_ceiling_strict"
+
+
+def free_vs_reachable(df: pd.DataFrame) -> pd.DataFrame:
+    """Per-chemistry cost of restricting the bridge anchors to the chain termini.
+
+    The free scan maximises over all (i, j); CPSea can only anchor at (0, L-1).  Paired
+    per complex, so `delta_median` is the median of the per-row differences rather than
+    the difference of the medians -- the two are not the same statistic, and only the
+    paired one answers "what does this complex lose by being restricted".
+    """
+    rows = []
+    for chem in ("disulfide", "isopeptide"):
+        free_col, term_col = ceiling_col(df, chem), ceiling_col(df, f"{chem}_term")
+        if free_col not in df or term_col not in df:
+            continue
+        both = df.dropna(subset=[free_col, term_col])
+        feas_free = df.get(f"{chem}_feasible_any")
+        feas_term = df.get(f"{chem}_term_feasible_any")
+        rows.append({
+            "chemistry": chem,
+            "n_paired": len(both),
+            "feasible_frac_free": float(feas_free.mean()) if feas_free is not None else float("nan"),
+            "feasible_frac_terminal": float(feas_term.mean()) if feas_term is not None else float("nan"),
+            "free_median": float(both[free_col].median()) if len(both) else float("nan"),
+            "terminal_median": float(both[term_col].median()) if len(both) else float("nan"),
+            "delta_median_paired": float((both[free_col] - both[term_col]).median()) if len(both) else float("nan"),
+            "frac_terminal_within_0.05": float(((both[free_col] - both[term_col]) <= 0.05).mean()) if len(both) else float("nan"),
+        })
+    return pd.DataFrame(rows)
 
 
 def ceiling_by_set(df: pd.DataFrame) -> pd.DataFrame:
@@ -149,6 +188,192 @@ def ceiling_by_length(df: pd.DataFrame, chem: str = "mainchain") -> pd.DataFrame
     return d.groupby("len_bin", observed=True).agg(
         n=(col, "size"), gap_median=("nc_gap_A", "median"),
         ceiling_median=(col, "median")).reset_index()
+
+
+# ------------------------------------------------------- the ratio is the wrong instrument
+# `ceiling_strict` is (contacts whose residue is in the held window) / (all contacts).  With
+# contacts spread roughly evenly along the chain that is held_window / L, so the ceiling
+# carries peptide length in its DENOMINATOR.  Two consequences, both of which bit the first
+# read of this run:
+#
+#   * a length trend in the ceiling is arithmetic.  (L - k) / L rises with L at constant k,
+#     so "longer peptides retain more" can be true of the ratio while the geometric cost k
+#     is flat.  It says nothing about closure being easier.
+#   * a gap trend can be masked.  In this dataset length rises monotonically with gap
+#     (len_median 6 -> 15 across the bins past 10 A), so a rising denominator cancels a
+#     falling numerator and the ceiling looks flat when the cost is not.
+#
+# `k` -- the number of residues that must be RELEASED to close -- has no such denominator,
+# so every gap/length claim below is made on k and the ratio is reported beside it only to
+# show the distortion.
+def released_cost(df: pd.DataFrame, chem: str = "mainchain") -> pd.DataFrame:
+    """Per-row released-residue cost, measured directly and as the ratio implies it.
+
+    `k_direct` is the real quantity: L minus the window the refinement actually held.
+    `k_implied` is L * (1 - ceiling), i.e. what you would infer from the ratio if contacts
+    were uniform along the chain.  Their difference is not noise -- it measures how far the
+    uniform-contact assumption is from this data, which is the assumption every ratio-based
+    conclusion rests on.
+    """
+    col = ceiling_col(df, chem)
+    wcol = f"{chem}_refined_window_len"
+    if col not in df or wcol not in df:
+        return pd.DataFrame()
+    d = df.dropna(subset=[col, wcol, "nc_gap_A", "peptide_length"]).copy()
+    d["k_direct"] = d["peptide_length"] - d[wcol]
+    d["k_implied"] = d["peptide_length"] * (1.0 - d[col])
+    d["gap_bin"] = pd.cut(d["nc_gap_A"], GAP_BINS, labels=GAP_LABELS, right=False)
+    d["len_bin"] = pd.cut(d["peptide_length"], LEN_BINS, labels=LEN_LABELS, right=True)
+    return d
+
+
+def released_cost_vs_gap(df: pd.DataFrame, chem: str = "mainchain") -> pd.DataFrame:
+    """The gap signal with the length denominator taken out."""
+    d = released_cost(df, chem)
+    if d.empty:
+        return pd.DataFrame()
+    col = ceiling_col(df, chem)
+    g = d.groupby("gap_bin", observed=True).agg(
+        n=("k_direct", "size"), gap_median=("nc_gap_A", "median"),
+        len_median=("peptide_length", "median"), ceiling_median=(col, "median"),
+        k_direct_median=("k_direct", "median"), k_implied_median=("k_implied", "median"),
+        held_median=(f"{chem}_refined_window_len", "median")).reset_index()
+    return g
+
+
+def released_cost_by_length(df: pd.DataFrame, chem: str = "mainchain") -> pd.DataFrame:
+    """The length 'signal'.  If k is flat here the ceiling's length trend was arithmetic."""
+    d = released_cost(df, chem)
+    if d.empty:
+        return pd.DataFrame()
+    col = ceiling_col(df, chem)
+    return d.groupby("len_bin", observed=True).agg(
+        n=("k_direct", "size"), len_median=("peptide_length", "median"),
+        gap_median=("nc_gap_A", "median"), ceiling_median=(col, "median"),
+        k_direct_median=("k_direct", "median"),
+        k_implied_median=("k_implied", "median")).reset_index()
+
+
+def ceiling_gap_within_length(df: pd.DataFrame, chem: str = "mainchain",
+                              value: str = "k_direct") -> pd.DataFrame:
+    """Gap stratified WITHIN length bins -- gap and length are collinear here, so the
+    marginal tables cannot separate them and neither conclusion is safe without this."""
+    d = released_cost(df, chem)
+    if d.empty:
+        return pd.DataFrame()
+    piv = d.pivot_table(index="len_bin", columns="gap_bin", values=value,
+                        aggfunc="median", observed=True)
+    cnt = d.pivot_table(index="len_bin", columns="gap_bin", values=value,
+                        aggfunc="size", observed=True)
+    # A median over 1-2 complexes is not a measurement; blank those cells rather than
+    # letting them carry a trend line.
+    piv = piv.where(cnt >= 5)
+    out = piv.reset_index()
+    out.columns = [str(c) for c in out.columns]
+    return out
+
+
+def _spearman(x: np.ndarray, y: np.ndarray) -> float:
+    """Rank correlation without a scipy dependency: Pearson on ranks."""
+    if len(x) < 3:
+        return float("nan")
+    rx = pd.Series(x).rank().to_numpy()
+    ry = pd.Series(y).rank().to_numpy()
+    if rx.std() == 0 or ry.std() == 0:
+        return float("nan")
+    return float(np.corrcoef(rx, ry)[0, 1])
+
+
+def joint_regression(df: pd.DataFrame, chem: str = "mainchain") -> pd.DataFrame:
+    """Regress each response on gap and length, alone and jointly.
+
+    Standardised coefficients (z-scored predictors and response), so `beta_gap` and
+    `beta_len` are directly comparable and the marginal-vs-joint shift is the confound made
+    numeric.  Reported for both the ratio and the released-residue cost: if a predictor's
+    marginal coefficient collapses when the other is controlled, the marginal table was
+    reading the other variable.
+    """
+    d = released_cost(df, chem)
+    if d.empty or len(d) < 10:
+        return pd.DataFrame()
+
+    def fit(sub: pd.DataFrame, response: str, preds: list[str]) -> dict:
+        y = sub[response].to_numpy(float)
+        keep = np.isfinite(y)
+        X = np.column_stack([sub[p].to_numpy(float) for p in preds])
+        keep &= np.isfinite(X).all(axis=1)
+        y, X = y[keep], X[keep]
+        if len(y) < 10 or y.std() == 0:
+            return {}
+        z = lambda a: (a - a.mean()) / (a.std() if a.std() else 1.0)  # noqa: E731
+        Xz = np.column_stack([z(X[:, i]) for i in range(X.shape[1])] + [np.ones(len(y))])
+        beta, *_ = np.linalg.lstsq(Xz, z(y), rcond=None)
+        pred = Xz @ beta
+        ss = ((z(y) - pred) ** 2).sum()
+        out = {"n": int(len(y)), "r2": float(1.0 - ss / ((z(y) - z(y).mean()) ** 2).sum())}
+        for p, b in zip(preds, beta[:-1]):
+            out[f"beta_{'gap' if 'gap' in p else 'len'}"] = float(b)
+        return out
+
+    col = ceiling_col(df, chem)
+    rows = []
+    for slice_name, sub in (("all", d), (">10 A gap", d[d["nc_gap_A"] >= 10.0])):
+        for resp, rlabel in ((col, "ceiling (ratio)"), ("k_direct", "k released")):
+            for preds, plabel in ((["nc_gap_A"], "gap only"),
+                                  (["peptide_length"], "length only"),
+                                  (["nc_gap_A", "peptide_length"], "gap + length")):
+                r = fit(sub, resp, preds)
+                if r:
+                    rows.append({"slice": slice_name, "response": rlabel, "model": plabel,
+                                 **r})
+    reg = pd.DataFrame(rows)
+    if not reg.empty:
+        reg = reg[["slice", "response", "model", "n", "beta_gap", "beta_len", "r2"]]
+    return reg
+
+
+def collinearity_note(df: pd.DataFrame, chem: str = "mainchain") -> dict:
+    """How badly gap and length are entangled -- the reason the marginal tables mislead."""
+    d = released_cost(df, chem)
+    if d.empty:
+        return {}
+    g, L = d["nc_gap_A"].to_numpy(float), d["peptide_length"].to_numpy(float)
+    past10 = d["nc_gap_A"] >= 10.0
+    # Variance inflation. With two predictors VIF = 1 / (1 - r^2) between them. Above ~10
+    # the individual joint coefficients are numerically unstable -- they can flip sign and
+    # inflate without the fit getting worse -- so they must not be read as effect sizes.
+    r = float(np.corrcoef(g, L)[0, 1]) if len(g) > 2 else float("nan")
+    vif = float(1.0 / (1.0 - r * r)) if math.isfinite(r) and abs(r) < 1 else float("inf")
+    return {
+        "pearson_gap_length_all": r,
+        "vif_gap_length": vif,
+        "spearman_gap_length_all": _spearman(g, L),
+        "spearman_gap_length_past10": _spearman(g[past10.to_numpy()], L[past10.to_numpy()]),
+        "k_direct_median": float(d["k_direct"].median()),
+        "k_implied_median": float(d["k_implied"].median()),
+        "k_uniform_contact_bias": float((d["k_implied"] - d["k_direct"]).median()),
+    }
+
+
+def mainchain_median_by_slice(df: pd.DataFrame, chem: str = "mainchain") -> pd.DataFrame:
+    """Pooled AND per-set medians in one table, labelled.
+
+    The pooled median is not any set's median and must not be quoted as one: pepbench is
+    600 of the 660 rows, so the pooled number is essentially pepbench's while the lnr slice
+    sits slightly above it.  A bracket bound quoted without its slice is unreproducible.
+    """
+    col = ceiling_col(df, chem)
+    if col not in df:
+        return pd.DataFrame()
+    d = df.dropna(subset=[col])
+    rows = [{"slice": "POOLED (all sets)", "n": int(len(d)),
+             "refined_median": float(d[col].median()),
+             "frac_of_rows": 1.0}]
+    for label, grp in d.groupby("label"):
+        rows.append({"slice": str(label), "n": int(len(grp)),
+                     "refined_median": float(grp[col].median()),
+                     "frac_of_rows": float(len(grp) / len(d))})
+    return pd.DataFrame(rows)
 
 
 def bridge_profile_table(df: pd.DataFrame) -> pd.DataFrame:
@@ -434,17 +659,111 @@ def main() -> None:
                "- `analytic_median` is the pre-refinement bound, kept only to show what the",
                "  cone-vs-sphere idealisation was worth. Never quote it.", "",
                "**Where the bracket is tight the chemistry is answered; where it is wide the",
-               "ceiling question is open.** On this run bridged closure is answered (1.000",
-               "both ends) and head-to-tail is not ([~0.59, 1.000]).", "",
+               "ceiling question is open.** On the first full run bridged closure read as",
+               "answered (1.000 both ends) and head-to-tail did not ([~0.59, 1.000]) -- but",
+               "that bridged number is the FREE scan, which maximises over anchor pairs the",
+               "generator cannot use. Read section 1b before quoting it.", "",
                "Both ends stay permissive about physics: no sterics, no Ramachandran, no",
                "receptor excluded volume. A bridged ceiling also assumes the anchor residues",
                "can carry the chemistry; `*_anchor_native_compatible` in the per-complex rows",
                "says whether they natively do.", "",
                md_table(ceiling_by_set(ceil)), ""]
 
+        fvr = free_vs_reachable(ceil)
+        if not fvr.empty:
+            md += ["### 1b. Free bridge against the reachable one", "",
+                   "The bridged rows above maximise over every (i, j) pair with |i-j| >= 3.",
+                   "CPSea conditions on the chain TERMINI, so the only anchors it can place",
+                   "a bridge between are (0, L-1). A ceiling taken over unreachable pairs is",
+                   "not a target the model can be held to, so the `*_term` columns repeat the",
+                   "scan with the anchors pinned there, same spec and same refinement.", "",
+                   "`delta_median_paired` is the median per-complex drop, not the difference",
+                   "of the two medians. Where it is near zero the free ceiling was reachable",
+                   "anyway and section 1's bridged number stands; where it is large, the",
+                   "bridged advantage over head-to-tail is partly an artifact of scanning",
+                   "pairs the generator cannot reach.", "",
+                   md_table(fvr, nd=3), ""]
+            for r in fvr.itertuples(index=False):
+                summary[f"{r.chemistry}_terminal_median"] = r.terminal_median
+                summary[f"{r.chemistry}_free_minus_terminal_median"] = r.delta_median_paired
+
+        msl = mainchain_median_by_slice(ceil)
+        if not msl.empty:
+            md += ["### Which slice a quoted median is", "",
+                   "The pooled median is not any set's median. Quote the slice with the",
+                   "number or it cannot be reproduced.", "",
+                   md_table(msl), ""]
+            summary["mainchain_refined_median_pooled"] = float(
+                msl.loc[msl["slice"] == "POOLED (all sets)", "refined_median"].iloc[0])
+
         md += ["## 2. Ceiling against terminal gap (head-to-tail)", "",
+               "**Read section 2b before drawing a gap or length conclusion from these two",
+               "tables.** `ceiling` is a ratio with peptide length in its denominator, and in",
+               "this dataset length rises monotonically with gap, so neither marginal table",
+               "separates the two.", "",
                md_table(ceiling_vs_gap(ceil), nd=2), "",
                "### by peptide length", "", md_table(ceiling_by_length(ceil), nd=2), ""]
+
+        # ---- 2b: the confound, made numeric.  This exists because the first read of the
+        # marginal tables above produced two conclusions ("past 10 A the gap stops
+        # mattering", "short peptides are the constrained case") that are artifacts of the
+        # ratio's denominator, not findings about closure.
+        rc_gap = released_cost_vs_gap(ceil)
+        if not rc_gap.empty:
+            coll = collinearity_note(ceil)
+            md += ["## 2b. Released-residue cost -- the same data without the ratio", "",
+                   "`ceiling_strict` = (contacts inside the held window) / (all contacts), so",
+                   "under roughly uniform contacts it is `held / L`. Peptide length is in the",
+                   "denominator. `k` is the number of residues that must be RELEASED to close",
+                   "(`L - held`); it is the geometric cost and carries no denominator.", "",
+                   f"- gap/length rank correlation: **{coll.get('spearman_gap_length_all', float('nan')):.2f}** "
+                   f"over all rows, **{coll.get('spearman_gap_length_past10', float('nan')):.2f}** past 10 A. "
+                   "Gap and length are entangled, so the marginal tables above are each",
+                   "  partly reading the other variable.",
+                   f"- `k_implied - k_direct` median: **{coll.get('k_uniform_contact_bias', float('nan')):+.2f}** "
+                   "residues. This is the uniform-contact assumption's error, measured rather",
+                   "  than assumed; near zero means the ratio's algebra holds on this data.",
+                   "", md_table(rc_gap, nd=2), "",
+                   "### by peptide length", "",
+                   "If `k_direct_median` is flat down this table while `ceiling_median` climbs,",
+                   "the ceiling's length trend is arithmetic -- the same closure cost spread",
+                   "over a longer chain -- and *not* evidence that long peptides close more",
+                   "cheaply.", "",
+                   md_table(released_cost_by_length(ceil), nd=2), ""]
+
+            piv_k = ceiling_gap_within_length(ceil, value="k_direct")
+            piv_c = ceiling_gap_within_length(ceil, value=ceiling_col(ceil, "mainchain"))
+            if not piv_k.empty:
+                md += ["### Gap stratified within length bins", "",
+                       "Rows = length bin, columns = gap bin. Cells with n < 5 are blank. This",
+                       "is the table that separates the two effects; the marginal tables",
+                       "cannot.", "",
+                       "`k_direct` (residues released to close -- lower is better):", "",
+                       md_table(piv_k, nd=2), "",
+                       "`ceiling` (the ratio, for comparison):", "",
+                       md_table(piv_c, nd=2), ""]
+
+            reg = joint_regression(ceil)
+            if not reg.empty:
+                vif = coll.get("vif_gap_length", float("nan"))
+                md += ["### Joint regression, standardised coefficients", "",
+                       "Predictors and response z-scored, so `beta_gap` and `beta_len` are",
+                       "comparable. Compare a predictor's `gap only` / `length only` row",
+                       "against its `gap + length` row: a coefficient that collapses when the",
+                       "other variable is controlled was reading that other variable.", "",
+                       f"**Variance inflation: VIF = {vif:.1f}.** " + (
+                           "Above 10, so the individual `gap + length` coefficients are "
+                           "unstable -- they can flip sign and inflate without the fit "
+                           "getting worse. Read the SIGN and the r2, and take effect sizes "
+                           "from the stratified table above, not from these coefficients."
+                           if vif > 10 else
+                           "Below 10, so the joint coefficients are stable enough to read as "
+                           "effect sizes."), "",
+                       "The `k released` rows are the trustworthy ones: `k` has no length in",
+                       "its denominator, so its coefficients mean what they say.", "",
+                       md_table(reg, nd=3), ""]
+                summary["joint_regression"] = reg.to_dict("records")
+            summary["collinearity"] = coll
 
         md += ["## 3. Bridge-span profile", "",
                "The chain-terminal gap measures the free tails, not the ring: for a",

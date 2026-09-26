@@ -8,7 +8,9 @@
 #   ceiling        CPU   per-complex ceiling scan (array, one job per set x shard)
 #   timing         CPU   section 2: the setup/marginal replica ratio
 #   deliverable-e  CPU   section 6: CPSea_full competitor pairs + the spatial check
+#   ceiling-report CPU   calibrate -> ceiling -> report, the re-run path
 #   report         CPU   tables + figures from whatever landed on disk
+#   nan-repro      CPU   isolate the OpenMM `Particle coordinate is NaN` failure
 #   all            the whole DAG
 #
 # Shape of the DAG:
@@ -36,10 +38,11 @@ CPU_PARTITION="cpu"
 # partial result rather than to nothing.
 CALIB_TIME="02:00:00"; CEIL_TIME="06:00:00"; TIME_TIME="12:00:00"
 EIDX_TIME="06:00:00"; ESPAT_TIME="06:00:00"; REPORT_TIME="01:00:00"
+NANREP_TIME="02:00:00"
 RUN_ID=""
 declare -a EXTRA_ENV=()
 
-usage() { sed -n '2,30p' "$0"; exit "${1:-0}"; }
+usage() { sed -n '2,31p' "$0"; exit "${1:-0}"; }
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -59,7 +62,7 @@ while [[ $# -gt 0 ]]; do
 done
 [[ -n "$STAGE" ]] || { echo "FATAL: --submit <stage> is required" >&2; usage 1 >&2; }
 case "$STAGE" in
-  calibrate|ceiling|timing|deliverable-e|report|all) ;;
+  calibrate|ceiling|ceiling-report|timing|deliverable-e|report|nan-repro|all) ;;
   *) echo "FATAL: unknown stage '$STAGE'" >&2; usage 1 >&2 ;;
 esac
 
@@ -116,14 +119,14 @@ submit() {  # submit <description> <sbatch args...>
 
 CALIB_JID=""; EIDX_JID=""; declare -a REPORT_DEPS=()
 
-if [[ "$STAGE" == "calibrate" || "$STAGE" == "ceiling" || "$STAGE" == "all" ]]; then
+if [[ "$STAGE" == "calibrate" || "$STAGE" == "ceiling" || "$STAGE" == "ceiling-report" || "$STAGE" == "all" ]]; then
   CALIB_JID="$(submit calibrate \
     --partition="$CPU_PARTITION" --time="$CALIB_TIME" \
     scripts/m15_calibrate.sbatch "$ENV_FILE")"
   REPORT_DEPS+=("$CALIB_JID")
 fi
 
-if [[ "$STAGE" == "ceiling" || "$STAGE" == "all" ]]; then
+if [[ "$STAGE" == "ceiling" || "$STAGE" == "ceiling-report" || "$STAGE" == "all" ]]; then
   DEP=(); [[ -n "$CALIB_JID" ]] && DEP=(--dependency=afterok:"$CALIB_JID")
   IFS=',' read -ra SETS <<< "$AUDIT_SETS"
   for s in "${SETS[@]}"; do
@@ -154,7 +157,15 @@ if [[ "$STAGE" == "deliverable-e" || "$STAGE" == "all" ]]; then
   REPORT_DEPS+=("$EIDX_JID" "$JID")
 fi
 
-if [[ "$STAGE" == "report" || "$STAGE" == "all" ]]; then
+if [[ "$STAGE" == "nan-repro" ]]; then
+  # Excluded from `all` on purpose: this is a diagnostic, its output feeds no table, and
+  # chaining it into the DAG would make a reproduced bug look like a pipeline failure.
+  submit nan-repro \
+    --partition="$CPU_PARTITION" --time="$NANREP_TIME" \
+    scripts/m15_nan_repro.sbatch "$ENV_FILE" >/dev/null
+fi
+
+if [[ "$STAGE" == "report" || "$STAGE" == "ceiling-report" || "$STAGE" == "all" ]]; then
   DEP=()
   if [[ ${#REPORT_DEPS[@]} -gt 0 ]]; then
     DEP=(--dependency=afterany:"$(IFS=:; echo "${REPORT_DEPS[*]}")")

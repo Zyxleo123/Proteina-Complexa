@@ -57,12 +57,55 @@ that moves 2 A does not lose a 10 A CA-CA contact, so the write-off is simply wr
 `ceiling_strict` (and `ceiling_refined`, built on it) sits *below* what closure actually
 permits.
 
+### And it is a RATIO, which is a second trap
+
+`ceiling_strict` = (contacts whose residue is in the held window) / (all contacts). Under
+roughly uniform contacts along the chain that is `held_window / L`, so **peptide length is in
+the denominator.** Any trend read off the ceiling against a variable correlated with length
+is contaminated:
+
+- a **length** trend in the ceiling is arithmetic. `(L - k) / L` rises with `L` at constant
+  `k`, so the ceiling climbs with length even when closure gets no cheaper. Measured on this
+  run: the ceiling climbs 0.48 -> 0.79 across the length bins while the released-residue count
+  **also** climbs, 4 -> 6. The two move in *opposite* directions. Holding gap fixed in the
+  20-25 A bin (n = 224), cost is flat at 5.0 -> 5.5 while the ratio goes 0.48 -> 0.90.
+- a **gap** trend can be cancelled. Gap and length move together here (Spearman 0.47, and
+  `len_median` climbs 6 -> 15 across the bins past 10 A), so a rising denominator hides a
+  falling numerator: the ceiling looks flat past 10 A -- its gap coefficient there is **+0.042**,
+  flat and wrong-signed -- while the released-residue cost rises monotonically over all eight
+  bins, 2.0 -> 8.5, with `beta_gap` = +0.87 (r2 = 0.76).
+
+Both mistakes were made in the first read of this run; see `README_M15_RESULTS.md` section 3
+for the withdrawal. **Quote `k` (released residues, `L - refined_window_len`) for any claim
+about gap or length, and treat the ratio as presentation only.** Section 2b of the generated
+report carries `k` per row, the two-way stratification and a joint regression. On this run
+VIF = 1.3, so the joint coefficients are stable and readable; the guard is there because that
+is a property of the data, not of the method, and a future set with a tighter gap/length
+coupling would make them unreadable without warning.
+
+One measured caveat: `k_implied - k_direct` is **-0.91 residues**, so contacts are not
+uniformly distributed along the chain and the `L * (1 - ceiling)` shortcut runs about a
+residue light. Use `k_direct`.
+
 Measured on the full run (n = 660):
 
 | bound | mainchain median | exceeded by |
 |---|---|---|
-| `ceiling_refined` | 0.586 | **86.4%** (max 2.74x) |
+| `ceiling_refined` | 0.586 (**LNR slice**, n = 60) | **86.4%** (n = 660) |
 | `ceiling_permissive` | 1.000 | **0.0%** |
+
+**The 0.586 is the LNR slice, not the pooled median.** Section 3 below gives LNR mainchain
+0.586 and PepBench mainchain 0.584, and PepBench is 600 of the 660 rows -- so the pooled
+median is essentially PepBench's, and labelling 0.586 "n = 660" mixes a 60-row statistic with
+a 660-row one. The exceedance column *is* pooled over all 660. This matters because 0.586 is
+the lower bound of the head-to-tail bracket quoted in `README_M15_RESULTS.md` section 1: a
+bracket bound whose slice is unstated cannot be reproduced. The report now emits pooled and
+per-set medians in one labelled table (`Which slice a quoted median is`), and
+`m15_summary.json` carries `mainchain_refined_median_pooled` for the pooled figure.
+
+Note also a third number in circulation: section 5's `ceiling_median` is 0.594, computed on
+the 59-complex subset that overlaps the sampled attempts. Three slices, three medians, all
+legitimately different -- always say which one.
 
 `ceiling_permissive` -- a released residue keeps a contact whose partner is still inside
 its reachable ball -- is the valid upper bound. It is also useless on its own, because it
@@ -212,6 +255,35 @@ as well as over windows. Reporting only the metadata's single "best" pair would 
 narrower question than the one that matters: whether **some** bridge preserves the
 interface, not whether the closest-to-ideal one does.
 
+### That free scan is an upper bound the generator cannot reach
+
+The free maximisation answers a question about *peptide geometry*. It does not answer a
+question about *CPSea*, because CPSea conditions on the chain termini: the only anchor pair
+it can place a bridge between is `(0, L-1)`. A ceiling taken over interior pairs is
+therefore not a target the model can be held to.
+
+So every bridged chemistry is scanned **twice** -- same `bridge_spec`, same calibrated
+window, same refinement:
+
+| columns | anchors | what it is |
+|---|---|---|
+| `<chem>_*` | argmax over all `(i, j)`, `\|i-j\| >= 3` | the geometric ceiling; an upper bound |
+| `<chem>_term_*` | pinned to `(0, L-1)` | the **reachable** ceiling |
+
+**Only `*_term_*` may be quoted as a target the model is measured against.** Both are kept
+so the free-vs-reachable difference stays visible rather than being asserted; report
+section 1b prints the paired comparison, and `REACHABLE_CHEMISTRIES` in `m15_report.py`
+names the quotable set (`mainchain`, `disulfide_term`, `isopeptide_term`).
+
+The free scan upper-bounds the pinned one **by construction**, since `(0, L-1)` is one of
+the pairs it maximises over. That invariant is a test
+(`script_utils/test_m15_terminal_bridge.py`); if it ever fails, the two columns are not
+measuring the same thing and neither is interpretable.
+
+Cost note, because it bit once: refinement is a torsion solve worth seconds, and the free
+arm evaluates `O(L^2)` pairs. Refine the **winner**, once -- never inside the pair loop, or
+a 6 h shard becomes a hang. The pinned arm adds exactly two refinements per complex.
+
 ## 6. The replica-economics measurement carries its own trap
 
 `timing.*` in the YAML must mirror `scripts/soft_closure_project.py`'s own argparse
@@ -239,10 +311,16 @@ existing pull force with `r0` pinned at the native bond length *is* a hold.
 
 ```
 setup (PDBFixer + ExampleContext)   1.7 s
-marginal (perturb + one minimize)  30.0 s      ratio 0.074x
+marginal (perturb + one minimize)  30.0 s      ratio 0.074x  <- median of per-complex ratios
 amortised per decoy at 8           30.2 s
 amortised per decoy at 30          30.1 s
 ```
+
+**0.074 is `median(setup_i / marginal_i)` over the 19 complexes**
+(`m15_replica_timing.py:134` builds the per-complex ratio, `:156` takes its median). The
+ratio of the two medians printed above is 1.7 / 30.0 = **0.057**. Both statistics are valid
+and they are not equal, so neither is a typo for the other -- label whichever one is quoted.
+Every conclusion in this section holds under both.
 
 Sizing note, learned the hard way: the 2-complex smoke reported 81.5 s and the login node
 42.2 s. Both are wrong by 1.4-2.7x. The ratio was stable across all three, the absolute
@@ -289,6 +367,19 @@ concurrently. `report` depends with `afterany`: a stage that gated itself out ex
 an explanation, and the report's job is to say which stages contributed. `afterok` there
 would strand the report on a deliberate gate.
 
+To re-measure the ceiling alone without redoing timing and Deliverable E, use the
+`ceiling-report` stage:
+
+```bash
+bash scripts/submit_m15_ceiling_audit.sh --submit ceiling-report --ceil-time 12:00:00
+```
+
+That is `calibrate -> ceiling(array) -> report` in **one** submission, which is the point:
+`--submit ceiling` does not chain the report, and a separate `--submit report` call has no
+dependency to wait on, so it fires immediately against an empty directory. The `cpu`
+partition allows 2 days, so a 12 h ceiling limit is safe -- worth using, since the second
+bridged arm roughly doubles the refinement work per complex.
+
 Everything is CPU-only. No GPU is requested anywhere -- asking for one to measure geometry
 just queues behind real work.
 
@@ -305,6 +396,13 @@ torsion solver dominates). The two that matter are
 out-reaches the analytic bound) and
 `test_analytic_never_calls_infeasible_what_the_solver_closes` (the bound never
 under-licenses).
+
+The reachable bridged arm has its own suite:
+`.venv/bin/python -m pytest script_utils/test_m15_terminal_bridge.py -q` (~8 s). It holds
+the pinned anchors to `(0, L-1)`, asserts the free-scan-upper-bounds-pinned invariant,
+checks a peptide too short for any legal terminal pair still writes its row rather than
+crashing the shard, and recomputes the free maximum independently to prove the added arm
+did not disturb it.
 
 ## 8. Outputs
 
