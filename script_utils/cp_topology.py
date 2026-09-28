@@ -411,6 +411,42 @@ def ring_bond_geometry(
         chem, pose.residue(i_pos).name3(), pose.residue(j_pos).name3()
     )
     ai, aj = atoms["atom_i"], atoms["atom_j"]
+
+    # The residues at the anchors may not carry these atoms at all -- asking for a disulfide
+    # where the pose decoded MET leaves no SG to measure, and Rosetta's response to
+    # `residue.xyz("SG")` is to abort the process ("ResidueType MET:NtermProteinFull does not
+    # have an atom SG"), not to raise something catchable at the call site.
+    #
+    # That case is a graded FAILURE, not an ungradable candidate: everything else in the
+    # contract (sequence, contacts, pose RMSD, clashes) is still perfectly measurable, and the
+    # candidate simply does not express the requested chemistry. Returning NaN geometry with
+    # `bond_ok` False keeps it in the table. Raising here instead cost 318 of 800 rows on the
+    # first real SDEdit run -- and they were precisely the abstaining candidates, the ones whose
+    # removal from the denominator would most flatter that arm.
+    missing = sorted({
+        name for pos, name in ((i_pos, ai), (i_pos, atoms["next_i"]),
+                               (j_pos, aj), (j_pos, atoms["prev_j"]))
+        if not pose.residue(pos).has(name)
+    })
+    if missing:
+        return {
+            "bond_atoms": f"{ai}-{aj}",
+            "bond_length_A": float("nan"),
+            "bond_angle1_deg": float("nan"),
+            "bond_angle2_deg": float("nan"),
+            "bond_torsion_deg": float("nan"),
+            "bond_is_declared": False,
+            "bond_length_ok": False,
+            "bond_angles_ok": False,
+            "bond_ok": False,
+            "amide_is_cis": False,
+            "bond_atoms_missing": missing,
+            "bond_missing_reason": (
+                f"{chem.name} needs {ai}/{aj}; residue {i_pos} is "
+                f"{pose.residue(i_pos).name3()} and residue {j_pos} is "
+                f"{pose.residue(j_pos).name3()}, which lack {missing}"),
+        }
+
     length = math.dist(_xyz(pose, i_pos, ai), _xyz(pose, j_pos, aj))
     ang1 = _angle_deg(_xyz(pose, j_pos, atoms["prev_j"]), _xyz(pose, j_pos, aj),
                       _xyz(pose, i_pos, ai))

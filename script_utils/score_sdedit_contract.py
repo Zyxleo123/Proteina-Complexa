@@ -111,20 +111,39 @@ def load_edits(edits: list[Path]) -> list[dict]:
     return rows
 
 
+# Statuses that record a FAILURE rather than a result. A resumed shard retries these instead of
+# inheriting them: otherwise a fixed bug can never be re-run, because its failure row already
+# occupies the row_key and the resume skips it. That is not hypothetical -- 318 rows failed on a
+# missing-atom bug, and without this they would have stayed failed across every resubmission.
+RETRY_STATUSES = frozenset({
+    "grade_failed", "relax_failed", "score_failed", "lp_baseline_failed",
+    "candidate_load_failed", "load_failed", "ambiguous_input",
+})
+
+
 def done_keys(path: Path) -> set[str]:
+    """Row keys already written, EXCLUDING recorded failures (which are retried)."""
     done: set[str] = set()
+    retried = 0
     if not path.exists():
         return done
     for lineno, line in enumerate(path.read_text().splitlines(), 1):
         if not line.strip():
             continue
         try:
-            done.add(json.loads(line)["row_key"])
+            row = json.loads(line)
         except json.JSONDecodeError:
             raise SystemExit(
                 f"FATAL: corrupt row {path}:{lineno}. Two writers probably shared this file.")
-        except KeyError:
+        key = row.get("row_key")
+        if key is None:
             continue
+        if row.get("status") in RETRY_STATUSES:
+            retried += 1
+            continue
+        done.add(key)
+    if retried:
+        print(f"{retried} previously-failed row(s) will be retried", flush=True)
     return done
 
 

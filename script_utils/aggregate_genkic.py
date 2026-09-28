@@ -53,20 +53,37 @@ def load_rows(rows_dir: Path) -> list[dict]:
     if not files:
         raise SystemExit(
             f"FATAL: no rows_*.jsonl, rows.jsonl or */rows.jsonl under {rows_dir}")
-    out: list[dict] = []
+    raw: list[dict] = []
     for path in files:
         for lineno, line in enumerate(path.read_text().splitlines(), 1):
             line = line.strip()
             if not line:
                 continue
             try:
-                out.append(json.loads(line))
+                raw.append(json.loads(line))
             except json.JSONDecodeError as exc:
                 raise SystemExit(
                     f"FATAL: corrupt row {path}:{lineno} ({exc}). Two writers probably shared "
                     "this file; do not trust this run. Re-run the affected shard."
                 )
-    print(f"loaded {len(out)} rows from {len(files)} shard file(s)")
+
+    # Deduplicate by row_key, keeping the LAST occurrence. A resumed shard retries rows that
+    # previously failed, and the output file is append-only, so a retried row_key appears twice:
+    # the old failure first, then the real result. Keeping the last is what makes a retry take
+    # effect; counting both would double the candidate count and leave the stale failure in the
+    # table. Rows without a row_key are kept as-is.
+    latest: dict[str, dict] = {}
+    keyless: list[dict] = []
+    for row in raw:
+        key = row.get("row_key")
+        if key is None:
+            keyless.append(row)
+        else:
+            latest[key] = row
+    out = list(latest.values()) + keyless
+    n_dup = len(raw) - len(out)
+    print(f"loaded {len(out)} rows from {len(files)} shard file(s)"
+          + (f" ({n_dup} superseded by a later row with the same key)" if n_dup else ""))
     return out
 
 

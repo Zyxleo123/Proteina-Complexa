@@ -86,22 +86,39 @@ def parse_protected(spec: str | None, length: int) -> list[int]:
     return sorted(out)
 
 
+# Statuses recording a FAILURE rather than a result. A resumed shard retries these rather than
+# inheriting them: a failure row otherwise occupies the row_key permanently, so a fixed bug can
+# never be re-run on the candidates it broke. The aggregator keeps the LAST row per key, so a
+# retry supersedes the failure it replaces.
+RETRY_STATUSES = frozenset({
+    "prepare_failed", "relax_failed", "score_failed", "lp_baseline_failed", "load_failed",
+})
+
+
 def done_keys(path: Path) -> set[str]:
-    """Row keys already written. Refuses a corrupt line rather than skipping it."""
+    """Row keys already written, EXCLUDING recorded failures. Refuses a corrupt line."""
     done: set[str] = set()
+    retried = 0
     if not path.exists():
         return done
     for lineno, line in enumerate(path.read_text().splitlines(), 1):
         if not line.strip():
             continue
         try:
-            done.add(json.loads(line)["row_key"])
+            row = json.loads(line)
         except json.JSONDecodeError:
             raise SystemExit(
                 f"FATAL: corrupt row {path}:{lineno}. Two writers probably shared this file; "
                 "do not trust this run.")
-        except KeyError:
+        key = row.get("row_key")
+        if key is None:
             continue
+        if row.get("status") in RETRY_STATUSES:
+            retried += 1
+            continue
+        done.add(key)
+    if retried:
+        print(f"{retried} previously-failed row(s) will be retried", flush=True)
     return done
 
 
