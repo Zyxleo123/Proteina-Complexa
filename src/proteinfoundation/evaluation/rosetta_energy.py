@@ -68,6 +68,12 @@ ROSETTA_INTERFACE_SCORE_KEYS = (
     "dG_separated_norelax",
     "total_score_norelax",
     "total_score_relaxed",
+    # The requested closing bond's actual length, before and after relax. Declaring the
+    # bond is not the same as the ring surviving relaxation, so both are recorded; NaN
+    # means "not measurable" (no cyclization requested, endpoints unmapped, atoms absent),
+    # never "not closed".
+    "ring_bond_distance_norelax",
+    "ring_bond_distance_after_relax",
 )
 
 ROSETTA_METRIC_COLS = [f"binder_rosetta_{key}" for key in ROSETTA_INTERFACE_SCORE_KEYS] + [
@@ -78,6 +84,46 @@ ROSETTA_METRIC_COLS = [f"binder_rosetta_{key}" for key in ROSETTA_INTERFACE_SCOR
     # filtering the same way `n_valid_*` counts do elsewhere in this codebase.
     "binder_rosetta_cyclic_topology_declared"
 ]
+
+
+#: Atoms the closing bond of each chemistry joins. The isopeptide acceptor atom depends on
+#: the acceptor residue, so it is resolved per pose rather than listed here.
+_RING_BOND_ATOMS = {"mainchain": ("N", "C"), "disulfide": ("SG", "SG")}
+_ISOPEPTIDE_ACCEPTOR_ATOM = {"ASP": "CG", "GLU": "CD"}
+
+
+def _measure_ring_bond(pose, binder_chain, cyclization_type, i_local, j_local) -> float:
+    """Distance between the two atoms the requested closing bond joins, in Angstrom.
+
+    NaN when no cyclization was requested, when the endpoints do not map, or when the
+    chemistry's atoms are absent from those residue types. NaN means "not measurable", never
+    "not closed" -- a caller that conflates the two would report an unmeasured ring as a
+    broken one.
+    """
+    if cyclization_type is None or i_local is None or j_local is None:
+        return float("nan")
+    try:
+        pdb_info = pose.pdb_info()
+        si = pdb_info.pdb2pose(binder_chain, int(i_local) + 1)
+        sj = pdb_info.pdb2pose(binder_chain, int(j_local) + 1)
+        if si == 0 or sj == 0:
+            return float("nan")
+        if cyclization_type == "isopeptide":
+            atom_i = "NZ"
+            atom_j = _ISOPEPTIDE_ACCEPTOR_ATOM.get(pose.residue(sj).name3())
+            if atom_j is None or pose.residue(si).name3() != "LYS":
+                return float("nan")
+        else:
+            pair = _RING_BOND_ATOMS.get(cyclization_type)
+            if pair is None:
+                return float("nan")
+            atom_i, atom_j = pair
+        ri, rj = pose.residue(si), pose.residue(sj)
+        if not (ri.has(atom_i) and rj.has(atom_j)):
+            return float("nan")
+        return float((ri.xyz(atom_i) - rj.xyz(atom_j)).norm())
+    except Exception:  # noqa: BLE001  -- a measurement must never break scoring
+        return float("nan")
 
 
 def _declare_cyclic_bond(
@@ -302,6 +348,12 @@ def pyrosetta_interface_energy(
         sf = pyrosetta.create_score_function("ref2015")
         extra["total_score_norelax"] = float(sf(pose))
         extra["dG_separated_norelax"] = _analyze(pyrosetta.Pose(pose)).get("dG_separated", float("nan"))
+        # Before/after the ring bond, so "did relaxation keep the ring closed?" is a
+        # measurement rather than an assumption. Declaring the bond stops fa_rep treating
+        # two bonded atoms at 1.33 A as a clash, but nothing guarantees the outcome, and a
+        # ring pried open during relax would otherwise be scored as a closed one.
+        extra["ring_bond_distance_norelax"] = _measure_ring_bond(
+            pose, binder_chain, cyclization_type, cyclization_i, cyclization_j)
 
         fast_relax = FastRelax(sf, 1)
         # Restrain to the input coordinates: we are scoring the geometry the model
@@ -309,6 +361,8 @@ def pyrosetta_interface_energy(
         fast_relax.constrain_relax_to_start_coords(True)
         fast_relax.apply(pose)
         extra["total_score_relaxed"] = float(sf(pose))
+        extra["ring_bond_distance_after_relax"] = _measure_ring_bond(
+            pose, binder_chain, cyclization_type, cyclization_i, cyclization_j)
 
     scores = _analyze(pose)
     scores.update(extra)
