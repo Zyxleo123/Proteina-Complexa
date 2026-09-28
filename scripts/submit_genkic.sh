@@ -6,6 +6,7 @@
 #   ./scripts/submit_genkic.sh --smoke                 one real complex, end to end (do this first)
 #   ./scripts/submit_genkic.sh --search                the substantive search array
 #   ./scripts/submit_genkic.sh --sdedit                grade existing SDEdit outputs, same contract
+#   ./scripts/submit_genkic.sh --confirm               re-score winners with many more repeats
 #   ./scripts/submit_genkic.sh --report                aggregate + report over an existing run
 #   ./scripts/submit_genkic.sh --all                   search + sdedit as siblings, then report
 #
@@ -36,7 +37,7 @@ MODE=""
 OVERRIDES=()
 for arg in "$@"; do
   case "$arg" in
-    --smoke|--search|--sdedit|--report|--all)
+    --smoke|--search|--sdedit|--confirm|--report|--all)
       [[ -n "$MODE" ]] && { echo "FATAL: pick one mode, got $MODE and $arg" >&2; exit 1; }
       MODE="$arg" ;;
     *=*) OVERRIDES+=("$arg") ;;
@@ -97,9 +98,13 @@ SEARCH_SHARDS="${SEARCH_SHARDS:-12}"
 SDEDIT_SHARDS="$(env_get SDEDIT_SHARDS)"
 SDEDIT_SHARDS="${SDEDIT_SHARDS:-12}"
 
+CONFIRM_SHARDS="$(env_get CONFIRM_SHARDS)"
+CONFIRM_SHARDS="${CONFIRM_SHARDS:-4}"
+
 SMOKE_ID=""
 SEARCH_ID=""
 SDEDIT_ID=""
+CONFIRM_ID=""
 
 submit_smoke() {
   local cmd=(sbatch scripts/genkic_smoke.sbatch "$ENV_FILE")
@@ -126,12 +131,27 @@ submit_sdedit() {
   echo "  submitted sdedit grading (${SDEDIT_SHARDS} shards) as job $SDEDIT_ID"
 }
 
+submit_confirm() {
+  local dep=() waits=()
+  [[ -n "$SEARCH_ID" ]] && waits+=("$SEARCH_ID")
+  [[ -n "$SDEDIT_ID" ]] && waits+=("$SDEDIT_ID")
+  if [[ ${#waits[@]} -gt 0 ]]; then
+    dep=(--dependency=afterany:"$(IFS=:; echo "${waits[*]}")")
+  fi
+  local cmd=(sbatch "${dep[@]}" --array=0-$((CONFIRM_SHARDS - 1))
+             scripts/genkic_confirm.sbatch "$ENV_FILE")
+  echo "+ ${cmd[*]}"
+  CONFIRM_ID="$(run_sbatch "${cmd[@]:1}" | awk '{print $NF}')"
+  echo "  submitted confirm (${CONFIRM_SHARDS} shards) as job $CONFIRM_ID"
+}
+
 submit_report() {
   local dep=() waits=()
   # afterany, not afterok: a shard that hit its walltime still produced rows worth
   # aggregating, and the report's own gate reports partial coverage explicitly.
   [[ -n "$SEARCH_ID" ]] && waits+=("$SEARCH_ID")
   [[ -n "$SDEDIT_ID" ]] && waits+=("$SDEDIT_ID")
+  [[ -n "$CONFIRM_ID" ]] && waits+=("$CONFIRM_ID")
   if [[ ${#waits[@]} -gt 0 ]]; then
     dep=(--dependency=afterany:"$(IFS=:; echo "${waits[*]}")")
   fi
@@ -146,10 +166,11 @@ case "$MODE" in
   --smoke)  submit_smoke ;;
   --search) submit_search ;;
   --sdedit) submit_sdedit ;;
+  --confirm) submit_confirm ;;
   --report) submit_report ;;
   # No smoke in --all: the smoke is a preflight you run once and read, not a gate to put in
   # front of every launch. Run it first, look at it, then launch this.
-  --all)    submit_search; submit_sdedit; submit_report ;;
+  --all)    submit_search; submit_sdedit; submit_confirm; submit_report ;;
 esac
 
 echo

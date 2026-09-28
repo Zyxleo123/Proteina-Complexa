@@ -352,6 +352,36 @@ def report(rows: list[dict], all_targets: list[str], out_dir: Path, sdedit_rows:
         out("  NOTE: only ONE relax repeat per candidate in this run, so the CP spread is 0 by")
         out("        construction and no ddG can be tested against relax noise. The contract")
         out("        asks for 3 -- relaunch with CP_REPEATS=3 before quoting a ddG as real.")
+    # The question is not whether ddG is large compared with the noise, it is whether the
+    # candidate's MARGIN TO THE BAR is. A candidate at +4.7 REU against a +5 bar has 0.3 REU of
+    # margin; if its repeat spread is 1.0 REU, another three seeds could put it the other side,
+    # and calling it a pass overstates what was measured. This is the check that matters for an
+    # ACCEPTED row, and it is reported for accepted rows specifically.
+    def margin_and_spread(r):
+        ddg = _num(r, "ddg_interface_reu")
+        if ddg != ddg:
+            return None, None
+        spread = (_num(r, "cp_dG_separated_spread", 0.0)
+                  + _num(r, "lp_dG_separated_spread", 0.0))
+        return thresholds_max_ddg - ddg, (spread if spread == spread else 0.0)
+
+    thresholds_max_ddg = 5.0
+    if accepted:
+        marginal = []
+        for r in accepted:
+            m, s = margin_and_spread(r)
+            if m is not None and s is not None and m < s:
+                marginal.append((r, m, s))
+        out(f"  ACCEPTED candidates whose margin to the +{thresholds_max_ddg:.0f} REU bar is "
+            f"SMALLER than their repeat spread: {len(marginal)}/{len(accepted)}")
+        for r, m, s in marginal[:8]:
+            out(f"    {r['example_id']:22s} {r.get('chemistry','?'):10s} "
+                f"ddG={_fmt(_num(r, 'ddg_interface_reu'), 2)} margin={m:.2f} "
+                f"spread={s:.2f} REU  <-- pass is NOT resolvable at this repeat count")
+        if marginal:
+            out("    These are reported as accepted because the contract is applied as written,")
+            out("    but the energy criterion is within noise for them. Re-score with more")
+            out("    repeats before treating any of them as a confirmed success.")
     noisy = [r for r in post
              if _num(r, "ddg_interface_reu") == _num(r, "ddg_interface_reu")
              and _num(r, "cp_dG_separated_spread", 0.0) + _num(r, "lp_dG_separated_spread", 0.0)

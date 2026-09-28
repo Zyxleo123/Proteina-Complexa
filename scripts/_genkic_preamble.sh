@@ -82,6 +82,10 @@ _genkic_defaults() {
   # nothing about run-to-run spread.
   CP_REPEATS="${CP_REPEATS:-3}"
   LP_REPEATS="${LP_REPEATS:-1}"
+  # Harmonic sd (A) restraining RELEASED CAs to their original positions during the SEARCH.
+  # 0 reproduces the unrestrained behaviour that put 209/222 candidates beyond the 2 A bar
+  # before relax. Swept, not fixed: tight restraints make far-apart termini unclosable.
+  SEARCH_COORD_SD="${SEARCH_COORD_SD:-1.0}"
   PERTURB_DEG="${PERTURB_DEG:-45.0}"
   SEED="${SEED:-1}"
 
@@ -106,12 +110,22 @@ _genkic_defaults() {
   SDEDIT_SHARDS="${SDEDIT_SHARDS:-12}"
   SDEDIT_SHORTLIST="${SDEDIT_SHORTLIST:-${SHORTLIST}}"
 
+  # Confirmation stage: re-score selected candidates with many more repeats, to test whether a
+  # pass survives its own noise. 15 repeats shrinks the standard error ~2x versus the search
+  # stage's 3, which is what a sub-REU margin needs.
+  CONFIRM_DIR="${CONFIRM_DIR:-${OUT_DIR}/confirm}"
+  CONFIRM_SHARDS="${CONFIRM_SHARDS:-4}"
+  CONFIRM_REPEATS="${CONFIRM_REPEATS:-15}"
+  CONFIRM_NEAR_MISS_REU="${CONFIRM_NEAR_MISS_REU:-5.0}"
+  CONFIRM_MAX="${CONFIRM_MAX:-0}"
+
   export METADATA RUN_ID OUT_DIR ROWS_DIR PDB_DIR REPORT_DIR
   export CHEMISTRIES BUDGETS PROTECTED
   export ATTEMPTS_PER_CALL CALLS MIN_SOLUTIONS MAX_RELEASED SHORTLIST DUMP_TOP
-  export RELAX_REPEATS CP_REPEATS LP_REPEATS PERTURB_DEG SEED
+  export RELAX_REPEATS CP_REPEATS LP_REPEATS PERTURB_DEG SEARCH_COORD_SD SEED
   export SEARCH_SHARDS TIME_BUDGET_S EXAMPLES SMOKE
   export SDEDIT_DIR SDEDIT_ROWS_DIR SDEDIT_SHARDS SDEDIT_SHORTLIST
+  export CONFIRM_DIR CONFIRM_SHARDS CONFIRM_REPEATS CONFIRM_NEAR_MISS_REU CONFIRM_MAX
 
   mkdir -p "${OUT_DIR}" "${ROWS_DIR}" "${PDB_DIR}" "${REPORT_DIR}"
 }
@@ -145,6 +159,7 @@ _genkic_banner() {
   echo "chemistries: ${CHEMISTRIES}"
   echo "budgets    : ${BUDGETS}"
   echo "effort     : attempts=${ATTEMPTS_PER_CALL} calls=${CALLS} min_solutions=${MIN_SOLUTIONS} max_released=${MAX_RELEASED}"
+  echo "pose rstr  : search_coord_sd=${SEARCH_COORD_SD} A on released CAs"
   echo "shortlist  : ${SHORTLIST} (cp_repeats=${CP_REPEATS}, relax_repeats=${RELAX_REPEATS}, lp_repeats=${LP_REPEATS})"
   # `hostname` is not on PATH on every compute node here, and a bare $(hostname) prints a
   # command-not-found to stderr on each job. SLURMD_NODENAME is set by Slurm itself.

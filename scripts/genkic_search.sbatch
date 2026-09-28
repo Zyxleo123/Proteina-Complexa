@@ -66,6 +66,7 @@ srun python scripts/genkic_cyclize.py \
   --cp-repeats "${CP_REPEATS}" \
   --lp-repeats "${LP_REPEATS}" \
   --perturb-deg "${PERTURB_DEG}" \
+  --search-coord-sd "${SEARCH_COORD_SD}" \
   --seed "${SEED}" \
   --shard-index "$SHARD_INDEX" \
   --shard-count "$SHARD_COUNT" \

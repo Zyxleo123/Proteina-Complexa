@@ -142,6 +142,45 @@ def reroot_outward(pose, binder_pos: list[int], anchor_local: int) -> bool:
     return ok
 
 
+def add_search_coord_constraints(pose, target, released_pose, sd: float = 1.0) -> int:
+    """Restrain the RELEASED residues' CA atoms to their original positions, for the search.
+
+    This is the lever on pose preservation, and it was missing. `randomize_backbone_by_rama_prepro`
+    resamples released torsions with no preference for where the residues started, and
+    `genkic_close` was handed a score function with the constraint terms at ZERO weight -- so
+    the lowest-energy selector chose among closures purely on ref2015 and was indifferent to
+    whether the peptide had swung across the interface. Measured on the first real run: 209 of
+    222 scored candidates were already beyond the 2 A whole-peptide bar BEFORE relaxation, and
+    relax then pulled them back by only 0.2 A. The pose failure is made in the search and
+    relaxation cannot undo it.
+
+    Only the released residues are restrained: the interior is already held exactly by the
+    engine's kinematics, so restraining it would add a force with nothing to do.
+
+    `sd` trades closure against fidelity, and the trade is real rather than free -- a target
+    whose termini start 45 A apart cannot close while holding every released CA within 1 A, so
+    a tight `sd` will make some targets unreachable instead of reachable-but-wrong. That is the
+    honest outcome and it is why `sd` is a swept knob, not a constant.
+
+    Returns:
+        The number of constraints added.
+    """
+    from pyrosetta.rosetta.core.id import AtomID
+    from pyrosetta.rosetta.core.scoring.constraints import CoordinateConstraint
+    from pyrosetta.rosetta.core.scoring.func import HarmonicFunc
+
+    anchor = AtomID(1, pose.fold_tree().root())
+    n = 0
+    for p in released_pose:
+        if not (pose.residue(p).has("CA") and target.pose.residue(p).has("CA")):
+            continue
+        pose.add_constraint(CoordinateConstraint(
+            AtomID(pose.residue(p).atom_index("CA"), p), anchor,
+            target.pose.residue(p).xyz("CA"), HarmonicFunc(0.0, sd)))
+        n += 1
+    return n
+
+
 def set_rng_seed(seed: int) -> None:
     """Seed both RNGs a search attempt draws from, so a batch is reproducible on resume.
 
@@ -302,6 +341,7 @@ def bridge_anneal(
     atoms: dict[str, str],
     perturb_deg: float = 45.0,
     min_rounds: int = 2,
+    coord_sd: float = 1.0,
 ) -> bool:
     """Perturb the released terminal torsions, then minimize under the ring constraints.
 
@@ -329,7 +369,13 @@ def bridge_anneal(
         pose.set_psi(p, pose.psi(p) + random.uniform(-perturb_deg, perturb_deg))
 
     T.add_ring_constraints(pose, i_pos, j_pos, chem, atoms)
-    sf = constrained_score_function(cst_weight=10.0)
+    # Same pose-preservation restraint the GenKIC path needs: without it the minimizer is free
+    # to drag the released termini anywhere that satisfies the ring, and nothing later recovers
+    # the original placement.
+    if coord_sd and coord_sd > 0:
+        add_search_coord_constraints(pose, target, window["released_pose"], sd=coord_sd)
+    sf = constrained_score_function(cst_weight=10.0,
+                                    coord_weight=1.0 if coord_sd and coord_sd > 0 else 0.0)
 
     mm = R.core.kinematics.MoveMap()
     mm.set_bb(False)

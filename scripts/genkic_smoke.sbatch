@@ -82,6 +82,7 @@ srun python scripts/genkic_cyclize.py \
   --cp-repeats "${SMOKE_CP_REPEATS:-1}" \
   --lp-repeats "${LP_REPEATS}" \
   --perturb-deg "${PERTURB_DEG}" \
+  --search-coord-sd "${SEARCH_COORD_SD}" \
   --seed "${SEED}"
 
 echo

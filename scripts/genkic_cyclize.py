@@ -223,13 +223,27 @@ def run_target(target: S.Target, args, emit) -> dict[str, int]:
                     tally["searched"] += 1
 
                     if chem.genkic_closable:
-                        ok = S.genkic_close(pose, window, i_pos, j_pos, chem, atoms,
-                                            S.constrained_score_function(cst_weight=0.0),
-                                            attempts=args.attempts_per_call,
-                                            min_solutions=args.min_solutions)
+                        # Coordinate restraints on the released CAs, and a score function that
+                        # actually WEIGHTS them, so the lowest-energy selector prefers closures
+                        # that stayed near the original pose. With coord_weight 0 it picked on
+                        # ref2015 alone and 209/222 candidates landed beyond the 2 A bar before
+                        # relax ever ran.
+                        coord_on = args.search_coord_sd and args.search_coord_sd > 0
+                        if coord_on:
+                            S.add_search_coord_constraints(
+                                pose, target, window["released_pose"],
+                                sd=args.search_coord_sd)
+                        ok = S.genkic_close(
+                            pose, window, i_pos, j_pos, chem, atoms,
+                            S.constrained_score_function(
+                                cst_weight=0.0, coord_weight=1.0 if coord_on else 0.0),
+                            attempts=args.attempts_per_call,
+                            min_solutions=args.min_solutions)
+                        pose.remove_constraints()
                     else:
                         ok = S.bridge_anneal(pose, target, window, i_pos, j_pos, chem, atoms,
-                                             perturb_deg=args.perturb_deg)
+                                             perturb_deg=args.perturb_deg,
+                                             coord_sd=args.search_coord_sd)
                     if not ok:
                         continue
                     tally["closed"] += 1
@@ -353,6 +367,12 @@ def main() -> int:
                          "attempts per chemistry is roughly calls * attempts * |ladder|.")
     ap.add_argument("--max-released", type=int, default=None,
                     help="Cap on released residues; default is the peptide's own limit (L-2).")
+    ap.add_argument("--search-coord-sd", type=float, default=1.0,
+                    help="Harmonic sd (A) restraining RELEASED residues' CA to their original "
+                         "positions DURING the search. 0 disables it, reproducing the "
+                         "unrestrained behaviour. Trades closure rate against pose fidelity: a "
+                         "target whose termini start far apart cannot close while holding every "
+                         "released CA tight, so this is a swept knob, not a constant.")
     ap.add_argument("--perturb-deg", type=float, default=45.0,
                     help="Torsion perturbation amplitude for the bridge-anneal engine.")
     ap.add_argument("--shortlist", type=int, default=8,
