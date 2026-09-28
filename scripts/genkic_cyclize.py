@@ -140,6 +140,17 @@ def run_target(target: S.Target, args, emit) -> dict[str, int]:
     for chem_name in args.chemistries:
         chem = T.chemistry(chem_name)
         min_cost = T.min_anchor_cost(target.native_aa_i, target.native_aa_j, chem)
+        # A larger budget only widens the search if it admits anchor options a smaller one could
+        # not afford. Head-to-tail costs 0 anchor mutations, so budgets 0/1/2 enumerate the
+        # IDENTICAL spec set and searching each would triple the work for literally the same
+        # candidates. The duplicate budget is recorded as such -- it still counts as covered in
+        # the tier grid, it simply is not re-searched.
+        #
+        # Note what this makes explicit: this arm spends the budget on ANCHOR identities only.
+        # `SearchSpec.extra_mutations` exists and is counted, but no additional non-anchor
+        # mutations are enumerated, so a budget above a chemistry's anchor cost buys nothing
+        # here. That is a limitation of the search, not a property of the chemistry.
+        searched_signatures: dict[frozenset, int] = {}
         for budget in args.budgets:
             if min_cost > budget:
                 key = f"{target.example_id}|{chem_name}|budget{budget}|infeasible"
@@ -161,6 +172,21 @@ def run_target(target: S.Target, args, emit) -> dict[str, int]:
             specs = specs_for(target, chem_name, budget, protected, args.max_released)
             if not specs:
                 continue
+            signature = frozenset(s.label() for s in specs)
+            if signature in searched_signatures:
+                prior = searched_signatures[signature]
+                emit({
+                    "row_key": f"{target.example_id}|{chem_name}|budget{budget}|duplicate",
+                    "status": "duplicate_budget", "example_id": target.example_id,
+                    "chemistry": chem_name, "mutation_budget": budget,
+                    "same_as_budget": prior, "n_specs": len(specs),
+                    "reason": (f"budget {budget} admits exactly the same {len(specs)} specs as "
+                               f"budget {prior} ({chem_name} needs {min_cost} anchor "
+                               f"mutation(s), and no non-anchor mutations are enumerated), so "
+                               f"searching it again would reproduce identical candidates"),
+                })
+                continue
+            searched_signatures[signature] = budget
             pool: list[tuple[tuple, dict, object, dict, dict, int, int, S.SearchSpec]] = []
 
             for spec in specs:
@@ -182,7 +208,8 @@ def run_target(target: S.Target, args, emit) -> dict[str, int]:
                     if chem.genkic_closable:
                         ok = S.genkic_close(pose, window, i_pos, j_pos, chem, atoms,
                                             S.constrained_score_function(cst_weight=0.0),
-                                            attempts=args.attempts_per_call)
+                                            attempts=args.attempts_per_call,
+                                            min_solutions=args.min_solutions)
                     else:
                         ok = S.bridge_anneal(pose, target, window, i_pos, j_pos, chem, atoms,
                                              perturb_deg=args.perturb_deg)
@@ -237,8 +264,10 @@ def run_target(target: S.Target, args, emit) -> dict[str, int]:
                 # re-searched from scratch on every resubmission. The failure is written out
                 # as a row, so it stays visible instead of thinning the table silently.
                 try:
-                    E.refine_candidate(pose, target, i_pos, j_pos, chem, atoms,
-                                       relax_repeats=args.relax_repeats)
+                    pose, cp_stats = E.refine_candidate_repeats(
+                        pose, target, i_pos, j_pos, chem, atoms,
+                        repeats=args.cp_repeats, relax_repeats=args.relax_repeats,
+                        seed_base=int(pre_row["seed"]) + 500_000)
                 except Exception as exc:                                   # noqa: BLE001
                     emit({"row_key": pre_row["row_key"].replace("|pre", "|relaxfail"),
                           "status": "relax_failed", "example_id": target.example_id,
@@ -250,6 +279,7 @@ def run_target(target: S.Target, args, emit) -> dict[str, int]:
                         target, pose, spec, atoms, window, i_pos, j_pos,
                         stage="post_relax", protected_local=protected,
                         lp_baseline=lp_baseline, with_energy=True)
+                    post.update(cp_stats)
                 except Exception as exc:                                   # noqa: BLE001
                     emit({"row_key": pre_row["row_key"].replace("|pre", "|scorefail"),
                           "status": "score_failed", "example_id": target.example_id,
@@ -297,6 +327,10 @@ def main() -> int:
                     help="0-based local indices that must not be mutated, e.g. '3,5-7'.")
     ap.add_argument("--attempts-per-call", type=int, default=2000,
                     help="GenKIC closure attempts per call.")
+    ap.add_argument("--min-solutions", type=int, default=8,
+                    help="Closures GenKIC collects per call before the lowest-energy selector "
+                         "picks one. At 1 it stops at the FIRST closure and the selector has "
+                         "nothing to choose from -- this is the quality-over-yield lever.")
     ap.add_argument("--calls", type=int, default=4,
                     help="Independent search calls per (anchors, window). Total closure "
                          "attempts per chemistry is roughly calls * attempts * |ladder|.")
@@ -308,7 +342,13 @@ def main() -> int:
                     help="Candidates per (chemistry, budget) that get relaxed and scored.")
     ap.add_argument("--dump-top", type=int, default=2,
                     help="Also write structures for this many top-ranked non-accepted rows.")
-    ap.add_argument("--relax-repeats", type=int, default=1, help="FastRelax repeats.")
+    ap.add_argument("--relax-repeats", type=int, default=1,
+                    help="FastRelax cycles WITHIN one relaxation trajectory (not independent "
+                         "samples of it -- see --cp-repeats).")
+    ap.add_argument("--cp-repeats", type=int, default=1,
+                    help="Independent relaxation/scoring runs per shortlisted CANDIDATE. The "
+                         "contract asks for 3; the median feeds the paired delta and the "
+                         "spread says whether that delta exceeds relax noise.")
     ap.add_argument("--lp-repeats", type=int, default=1,
                     help="Independent LP baseline relaxations (median feeds the paired delta).")
     ap.add_argument("--seed", type=int, default=1)
@@ -338,10 +378,27 @@ def main() -> int:
     print(f"{len(meta)} targets; shard {args.shard_index}/{args.shard_count} takes {len(rows)}",
           flush=True)
 
+    # State the search effort explicitly, per LP and per chemistry, rather than leaving it
+    # implicit in four interacting knobs. `attempts` is an upper bound: GenKIC stops once it has
+    # `min_solutions` closures, so an easy window spends a fraction of the budget and a hard one
+    # is capped at it. The printed number is therefore the ceiling, not the expected cost.
+    for _, m in rows.head(1).iterrows():
+        L = int(m["peptide_length"])
+        n_rungs = len(T.window_ladder(L, max_released=args.max_released))
+        per_anchor = args.attempts_per_call * args.calls * n_rungs
+        print(f"search effort ceiling (L={L} example): {n_rungs} window rungs x {args.calls} "
+              f"calls x {args.attempts_per_call} attempts = {per_anchor:,} closure attempts per "
+              f"anchor option per budget; GenKIC collects {args.min_solutions} closures per call "
+              f"before selecting.", flush=True)
+
     if args.dry_run:
         for _, m in rows.iterrows():
-            print(f"  {m['example_id']}  L={m['peptide_length']}  chain={m['binder_chain_id']}"
+            L = int(m["peptide_length"])
+            n_rungs = len(T.window_ladder(L, max_released=args.max_released))
+            print(f"  {m['example_id']}  L={L}  chain={m['binder_chain_id']}"
                   f"  nc_gap={m.get('nc_gap_angstrom', float('nan')):.1f}"
+                  f"  rungs={n_rungs}"
+                  f"  ceiling={args.attempts_per_call * args.calls * n_rungs:,}/anchor/budget"
                   f"  chemistries={args.chemistries} budgets={args.budgets}", flush=True)
         print("DRY RUN OK: ran no Rosetta.", flush=True)
         return 0

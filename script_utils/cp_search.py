@@ -224,12 +224,20 @@ def genkic_close(
     score_function,
     attempts: int = 500,
     rama_cutoff: float = 2.0,
+    min_solutions: int = 8,
 ) -> bool:
     """One GenKIC call: close the ring through `chem`'s bond, or report failure.
 
     Returns True when a solution was found and applied to `pose`. Loop residues are supplied
     in ring order so GenKIC's auto-assigned anchors are the residues flanking the window,
     which it holds exactly fixed.
+
+    `min_solutions` is the quality lever, and it is why this arm is not a first-hit search.
+    GenKIC stops once it has collected `min_solutions` closures, then `lowest_energy_selector`
+    returns the best of them; at `min_solutions=1` it stops at the FIRST closure and the
+    selector has nothing to choose from, which is exactly the "stop at the first closed
+    structure" behaviour the contract rules out. `attempts` is the upper bound on tries, so an
+    easy window costs little and a hard one is capped.
     """
     import pyrosetta.rosetta as R
 
@@ -266,7 +274,7 @@ def genkic_close(
     gk.set_selector_type("lowest_energy_selector")
     gk.set_selector_scorefunction(score_function)
     gk.set_closure_attempts(int(attempts))
-    gk.set_min_solution_count(1)
+    gk.set_min_solution_count(max(1, int(min_solutions)))
     gk.set_dont_fail_if_no_solution_found(True)
 
     # GenKIC can also drop the pose's PDBInfo. It is repaired downstream rather than here,

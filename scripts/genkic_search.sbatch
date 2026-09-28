@@ -58,10 +58,12 @@ srun python scripts/genkic_cyclize.py \
   --budgets ${BUDGETS} \
   --attempts-per-call "${ATTEMPTS_PER_CALL}" \
   --calls "${CALLS}" \
+  --min-solutions "${MIN_SOLUTIONS}" \
   --max-released "${MAX_RELEASED}" \
   --shortlist "${SHORTLIST}" \
   --dump-top "${DUMP_TOP}" \
   --relax-repeats "${RELAX_REPEATS}" \
+  --cp-repeats "${CP_REPEATS}" \
   --lp-repeats "${LP_REPEATS}" \
   --perturb-deg "${PERTURB_DEG}" \
   --seed "${SEED}" \

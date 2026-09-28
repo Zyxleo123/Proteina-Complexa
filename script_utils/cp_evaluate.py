@@ -102,6 +102,70 @@ def refine_candidate(pose, target, i_pos, j_pos, chem, atoms,
     pose.remove_constraints()
 
 
+def refine_candidate_repeats(
+    pose, target, i_pos, j_pos, chem, atoms, *,
+    repeats: int = 1, relax_repeats: int = 1, coord_sd: float = 0.5,
+    seed_base: int = 500_000,
+):
+    """Relax the SAME pre-relax candidate `repeats` times from independent seeds.
+
+    The contract asks for three independent relaxation/scoring runs on shortlisted candidates,
+    with medians and variability, against the LP baseline's own repeats. One relaxation cannot
+    supply that: `FastRelax`'s own repeat count is a number of cycles inside a single
+    trajectory, not independent samples of it, so it says nothing about run-to-run spread.
+    This matters concretely here -- measured interface deltas on the first complex ranged from
+    +8 to +50 REU against a +5 REU bar, and without the spread there is no way to tell a real
+    degradation from relax noise.
+
+    The returned pose is the repeat whose `dG_separated` is the MEDIAN, not an average of
+    coordinates: every geometry, contact and clash number then describes a structure that
+    actually exists. Repeats that failed outright are reported rather than silently dropped.
+
+    Returns:
+        `(representative_pose, stats)`. `stats` carries the median, spread and full list of
+        `dG_separated`, plus how many repeats were attempted and how many yielded a number.
+
+    Raises:
+        RuntimeError: every repeat failed, so there is no candidate to grade.
+    """
+    import pyrosetta
+
+    n = max(1, int(repeats))
+    scored: list[tuple[float, object]] = []
+    errors: list[str] = []
+    for r in range(n):
+        work = pyrosetta.Pose(pose)
+        S.set_rng_seed(seed_base + 1000 * r)
+        try:
+            refine_candidate(work, target, i_pos, j_pos, chem, atoms,
+                             relax_repeats=relax_repeats, coord_sd=coord_sd)
+        except Exception as exc:                                      # noqa: BLE001
+            errors.append(f"repeat {r}: {type(exc).__name__}: {exc}"[:200])
+            continue
+        dg = interface_metrics_or_nan(work, target).get("dG_separated", float("nan"))
+        scored.append((dg, work))
+
+    if not scored:
+        raise RuntimeError(
+            f"all {n} relaxation repeats failed; " + " | ".join(errors[:3]))
+
+    # Median by dG, NaNs last so a failed measurement never becomes the representative.
+    scored.sort(key=lambda t: (t[0] != t[0], t[0]))
+    rep_dg, rep_pose = scored[(len(scored) - 1) // 2]
+    dgs = [d for d, _ in scored]
+    stats = {
+        "cp_n_relax_repeats": n,
+        "cp_n_relax_scored": len(scored),
+        "cp_dG_separated_median": round(_median(dgs), 3),
+        "cp_dG_separated_spread": round(_spread(dgs), 3),
+        "cp_dG_separated_all": [round(d, 3) if d == d else None for d in dgs],
+        "cp_representative_dG": round(rep_dg, 3) if rep_dg == rep_dg else float("nan"),
+    }
+    if errors:
+        stats["cp_relax_repeat_errors"] = errors[:3]
+    return rep_pose, stats
+
+
 def refine_lp_baseline(target, relax_repeats: int = 1, coord_sd: float = 0.5):
     """Relax the ORIGINAL LP down the identical pack/relax path, with no ring declared."""
     import pyrosetta

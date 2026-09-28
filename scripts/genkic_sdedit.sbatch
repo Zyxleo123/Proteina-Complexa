@@ -90,6 +90,7 @@ srun python script_utils/score_sdedit_contract.py \
   --shortlist "${SDEDIT_SHORTLIST:-${SHORTLIST}}" \
   --dump-top "${DUMP_TOP}" \
   --relax-repeats "${RELAX_REPEATS}" \
+  --cp-repeats "${CP_REPEATS}" \
   --lp-repeats "${LP_REPEATS}" \
   --shard-index "$SHARD_INDEX" \
   --shard-count "$SHARD_COUNT" \

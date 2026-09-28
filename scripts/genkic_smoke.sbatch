@@ -74,10 +74,12 @@ srun python scripts/genkic_cyclize.py \
   --budgets ${BUDGETS} \
   --attempts-per-call "${SMOKE_ATTEMPTS:-500}" \
   --calls "${SMOKE_CALLS:-2}" \
+  --min-solutions "${MIN_SOLUTIONS}" \
   --max-released "${MAX_RELEASED}" \
   --shortlist "${SMOKE_SHORTLIST:-2}" \
   --dump-top 1 \
   --relax-repeats "${RELAX_REPEATS}" \
+  --cp-repeats "${SMOKE_CP_REPEATS:-1}" \
   --lp-repeats "${LP_REPEATS}" \
   --perturb-deg "${PERTURB_DEG}" \
   --seed "${SEED}"

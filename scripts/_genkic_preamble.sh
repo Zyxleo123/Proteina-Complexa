@@ -70,10 +70,17 @@ _genkic_defaults() {
   # ranked shortlist pays for relaxation.
   ATTEMPTS_PER_CALL="${ATTEMPTS_PER_CALL:-2000}"
   CALLS="${CALLS:-4}"
+  # Closures GenKIC collects per call before the lowest-energy selector picks one. At 1 the
+  # search stops at the first closed structure, which the contract rules out.
+  MIN_SOLUTIONS="${MIN_SOLUTIONS:-8}"
   MAX_RELEASED="${MAX_RELEASED:-6}"
   SHORTLIST="${SHORTLIST:-8}"
   DUMP_TOP="${DUMP_TOP:-2}"
   RELAX_REPEATS="${RELAX_REPEATS:-1}"
+  # Independent relaxation/scoring runs per shortlisted CANDIDATE (the contract asks for 3).
+  # Distinct from RELAX_REPEATS, which is FastRelax cycles inside ONE trajectory and so says
+  # nothing about run-to-run spread.
+  CP_REPEATS="${CP_REPEATS:-3}"
   LP_REPEATS="${LP_REPEATS:-1}"
   PERTURB_DEG="${PERTURB_DEG:-45.0}"
   SEED="${SEED:-1}"
@@ -101,8 +108,8 @@ _genkic_defaults() {
 
   export METADATA RUN_ID OUT_DIR ROWS_DIR PDB_DIR REPORT_DIR
   export CHEMISTRIES BUDGETS PROTECTED
-  export ATTEMPTS_PER_CALL CALLS MAX_RELEASED SHORTLIST DUMP_TOP
-  export RELAX_REPEATS LP_REPEATS PERTURB_DEG SEED
+  export ATTEMPTS_PER_CALL CALLS MIN_SOLUTIONS MAX_RELEASED SHORTLIST DUMP_TOP
+  export RELAX_REPEATS CP_REPEATS LP_REPEATS PERTURB_DEG SEED
   export SEARCH_SHARDS TIME_BUDGET_S EXAMPLES SMOKE
   export SDEDIT_DIR SDEDIT_ROWS_DIR SDEDIT_SHARDS SDEDIT_SHORTLIST
 
@@ -137,8 +144,8 @@ _genkic_banner() {
   echo "metadata   : ${METADATA}"
   echo "chemistries: ${CHEMISTRIES}"
   echo "budgets    : ${BUDGETS}"
-  echo "effort     : attempts=${ATTEMPTS_PER_CALL} calls=${CALLS} max_released=${MAX_RELEASED}"
-  echo "shortlist  : ${SHORTLIST} (relax_repeats=${RELAX_REPEATS}, lp_repeats=${LP_REPEATS})"
+  echo "effort     : attempts=${ATTEMPTS_PER_CALL} calls=${CALLS} min_solutions=${MIN_SOLUTIONS} max_released=${MAX_RELEASED}"
+  echo "shortlist  : ${SHORTLIST} (cp_repeats=${CP_REPEATS}, relax_repeats=${RELAX_REPEATS}, lp_repeats=${LP_REPEATS})"
   # `hostname` is not on PATH on every compute node here, and a bare $(hostname) prints a
   # command-not-found to stderr on each job. SLURMD_NODENAME is set by Slurm itself.
   echo "job        : ${SLURM_JOB_ID:-none} array ${SLURM_ARRAY_TASK_ID:-none} on ${SLURMD_NODENAME:-${HOSTNAME:-unknown}}"

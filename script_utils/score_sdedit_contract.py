@@ -273,10 +273,16 @@ def grade_example(example_id: str, rows: list[dict], args, emit) -> dict[str, in
         entries.sort(key=lambda e: e[0])
         for rank, (_, pre_row, pose, atoms, window, i_pos, j_pos, spec, chem) in enumerate(
                 entries[: args.shortlist]):
-            S.set_rng_seed(abs(hash((example_id, spec.pdb_tag))) % 1_000_000 + 500_000)
+            # Seeded from the tag, not Python's hash(): PYTHONHASHSEED randomizes str hashing
+            # per process, so a resumed shard would relax from different seeds than the run it
+            # is continuing and its repeats would not be reproducible.
+            seed_base = (int.from_bytes(spec.pdb_tag.encode(), "little", signed=False)
+                         % 1_000_000) + 500_000
             try:
-                E.refine_candidate(pose, target, i_pos, j_pos, chem, atoms,
-                                   relax_repeats=args.relax_repeats)
+                pose, cp_stats = E.refine_candidate_repeats(
+                    pose, target, i_pos, j_pos, chem, atoms,
+                    repeats=args.cp_repeats, relax_repeats=args.relax_repeats,
+                    seed_base=seed_base)
             except Exception as exc:                                  # noqa: BLE001
                 emit({"row_key": f"{example_id}|{spec.pdb_tag}|relaxfail",
                       "status": "relax_failed", "example_id": example_id,
@@ -294,6 +300,7 @@ def grade_example(example_id: str, rows: list[dict], args, emit) -> dict[str, in
                       "pdb_tag": spec.pdb_tag, "chemistry": chem_name,
                       "error": f"{type(exc).__name__}: {exc}"[:300]})
                 continue
+            post.update(cp_stats)
             post.update({"status": "ok", "arm": "sdedit", "engine": "sdedit",
                          "pdb_tag": spec.pdb_tag, "t_ca_start": spec.t_ca,
                          "t_lat_start": spec.t_lat, "seed": spec.seed,
@@ -331,7 +338,10 @@ def main() -> int:
     ap.add_argument("--shortlist", type=int, default=8,
                     help="Candidates per (example, chemistry) that get relaxed and scored.")
     ap.add_argument("--dump-top", type=int, default=2)
-    ap.add_argument("--relax-repeats", type=int, default=1)
+    ap.add_argument("--relax-repeats", type=int, default=1,
+                    help="FastRelax cycles within one trajectory (not independent samples).")
+    ap.add_argument("--cp-repeats", type=int, default=1,
+                    help="Independent relaxation/scoring runs per shortlisted candidate.")
     ap.add_argument("--lp-repeats", type=int, default=1)
     ap.add_argument("--shard-index", type=int, default=0)
     ap.add_argument("--shard-count", type=int, default=1)

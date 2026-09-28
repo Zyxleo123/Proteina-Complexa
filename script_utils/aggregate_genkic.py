@@ -44,9 +44,15 @@ CHEMISTRIES = ("mainchain", "disulfide", "isopeptide")
 
 def load_rows(rows_dir: Path) -> list[dict]:
     """Every row from every shard. A corrupt line stops the aggregation."""
-    files = sorted(rows_dir.glob("rows_*.jsonl")) + sorted(rows_dir.glob("*/rows.jsonl"))
+    # Search shards write rows_<n>.jsonl; the smoke writes a single rows.jsonl (either in the
+    # directory given, or in a subdirectory of the run), so the same report can be cut over a
+    # smoke and over a full run without a second code path.
+    files = (sorted(rows_dir.glob("rows_*.jsonl"))
+             + sorted(rows_dir.glob("rows.jsonl"))
+             + sorted(rows_dir.glob("*/rows.jsonl")))
     if not files:
-        raise SystemExit(f"FATAL: no rows_*.jsonl under {rows_dir}")
+        raise SystemExit(
+            f"FATAL: no rows_*.jsonl, rows.jsonl or */rows.jsonl under {rows_dir}")
     out: list[dict] = []
     for path in files:
         for lineno, line in enumerate(path.read_text().splitlines(), 1):
@@ -250,20 +256,33 @@ def report(rows: list[dict], all_targets: list[str], out_dir: Path, sdedit_rows:
     out("  searched = a closure was attempted;  infeasible = the chemistry cannot exist at")
     out("  that budget on that LP (counted, never dropped from the denominator)")
     out("-" * 100)
-    budgets = sorted({int(r["mutation_budget"]) for r in post + infeasible
+    dup = [r for r in rows if r.get("status") == "duplicate_budget"]
+    budgets = sorted({int(r["mutation_budget"]) for r in post + infeasible + dup
                       if r.get("mutation_budget") is not None})
     out(f"  {'chemistry':12s} {'budget':>6s} {'targets':>8s} {'infeas':>7s} "
-        f"{'cands':>6s} {'accept':>7s} {'LPs_ok':>7s}")
+        f"{'cands':>6s} {'accept':>7s} {'LPs_ok':>7s}  note")
     for chem in CHEMISTRIES:
         for b in budgets:
             cands = [r for r in post if r.get("chemistry") == chem
                      and int(r.get("mutation_budget", -1)) == b]
             infs = [r for r in infeasible if r.get("chemistry") == chem
                     and int(r.get("mutation_budget", -1)) == b]
+            dups = [r for r in dup if r.get("chemistry") == chem
+                    and int(r.get("mutation_budget", -1)) == b]
             acc = [r for r in cands if r.get("accepted")]
+            note = ""
+            if dups and not cands:
+                # NOT missing coverage: this budget admits the same specs as a cheaper one, so
+                # its results are the cheaper budget's results. Reading the empty row as a gap
+                # would understate coverage exactly where the chemistry is free.
+                same = sorted({str(r.get("same_as_budget")) for r in dups})
+                note = (f"same specs as budget {','.join(same)} -- not re-searched; "
+                        f"its results carry over ({len(dups)} LPs)")
             out(f"  {chem:12s} {b:6d} {len({r['example_id'] for r in cands}):8d} "
                 f"{len({r['example_id'] for r in infs}):7d} {len(cands):6d} {len(acc):7d} "
-                f"{len({r['example_id'] for r in acc}):7d}")
+                f"{len({r['example_id'] for r in acc}):7d}  {note}")
+    out("  A candidate found at budget b also satisfies every larger budget, which the tier")
+    out("  grid below accounts for by counting substitutions rather than by re-searching.")
     out()
 
     # ----------------------------------------------------------------------- tiers
@@ -301,11 +320,28 @@ def report(rows: list[dict], all_targets: list[str], out_dir: Path, sdedit_rows:
     only_after = [r for r in post if r.get("accepted") and not r.get("pre_bond_ok")]
     out(f"  accepted candidates whose ring geometry only became acceptable through relax: "
         f"{len(only_after)}")
-    spreads = [_num(r, "lp_dG_separated_spread") for r in post]
-    spreads = [s for s in spreads if s == s]
-    if spreads:
-        out(f"  LP baseline dG spread across repeats: median {statistics.median(spreads):.2f} REU "
-            f"(max {max(spreads):.2f}) -- a |ddG| below this is inside the baseline's own noise")
+    # The paired delta is only meaningful against the noise of the two things being subtracted,
+    # so BOTH spreads are reported. A |ddG| inside them is not a measured degradation.
+    for label, key in (("LP baseline", "lp_dG_separated_spread"),
+                       ("CP candidate", "cp_dG_separated_spread")):
+        spreads = [_num(r, key) for r in post]
+        spreads = [s for s in spreads if s == s]
+        if spreads:
+            out(f"  {label} dG spread across independent relax repeats: "
+                f"median {statistics.median(spreads):.2f} REU (max {max(spreads):.2f})")
+    reps = [_num(r, "cp_n_relax_scored") for r in post]
+    reps = [x for x in reps if x == x]
+    if reps and max(reps) <= 1:
+        out("  NOTE: only ONE relax repeat per candidate in this run, so the CP spread is 0 by")
+        out("        construction and no ddG can be tested against relax noise. The contract")
+        out("        asks for 3 -- relaunch with CP_REPEATS=3 before quoting a ddG as real.")
+    noisy = [r for r in post
+             if _num(r, "ddg_interface_reu") == _num(r, "ddg_interface_reu")
+             and _num(r, "cp_dG_separated_spread", 0.0) + _num(r, "lp_dG_separated_spread", 0.0)
+             >= abs(_num(r, "ddg_interface_reu", 0.0))]
+    if post:
+        out(f"  candidates whose |ddG| does NOT exceed the combined repeat spread: "
+            f"{len(noisy)}/{len(post)} -- for these the energy criterion is not resolvable")
     out()
 
     # ---------------------------------------------------------------------- effort
