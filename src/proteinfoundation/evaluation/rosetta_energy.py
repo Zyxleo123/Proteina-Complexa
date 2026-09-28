@@ -15,14 +15,24 @@ peptide that merely happens to sit in a ring-shaped conformation -- the same
 "instrument problem" `evaluation.cyclic_offset` exists to fix for AF2, just for
 Rosetta. `_declare_cyclic_bond` patches the loaded pose so the requested closing
 bond is an explicit covalent connection before `FastRelax`/`InterfaceAnalyzerMover`
-run, for **mainchain** and **disulfide** (both use existing, verified PyRosetta
-APIs: `Conformation.declare_chemical_bond` after stripping terminus variants, and
-`Conformation.add_disulfide_bond`, respectively). **Isopeptide is not yet
-supported** -- declaring an arbitrary Lys-NZ <-> Asp/Glu-side-chain bond needs a
-custom Rosetta residue-connection patch that plain amino acid types don't carry
-(unlike a stripped terminus or a disulfide-patched CYS); this is a real, open gap
-and is reported via `binder_rosetta_cyclic_topology_declared=False` rather than
-silently scored as if it were closed.
+run, for all three chemistries:
+
+* **mainchain** -- `Conformation.declare_chemical_bond` after stripping the
+  terminus variants that would otherwise cap the N and C connections.
+* **disulfide** -- `Conformation.add_disulfide_bond`.
+* **isopeptide** -- Rosetta's own `SidechainConjugation` patch (database
+  `chemical/residue_type_sets/fa_standard/patches/SidechainConjugation.txt`) opens a
+  real `CONNECT` at LYS:NZ / ASP:CG / GLU:CD, then `DeclareBond`. The patch is what
+  makes the bond chemically real: without it NZ keeps its three ammonium protons and
+  the carboxylate keeps both oxygens, so the declared bond would imply a five-bonded
+  nitrogen.
+
+Every chemistry therefore ends with `residue(i).is_bonded(j)` true, and an
+undeclarable request raises rather than scoring an open topology --
+`binder_rosetta_cyclic_topology_declared` has no False path left. The equivalent
+logic, plus geometry measurement and ring constraints, lives in
+`script_utils/cp_topology.py` for the GenKIC search arm; the two are kept to one
+behaviour deliberately.
 """
 
 from __future__ import annotations
@@ -64,6 +74,88 @@ ROSETTA_METRIC_COLS = [f"binder_rosetta_{key}" for key in ROSETTA_INTERFACE_SCOR
 ]
 
 
+# Which atom is the amine and which the acyl carbon, per residue type, for an
+# isopeptide bond: {name3: (bridging atom, its ring-interior neighbour)}.
+_ISOPEPTIDE_AMINE = {"LYS": ("NZ", "CE")}
+_ISOPEPTIDE_ACYL = {"ASP": ("CG", "CB"), "GLU": ("CD", "CG")}
+
+
+def _binder_seqpos(pose, binder_chain: str, local_index: int) -> int:
+    """Pose sequence position of binder-local residue `local_index`.
+
+    Maps by chain membership and POSE ORDER, not by PDB residue number. The older
+    `pdb2pose(binder_chain, local_index + 1)` lookup assumed the binder is numbered
+    1..L, which holds for CPSea-generated PDBs but not for staged crystal complexes
+    that preserve their source numbering -- chain B of `LNR_2qos_C_A` runs 158..168,
+    where that lookup returns 0 and the caller raises.
+
+    Raises:
+        ValueError: the chain is absent, or `local_index` is out of range for it.
+    """
+    pdb_info = pose.pdb_info()
+    positions = [
+        seqpos
+        for seqpos in range(1, pose.size() + 1)
+        if pdb_info.chain(seqpos) == binder_chain
+    ]
+    if not positions:
+        raise ValueError(
+            f"no residues on binder chain {binder_chain!r}; chains present: "
+            f"{sorted({pdb_info.chain(s) for s in range(1, pose.size() + 1)})}"
+        )
+    if not 0 <= local_index < len(positions):
+        raise ValueError(
+            f"binder-local index {local_index} out of range for chain {binder_chain!r} "
+            f"(length {len(positions)})"
+        )
+    return positions[local_index]
+
+
+def _isopeptide_atoms(aa_i: str, aa_j: str) -> dict[str, str]:
+    """Resolve the isopeptide bridging atoms for anchors `aa_i`/`aa_j`.
+
+    Either terminus may carry the lysine; the other must be Asp or Glu.
+
+    Raises:
+        ValueError: the pair is not one amine plus one acyl donor.
+    """
+    if aa_i in _ISOPEPTIDE_AMINE and aa_j in _ISOPEPTIDE_ACYL:
+        (atom_i, next_i), (atom_j, prev_j) = _ISOPEPTIDE_AMINE[aa_i], _ISOPEPTIDE_ACYL[aa_j]
+    elif aa_i in _ISOPEPTIDE_ACYL and aa_j in _ISOPEPTIDE_AMINE:
+        (atom_i, next_i), (atom_j, prev_j) = _ISOPEPTIDE_ACYL[aa_i], _ISOPEPTIDE_AMINE[aa_j]
+    else:
+        raise ValueError(
+            f"isopeptide needs one LYS and one ASP/GLU anchor, got aa_i={aa_i!r} aa_j={aa_j!r}"
+        )
+    return {"atom_i": atom_i, "atom_j": atom_j, "prev_j": prev_j, "next_i": next_i}
+
+
+def _sidechain_connection_id(pose, seqpos: int, atom: str) -> int:
+    """Residue-connection id at `seqpos` whose connect atom is `atom`.
+
+    Looked up rather than assumed: the side-chain connection's index depends on how
+    many polymer connections the residue still has, so a residue carrying a
+    terminus variant numbers it differently from an internal one.
+
+    Raises:
+        ValueError: no connection on this residue uses `atom`.
+    """
+    residue = pose.residue(seqpos)
+    target = residue.atom_index(atom)
+    n_conn = residue.type().n_possible_residue_connections()
+    for conn_id in range(1, n_conn + 1):
+        if residue.residue_connect_atom_index(conn_id) == target:
+            return conn_id
+    used = [
+        residue.atom_name(residue.residue_connect_atom_index(c)).strip()
+        for c in range(1, n_conn + 1)
+    ]
+    raise ValueError(
+        f"residue {seqpos} ({residue.name()}) has no residue connection at atom "
+        f"{atom!r}; connections use atoms {used}"
+    )
+
+
 def _declare_cyclic_bond(
     pose,
     binder_chain: str,
@@ -79,32 +171,28 @@ def _declare_cyclic_bond(
         cyclization_type: `"mainchain"`, `"disulfide"`, or `"isopeptide"`.
         i_local, j_local: 0-based, binder-chain-LOCAL residue indices (same
             convention as CPSea's `cyclization_i`/`cyclization_j`), mapped to pose
-            sequence positions via the pose's own `PDBInfo`. This assumes
-            `utils.pdb_utils.to_pdb`'s per-chain-restarting numbering (binder-local
-            index `k` <-> PDB resSeq `k + 1` on `binder_chain`), the convention
-            every CPSea-generated PDB in this repo is written with.
+            sequence positions by POSE ORDER within `binder_chain` (see
+            `_binder_seqpos`), which is correct for any residue numbering.
 
     Returns:
-        True if the bond was declared; False if the chemistry is not yet
-        supported (isopeptide -- see module docstring), in which case scoring
-        proceeds WITHOUT the bond and the caller should record that the result
-        is missing it.
+        True -- every supported chemistry ends with a real covalent connection on
+        the pose. There is no longer a "declared=False" path: an undeclarable
+        request raises instead of quietly scoring an open topology.
 
     Raises:
-        ValueError: the endpoints could not be mapped to pose positions, or
-            (for disulfide) `add_disulfide_bond` refused (e.g. not both CYS).
+        ValueError: the endpoints are out of range for the binder chain, the
+            anchors carry the wrong identities for the requested chemistry, or
+            Rosetta refused the bond.
     """
+    import pyrosetta.rosetta as rosetta
     from pyrosetta.rosetta.core.chemical import VariantType
-    from pyrosetta.rosetta.core.pose import remove_variant_type_from_pose_residue
+    from pyrosetta.rosetta.core.pose import (
+        add_variant_type_to_pose_residue,
+        remove_variant_type_from_pose_residue,
+    )
 
-    pdb_info = pose.pdb_info()
-    seqpos_i = pdb_info.pdb2pose(binder_chain, i_local + 1)
-    seqpos_j = pdb_info.pdb2pose(binder_chain, j_local + 1)
-    if seqpos_i == 0 or seqpos_j == 0:
-        raise ValueError(
-            f"could not map cyclization endpoints (i_local={i_local}, j_local={j_local}) "
-            f"to pose positions on chain {binder_chain!r} -- pdb2pose returned 0 (not found)"
-        )
+    seqpos_i = _binder_seqpos(pose, binder_chain, i_local)
+    seqpos_j = _binder_seqpos(pose, binder_chain, j_local)
 
     if cyclization_type == "mainchain":
         # A closing amide needs a free N/C connection; the terminus variants
@@ -127,15 +215,34 @@ def _declare_cyclic_bond(
         return True
 
     if cyclization_type == "isopeptide":
-        logger.warning(
-            "Rosetta isopeptide bond NOT declared (residues {}/{}): no custom residue-"
-            "connection patch is wired up yet (see rosetta_energy._declare_cyclic_bond). "
-            "Scoring proceeds on a topology missing its closing bond; "
-            "binder_rosetta_cyclic_topology_declared=False marks this in the output.",
-            seqpos_i,
-            seqpos_j,
+        # Rosetta's own SidechainConjugation patch opens a real CONNECT at LYS:NZ /
+        # ASP:CG / GLU:CD, strips the extra protons (3 HZ -> 1 amide HZ) and the second
+        # carboxyl oxygen (OD1+OD2 -> one amide OD), and retypes the atoms Nbb/CObb.
+        # Declaring NZ--CG *without* it leaves NZ carrying three protons, i.e. a
+        # five-bonded nitrogen, so the "bond" would be a chemical fiction.
+        atoms = _isopeptide_atoms(
+            pose.residue(seqpos_i).name3(), pose.residue(seqpos_j).name3()
         )
-        return False
+        for seqpos in (seqpos_i, seqpos_j):
+            add_variant_type_to_pose_residue(pose, VariantType.SIDECHAIN_CONJUGATION, seqpos)
+        declare = rosetta.protocols.simple_moves.DeclareBond()
+        # add_termini=False, run_kic=False, kic_res1=0, kic_res2=0, rebuild_fold_tree=True
+        declare.set(seqpos_j, atoms["atom_j"], seqpos_i, atoms["atom_i"], False, False, 0, 0, True)
+        declare.apply(pose)
+        # The patch's new atoms (the amide HZ, the single OD/OE, the virtual) have ICOORs
+        # defined relative to the connection, so they sit at stale positions until rebuilt.
+        # The connection id is looked up rather than assumed to be 3: a residue still
+        # carrying a terminus variant has one fewer polymer connection, which shifts it.
+        for seqpos, atom in ((seqpos_i, atoms["atom_i"]), (seqpos_j, atoms["atom_j"])):
+            pose.conformation().rebuild_residue_connection_dependent_atoms(
+                seqpos, _sidechain_connection_id(pose, seqpos, atom)
+            )
+        if not pose.residue(seqpos_i).is_bonded(seqpos_j):
+            raise ValueError(
+                f"isopeptide: declared the bond but pose residue {seqpos_i} still reports "
+                f"not bonded to {seqpos_j} -- refusing to score an open topology as closed"
+            )
+        return True
 
     raise ValueError(f"unknown cyclization_type: {cyclization_type!r}")
 
