@@ -106,20 +106,31 @@ def heavy_atom_contacts(
     tgt_xyz_A,
     tgt_aatype,
     cutoff_A: float = CONTRACT["contact_cutoff_A"],
+    pep_atom_mask=None,
+    tgt_atom_mask=None,
 ) -> set[tuple[int, int]]:
     """Residue pairs (peptide_idx, receptor_idx) with any heavy-atom distance <= cutoff.
 
     Args:
         pep_xyz_A: [Lp, 37, 3] peptide atom37 coordinates in ANGSTROM.
-        pep_aatype: [Lp] integer residue types (used to know which slots are real atoms).
+        pep_aatype: [Lp] integer residue types, used to infer which slots are real atoms
+            when no explicit mask is given.
         tgt_xyz_A: [Lt, 37, 3] receptor atom37 coordinates in Angstrom.
         tgt_aatype: [Lt] integer residue types.
+        pep_atom_mask, tgt_atom_mask: optional [L, 37] bool masks of atoms that are ACTUALLY
+            PRESENT. Pass these for anything read from a crystal: an unresolved side-chain
+            atom has coordinate (0, 0, 0), and inferring presence from residue type alone
+            would promote it to a real atom sitting at the frame origin, manufacturing
+            contacts for every residue whose type says the atom should exist. Decoded model
+            output has every atom, so the type-derived mask is right there.
 
     Coordinates must already be in a shared frame; nothing here aligns anything.
     """
     p_xyz, t_xyz = _as_np(pep_xyz_A), _as_np(tgt_xyz_A)
-    p_m = _restype_atom_mask(_as_np(pep_aatype))
-    t_m = _restype_atom_mask(_as_np(tgt_aatype))
+    p_m = (_restype_atom_mask(_as_np(pep_aatype)) if pep_atom_mask is None
+           else _as_np(pep_atom_mask).astype(bool))
+    t_m = (_restype_atom_mask(_as_np(tgt_aatype)) if tgt_atom_mask is None
+           else _as_np(tgt_atom_mask).astype(bool))
     # Flatten to atom lists, carrying each atom's residue index.
     p_idx, p_slot = np.nonzero(p_m)
     t_idx, t_slot = np.nonzero(t_m)
@@ -263,16 +274,22 @@ def severe_clashes(
     tgt_aatype=None,
     ring: tuple[int, int] | None = None,
     dist_A: float = CONTRACT["clash_dist_A"],
+    pep_atom_mask=None,
+    tgt_atom_mask=None,
 ) -> dict:
     """Count non-bonded heavy-atom pairs closer than `dist_A`.
 
     Excluded from the count: atoms in the same residue, atoms in sequence-adjacent residues
     (their backbone atoms are genuinely bonded), and the declared ring pair. Everything else
     at sub-2 A is a steric impossibility rather than a tight contact.
+
+    `pep_atom_mask` / `tgt_atom_mask`: see `heavy_atom_contacts` -- unresolved crystal atoms
+    sit at the origin and would otherwise read as a pile of clashes there.
     """
     xyz = _as_np(pep_xyz_A)
     aa = _as_np(pep_aatype).astype(int)
-    m = _restype_atom_mask(aa)
+    m = (_restype_atom_mask(aa) if pep_atom_mask is None
+         else _as_np(pep_atom_mask).astype(bool))
     idx, slot = np.nonzero(m)
     pa = xyz[idx, slot]
     d2 = ((pa[:, None, :] - pa[None, :, :]) ** 2).sum(-1)
@@ -297,7 +314,8 @@ def severe_clashes(
     }
     if tgt_xyz_A is not None:
         t_xyz, t_aa = _as_np(tgt_xyz_A), _as_np(tgt_aatype).astype(int)
-        t_m = _restype_atom_mask(t_aa)
+        t_m = (_restype_atom_mask(t_aa) if tgt_atom_mask is None
+               else _as_np(tgt_atom_mask).astype(bool))
         t_idx, t_slot = np.nonzero(t_m)
         ta = t_xyz[t_idx, t_slot]
         n_inter, best = 0, np.inf
@@ -324,6 +342,9 @@ def evaluate(
     anchor_j: int,
     protected: Iterable[int] = (),
     ddg_REU: float | None = None,
+    before_atom_mask=None,
+    after_atom_mask=None,
+    tgt_atom_mask=None,
 ) -> dict:
     """Grade one edit against the contract. Returns every measured value plus the verdict.
 
@@ -335,10 +356,15 @@ def evaluate(
     ring = ring_geometry(after_xyz_A, after_aatype, anchor_i, anchor_j, cyc_type)
     seq = sequence_budget(before_aatype, after_aatype, protected=protected)
     clash = severe_clashes(after_xyz_A, after_aatype, tgt_xyz_A, tgt_aatype,
-                           ring=(anchor_i, anchor_j))
+                           ring=(anchor_i, anchor_j),
+                           pep_atom_mask=after_atom_mask, tgt_atom_mask=tgt_atom_mask)
 
-    c_before = heavy_atom_contacts(before_xyz_A, before_aatype, tgt_xyz_A, tgt_aatype)
-    c_after = heavy_atom_contacts(after_xyz_A, after_aatype, tgt_xyz_A, tgt_aatype)
+    c_before = heavy_atom_contacts(before_xyz_A, before_aatype, tgt_xyz_A, tgt_aatype,
+                                   pep_atom_mask=before_atom_mask,
+                                   tgt_atom_mask=tgt_atom_mask)
+    c_after = heavy_atom_contacts(after_xyz_A, after_aatype, tgt_xyz_A, tgt_aatype,
+                                  pep_atom_mask=after_atom_mask,
+                                  tgt_atom_mask=tgt_atom_mask)
     iface = interface_residues(c_before)
     retention = contact_retention(c_before, c_after)
 

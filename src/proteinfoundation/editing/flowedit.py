@@ -156,11 +156,13 @@ def flowedit_simulate(
     step_params: dict[str, dict],
     predict_for_sampling: Callable,
     nsteps: int,
+    x_init: dict[str, Tensor] | None = None,
     edit_end_step: int | None = None,
     n_avg: int = 1,
     guidance_w: float = 1.0,
     self_cond: bool = False,
     generator: torch.Generator | None = None,
+    noise_fn: Callable | None = None,
     record_every: int = 0,
 ) -> dict:
     """Integrate the FlowEdit ODE from the clean source to an edited sample.
@@ -180,6 +182,12 @@ def flowedit_simulate(
             `ode_step_params`.
         predict_for_sampling: the network, as `partial(model.predict_for_sampling, ...)`.
         nsteps: number of Euler steps.
+        x_init: the state to start integrating from. `None` means `x_src`, which is FlowEdit
+            proper -- the trajectory begins AT the input. Passing the NOISED input
+            (`interpolate(noise, x_src, t_start)`) together with `edit_end_step=0` turns this
+            same loop into SDEdit, so the two arms can be compared with only the initial
+            condition and the delta differing, rather than through two separate samplers
+            whose incidental differences would confound the comparison.
         edit_end_step: steps at or after this index drop the delta and integrate the plain
             TARGET field (the paper's `n_min`). `None` means edit the whole interval.
         n_avg: noise draws averaged into each delta (the paper's `n_avg`). Each draw costs
@@ -191,6 +199,12 @@ def flowedit_simulate(
             source branch's `x_sc` is the average over that step's draws, since there is no
             single source state.
         generator: RNG for the coupled noise draws, for reproducibility across resumes.
+        noise_fn: overrides how a coupled-noise draw is produced, as
+            `noise_fn(step, draw) -> dict[mode, tensor]` shaped like `x_src`. A batched
+            search uses this to build each row's noise from that CANDIDATE's own seed, so a
+            candidate's result does not depend on which batch it happened to share -- without
+            it, one generator feeds the whole batch and a result is only reproducible at the
+            same batch size and position.
         record_every: if > 0, also return the trajectory every N steps (diagnostics only).
 
     Returns:
@@ -216,7 +230,8 @@ def flowedit_simulate(
     device = mask.device
     # Z^FE starts AT the clean source -- the defining property of FlowEdit. No noise is
     # added to the state itself, ever; noise enters only inside the delta construction.
-    z = {dm: val.clone() for dm, val in x_src.items()}
+    # `x_init` overrides that to support the SDEdit arm; see the argument's docstring.
+    z = {dm: val.clone() for dm, val in (x_init or x_src).items()}
     x_sc_src: dict[str, Tensor] | None = None
     x_sc_tar: dict[str, Tensor] | None = None
     x_1_pred_tar: dict[str, Tensor] | None = None
@@ -233,13 +248,16 @@ def flowedit_simulate(
             v_delta = {dm: torch.zeros_like(z[dm]) for dm in fm.data_modes}
             acc_src: dict[str, Tensor] = {}
             acc_tar: dict[str, Tensor] = {}
-            for _ in range(n_avg):
+            for draw in range(n_avg):
                 # Coupled noise: ONE draw builds the source state, and the SAME
                 # displacement is applied to Z^FE to build the target state. That coupling
                 # is what makes the difference of velocities a difference along the same
                 # perturbation rather than two unrelated samples.
-                x_0 = _sample_noise_like(fm, n=n, bs=bs, mask=mask, device=device,
-                                         generator=generator)
+                if noise_fn is not None:
+                    x_0 = noise_fn(step, draw)
+                else:
+                    x_0 = _sample_noise_like(fm, n=n, bs=bs, mask=mask, device=device,
+                                             generator=generator)
                 x_src_t = fm.interpolate(x_0=x_0, x_1=x_src, t=t, mask=mask)
                 x_tar_t = {dm: z[dm] + (x_src_t[dm] - x_src[dm]) for dm in fm.data_modes}
 
