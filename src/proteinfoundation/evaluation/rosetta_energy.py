@@ -15,14 +15,30 @@ peptide that merely happens to sit in a ring-shaped conformation -- the same
 "instrument problem" `evaluation.cyclic_offset` exists to fix for AF2, just for
 Rosetta. `_declare_cyclic_bond` patches the loaded pose so the requested closing
 bond is an explicit covalent connection before `FastRelax`/`InterfaceAnalyzerMover`
-run, for **mainchain** and **disulfide** (both use existing, verified PyRosetta
-APIs: `Conformation.declare_chemical_bond` after stripping terminus variants, and
-`Conformation.add_disulfide_bond`, respectively). **Isopeptide is not yet
-supported** -- declaring an arbitrary Lys-NZ <-> Asp/Glu-side-chain bond needs a
-custom Rosetta residue-connection patch that plain amino acid types don't carry
-(unlike a stripped terminus or a disulfide-patched CYS); this is a real, open gap
-and is reported via `binder_rosetta_cyclic_topology_declared=False` rather than
-silently scored as if it were closed.
+run, for **mainchain**, **disulfide** and **isopeptide**.
+
+**Isopeptide, resolved 2026-09-28.** This was previously an open gap, on the belief
+that a Lys-NZ <-> Asp/Glu-side-chain bond needed a custom residue-connection patch.
+It does not: Rosetta ships one, the `SidechainConjugation` variant, which is what
+ubiquitin/SUMO isopeptide linkages use. Applying `VariantType.SIDECHAIN_CONJUGATION`
+to both partners adds a residue connection at exactly the conjugating atom --
+measured on this build, LYS gains a connect at **NZ** and ASP at **CG**, GLU at
+**CD** -- after which the ordinary `declare_chemical_bond` succeeds.
+
+The limitation that remains is narrower and is a property of the residue type set,
+not of the chemistry: **ASN and GLN have no `SidechainConjugation` variant in this
+build** (`ResidueTypeSet.cc:980` refuses it), so a Lys-Asn/Gln isopeptide cannot be
+declared even though its geometry is the same CG/CD amide. Those rows keep
+`binder_rosetta_cyclic_topology_declared=False` and must be excluded from any
+claimed isopeptide success rather than scored as if closed -- the training config
+does allow Asn/Gln isopeptides (`cyclization.allow_asn_gln_isopeptide`), so this is
+a live subset, not a theoretical one.
+
+Declaring the bond does not MAKE a ring close: relax will not pull ends together
+across a gap. It stops the opposite error -- `fa_rep` reading two bonded atoms at
+1.33 A as a clash and relax prying an already-closed ring apart. Whether the ring
+actually survived relaxation is therefore measured, not assumed: see
+`ring_bond_distance_after_relax`.
 """
 
 from __future__ import annotations
@@ -127,15 +143,39 @@ def _declare_cyclic_bond(
         return True
 
     if cyclization_type == "isopeptide":
-        logger.warning(
-            "Rosetta isopeptide bond NOT declared (residues {}/{}): no custom residue-"
-            "connection patch is wired up yet (see rosetta_energy._declare_cyclic_bond). "
-            "Scoring proceeds on a topology missing its closing bond; "
-            "binder_rosetta_cyclic_topology_declared=False marks this in the output.",
-            seqpos_i,
-            seqpos_j,
-        )
-        return False
+        from pyrosetta.rosetta.core.pose import add_variant_type_to_pose_residue
+
+        # The acceptor's conjugating atom is residue-specific: Asp bonds through CG, Glu
+        # through CD. Asn/Gln would be the same amide chemistry but have no
+        # SidechainConjugation variant in this residue type set, so they cannot be
+        # declared -- reported, never faked.
+        acceptor = pose.residue(seqpos_j).name3()
+        acceptor_atom = {"ASP": "CG", "GLU": "CD"}.get(acceptor)
+        donor = pose.residue(seqpos_i).name3()
+        if donor != "LYS" or acceptor_atom is None:
+            logger.warning(
+                "Rosetta isopeptide bond NOT declared (residues {}/{}, {}/{}): this build's "
+                "residue type set has no SidechainConjugation variant for that pair "
+                "(supported: LYS donor with ASP or GLU acceptor). Scoring proceeds on a "
+                "topology missing its closing bond; "
+                "binder_rosetta_cyclic_topology_declared=False marks this in the output.",
+                seqpos_i, seqpos_j, donor, acceptor,
+            )
+            return False
+        try:
+            add_variant_type_to_pose_residue(pose, VariantType.SIDECHAIN_CONJUGATION, seqpos_i)
+            add_variant_type_to_pose_residue(pose, VariantType.SIDECHAIN_CONJUGATION, seqpos_j)
+            pose.conformation().declare_chemical_bond(seqpos_i, "NZ", seqpos_j, acceptor_atom)
+        except RuntimeError as exc:
+            # A Rosetta UtilityExitException surfaces here. Degrade to "not declared"
+            # rather than killing the whole scoring run over one candidate.
+            logger.warning(
+                "Rosetta isopeptide declaration failed for residues {}/{} ({}/{}): {}. "
+                "binder_rosetta_cyclic_topology_declared=False.",
+                seqpos_i, seqpos_j, donor, acceptor, exc,
+            )
+            return False
+        return True
 
     raise ValueError(f"unknown cyclization_type: {cyclization_type!r}")
 

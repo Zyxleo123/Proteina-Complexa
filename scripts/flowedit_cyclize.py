@@ -78,6 +78,7 @@ from sdedit_cyclize import (  # noqa: E402  (path must be set first)
     T_START_MAX,
     _resolve_sampling_cfg,
     build_edit_schedule,
+    build_frame,
     to_device,
 )
 
@@ -155,6 +156,46 @@ def make_noise_fn(fm, *, n: int, mask_row: torch.Tensor, device, seeds: list[int
         return {dm: torch.cat([p[dm] for p in parts], dim=0) for dm in fm.data_modes}
 
     return noise_fn
+
+
+def write_candidate(out_dir: Path, tag: str, xyz_A, aatype, frame, row: dict) -> None:
+    """Write the peptide PDB and, when the frame is trustworthy, the full COMPLEX.
+
+    The complex has to be written here, at sampling time, not reconstructed later: the
+    receptor crop is redrawn on every load, so two loads of one example land in frames that
+    differ by a rigid transform and a peptide saved alone can never be re-united with its
+    receptor afterwards. `frame` is the loader -> input-PDB transform recovered once per
+    example by `build_frame`.
+
+    Rosetta scores a complex, so a candidate with no complex is unscorable, and
+    `input_complex_pdb` is the paired LP baseline the dG change is measured against.
+    """
+    from proteinfoundation.utils.pdb_utils import write_prot_to_pdb
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    pep_path = out_dir / f"{tag}.pdb"
+    write_prot_to_pdb(
+        xyz_A.numpy(), str(pep_path), aatype=aatype.numpy(),
+        overwrite=True, no_indexing=True,
+    )
+    row["peptide_pdb"] = str(pep_path)
+    row["pdb_tag"] = tag
+    if frame is None:
+        # Recorded, not silently dropped: a shard whose frames all refused would otherwise
+        # look like a shard that simply found nothing worth scoring.
+        row["complex_pdb"] = None
+        row["complex_skipped_reason"] = "frame fit refused"
+        return
+    from complex_frame import read_atom_lines, write_complex
+
+    cpx = out_dir / f"{tag}__complex.pdb"
+    write_complex(cpx, frame["receptor_lines"], read_atom_lines(pep_path),
+                  frame["binder_chain"], frame["r"], frame["t"])
+    row["complex_pdb"] = str(cpx)
+    row["input_complex_pdb"] = frame["input_pdb"]
+    row["binder_chain"] = frame["binder_chain"]
+    row["target_chains"] = ",".join(frame["target_chains"])
+    row["frame_residual_A"] = round(float(frame["residual_A"]), 4)
 
 
 def resolve_protected(spec: str, iface: set[int], anchors: tuple[int, int]) -> list[int]:
@@ -385,7 +426,13 @@ def main() -> None:
                          "input. Both share this script's decode and contract.")
     ap.add_argument("--protected", default="none",
                     help="'none', 'interface', or explicit 0-based indices.")
-    ap.add_argument("--pdb-dir", default=None, help="Write peptide PDBs for kept candidates.")
+    ap.add_argument("--pdb-dir", default=None,
+                    help="Write peptide AND complex PDBs for kept candidates. Required for "
+                         "the Rosetta stage, which scores complexes.")
+    ap.add_argument("--complex-align-tol-A", type=float, default=0.5,
+                    help="Max RMSD for the loader->input-PDB rigid fit. Above it the frame "
+                         "is refused and no complex is written for that example, because a "
+                         "badly fitted frame puts the peptide in the wrong place silently.")
     ap.add_argument("--write-if", default="geom", choices=["accepted", "geom", "all", "none"],
                     help="Which candidates get a PDB. 'geom' = passed every geometry and "
                          "sequence gate (Rosetta has not run yet at this point).")
@@ -513,6 +560,22 @@ def main() -> None:
                 print(f"  SKIP {example_id}: failed to load", flush=True)
                 continue
 
+            # Once per example: the loader -> input-PDB rigid transform, which is the only
+            # way a written peptide can be re-united with its receptor. Built from a
+            # batch-of-one; `run_setting` re-collates for the seed batch and the frame is
+            # unaffected because it describes the EXAMPLE, not the batch.
+            frame = None
+            if args.pdb_dir:
+                one = to_device(structure_collate_fn([sample]), args.device)
+                m1 = (one["mask"].bool() if "mask" in one
+                      else one["coord_mask"][..., CA_IDX].bool())
+                one["mask"] = m1
+                frame = build_frame(one, m1, meta.iloc[idx], args.complex_align_tol_A)
+                if frame is None:
+                    print(f"  {example_id}: no complexes will be written (frame fit refused)",
+                          flush=True)
+                del one
+
             for cyc_name in args.cyc_types:
                 if cyc_name not in TYPE_NAMES:
                     raise SystemExit(f"FATAL: unknown chemistry {cyc_name!r}")
@@ -564,10 +627,11 @@ def main() -> None:
                                 or (args.write_if == "accepted" and row["accepted"])
                             )
                             if args.pdb_dir and want:
-                                p = Path(args.pdb_dir) / (k.replace("|", "_") + ".pt")
-                                torch.save({"coors_A": xyz, "aatype": aa,
-                                            "example_id": example_id, "run_key": k}, p)
-                                row["candidate_file"] = str(p)
+                                # "_" not "|": this becomes a filename.
+                                tag = k.replace("|", "_")
+                                write_candidate(
+                                    Path(args.pdb_dir), tag, xyz, aa, frame, row
+                                )
                                 n_written += 1
                             fh.write(json.dumps(row) + "\n")
                             n_ok += 1

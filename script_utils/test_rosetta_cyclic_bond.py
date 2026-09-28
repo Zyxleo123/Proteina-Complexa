@@ -76,12 +76,60 @@ def test_disulfide_bond_fails_loudly_when_not_cysteine():
         _declare_cyclic_bond(pose, binder_chain="B", cyclization_type="disulfide", i_local=0, j_local=4)
 
 
-def test_isopeptide_returns_false_not_silently_scored():
-    """Documented gap: isopeptide bond declaration is not implemented; the caller
-    must be told so via a False return, not have the bond silently skipped."""
+def test_isopeptide_lys_asp_is_declared():
+    """The gap this file used to document is closed: Rosetta's own
+    `SidechainConjugation` variant provides the residue connection, at NZ on the LYS
+    donor and CG on the ASP acceptor, after which the ordinary declaration works."""
     pose = _pose_with_pdb_info("KAAAD")  # 1=LYS, 5=ASP
     declared = _declare_cyclic_bond(pose, binder_chain="B", cyclization_type="isopeptide", i_local=0, j_local=4)
+    assert declared is True
+    assert _atoms_bonded(pose, 1, "NZ", 5, "CG")
+    assert "SidechainConjugation" in pose.residue(1).name()
+    assert "SidechainConjugation" in pose.residue(5).name()
+
+
+def test_isopeptide_lys_glu_bonds_through_cd():
+    """Glu conjugates through CD, not CG. Using the wrong atom would declare a bond
+    that does not exist and relax around it."""
+    pose = _pose_with_pdb_info("KAAAE")
+    declared = _declare_cyclic_bond(pose, binder_chain="B", cyclization_type="isopeptide", i_local=0, j_local=4)
+    assert declared is True
+    assert _atoms_bonded(pose, 1, "NZ", 5, "CD")
+
+
+def test_isopeptide_asn_gln_refuse_rather_than_fake():
+    """Asn/Gln isopeptides are real chemistry (transglutaminase-type) and the training
+    config allows them, but this residue type set has no SidechainConjugation variant
+    for them. They must come back False so they can be EXCLUDED from claimed
+    isopeptide successes -- scoring them as closed would inflate exactly the number
+    this whole arm is about."""
+    for seq in ("KAAAN", "KAAAQ"):
+        pose = _pose_with_pdb_info(seq)
+        declared = _declare_cyclic_bond(pose, binder_chain="B",
+                                        cyclization_type="isopeptide", i_local=0, j_local=4)
+        assert declared is False, seq
+
+
+def test_isopeptide_refuses_non_hostable_anchors():
+    """A PRO/PRO pair cannot host an isopeptide however close the atoms are. This is
+    the measured dominant isopeptide failure mode, so it must not be declarable."""
+    pose = _pose_with_pdb_info("PAAAP")
+    declared = _declare_cyclic_bond(pose, binder_chain="B",
+                                    cyclization_type="isopeptide", i_local=0, j_local=4)
     assert declared is False
+
+
+def test_isopeptide_survives_fast_relax():
+    """Declaring the bond must not make relax fall over: the whole point is that
+    FastRelax then runs on a topology that knows about the ring."""
+    from pyrosetta.rosetta.protocols.relax import FastRelax
+
+    pose = _pose_with_pdb_info("KAAAD")
+    assert _declare_cyclic_bond(pose, binder_chain="B", cyclization_type="isopeptide",
+                                i_local=0, j_local=4) is True
+    sf = pyrosetta.get_fa_scorefxn()
+    FastRelax(sf, 1).apply(pose)
+    assert _atoms_bonded(pose, 1, "NZ", 5, "CG"), "the declared bond was lost during relax"
 
 
 def test_unknown_cyclization_type_raises():
@@ -100,7 +148,11 @@ ALL_TESTS = [
     test_mainchain_bond_is_declared,
     test_disulfide_bond_is_declared,
     test_disulfide_bond_fails_loudly_when_not_cysteine,
-    test_isopeptide_returns_false_not_silently_scored,
+    test_isopeptide_lys_asp_is_declared,
+    test_isopeptide_lys_glu_bonds_through_cd,
+    test_isopeptide_asn_gln_refuse_rather_than_fake,
+    test_isopeptide_refuses_non_hostable_anchors,
+    test_isopeptide_survives_fast_relax,
     test_unknown_cyclization_type_raises,
     test_bad_endpoint_mapping_raises,
 ]
