@@ -28,6 +28,9 @@ STAGE=""; DRYRUN=0
 GPU_PARTITION="general"; GPU_GRES="gpu:a6000:1"; GPU_NODELIST=""
 CPU_PARTITION="cpu"
 GEN_TIME="08:00:00"; ROSETTA_TIME="08:00:00"; REPORT_TIME="01:00:00"
+# The smoke asks for much less wall time than the sweep on purpose: a6000s here are often
+# backfill-reserved, and a short request schedules in a gap a long one cannot fit.
+SMOKE_TIME="00:30:00"
 SHARDS=1
 SMOKE=0
 declare -a EXTRA_ENV=()
@@ -48,6 +51,7 @@ while [[ $# -gt 0 ]]; do
     # settable without editing a script.
     --set)           EXTRA_ENV+=("$2"); shift 2 ;;
     --smoke)         SMOKE=1;           shift ;;
+    --smoke-time)    SMOKE_TIME="$2";   shift 2 ;;
     --dry-run)       DRYRUN=1;          shift ;;
     -h|--help)       usage 0 ;;
     *) echo "unknown arg: $1" >&2; usage 1 >&2 ;;
@@ -97,7 +101,7 @@ if [[ "$STAGE" == "smoke" ]]; then
   # readiness project: it is the same code path the sweep uses, just small.
   for m in flowedit sdedit; do
     submit "smoke:$m" \
-      --partition="$GPU_PARTITION" --gres="$GPU_GRES" --time=02:00:00 \
+      --partition="$GPU_PARTITION" --gres="$GPU_GRES" --time="$SMOKE_TIME" \
       "${NODELIST_ARG[@]}" \
       scripts/flowedit_gpu.sbatch "$ENV_FILE" "METHOD=$m" >/dev/null
   done
