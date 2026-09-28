@@ -54,11 +54,31 @@ ENV_FILE="${REPO}/evaluation_results/_env/genkic_${STAMP}.env"
   echo "REPO=${REPO}"
   # RUN_ID is fixed HERE rather than left to each job's own $(date), or the array's tasks
   # would each invent a different one and scatter their rows across N directories.
-  grep -q '^RUN_ID=' <<<"${OVERRIDES[*]:-}" || echo "RUN_ID=genkic_${STAMP}"
-  for o in "${OVERRIDES[@]+"${OVERRIDES[@]}"}"; do echo "$o"; done
+  # Checked per override, not against "${OVERRIDES[*]}": that joins them into ONE line, so an
+  # anchored ^RUN_ID= only matches when RUN_ID happens to be the FIRST override, and otherwise
+  # the default is written too. Sourcing lets the later line win, so it worked by accident --
+  # but the file then held two RUN_IDs and the submitter printed the wrong one.
+  _have_run_id=0
+  for o in "${OVERRIDES[@]+"${OVERRIDES[@]}"}"; do
+    [[ "$o" == RUN_ID=* ]] && _have_run_id=1
+  done
+  (( _have_run_id )) || echo "RUN_ID='genkic_${STAMP}'"
+  # Values MUST be single-quoted. The env file is SOURCED, so a list-valued override written
+  # verbatim -- BUDGETS=0 1 2 -- parses as `BUDGETS=0` followed by running `1` with argument
+  # `2`, and the job dies with "1: command not found". Measured: it killed all 20 search shards
+  # on first launch. Embedded single quotes are escaped the POSIX way ('\'').
+  for o in "${OVERRIDES[@]+"${OVERRIDES[@]}"}"; do
+    printf "%s='%s'\n" "${o%%=*}" "$(printf '%s' "${o#*=}" | sed "s/'/'\\\\''/g")"
+  done
 } > "$ENV_FILE"
 
-RUN_ID="$(grep -m1 '^RUN_ID=' "$ENV_FILE" | cut -d= -f2-)"
+# Values in the env file are single-quoted (see above), so strip the quotes when reading one
+# back here. Left in, RUN_ID would become "'genkic_x'" and the submitter would print and
+# suggest a resume command with a run id that does not match the one the jobs use.
+# LAST match, not the first: the file is sourced top to bottom, so if a key appears more than
+# once the last line is the value the jobs actually see.
+env_get() { sed -n "s/^$1=//p" "$ENV_FILE" | tail -1 | sed "s/^'//; s/'$//"; }
+RUN_ID="$(env_get RUN_ID)"
 echo "env file : $ENV_FILE"
 echo "run id   : $RUN_ID"
 sed 's/^/           /' "$ENV_FILE"
@@ -71,10 +91,10 @@ run_sbatch() {
   env $(env | grep -o '^SLURM_[A-Z_]*' | sed 's/^/-u /' | tr '\n' ' ') sbatch "$@"
 }
 
-SEARCH_SHARDS="$(grep -m1 '^SEARCH_SHARDS=' "$ENV_FILE" | cut -d= -f2- || true)"
+SEARCH_SHARDS="$(env_get SEARCH_SHARDS)"
 SEARCH_SHARDS="${SEARCH_SHARDS:-12}"
 
-SDEDIT_SHARDS="$(grep -m1 '^SDEDIT_SHARDS=' "$ENV_FILE" | cut -d= -f2- || true)"
+SDEDIT_SHARDS="$(env_get SDEDIT_SHARDS)"
 SDEDIT_SHARDS="${SDEDIT_SHARDS:-12}"
 
 SMOKE_ID=""
