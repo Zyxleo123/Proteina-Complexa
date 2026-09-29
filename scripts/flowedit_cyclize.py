@@ -352,6 +352,7 @@ def run_setting(
             noise_fn=noise_fn,
         )
         ed_xyz, ed_aa = decode(model, out["x"], mask)
+        cond_sep = out.get("cond_separation", {}) or {}
 
     # ---- score each candidate -------------------------------------------------
     keep = mask[0].cpu().numpy().astype(bool)
@@ -398,6 +399,7 @@ def run_setting(
             edit_end_frac=float(edit_end_frac), edit_end_step=edit_end_step,
             n_avg=int(n_avg), nsteps=int(nsteps), guidance_w=float(guidance_w),
             self_cond=bool(self_cond), method=str(method),
+            **{k: float(v) for k, v in cond_sep.items()},
         )
         rows.append((row, ed_xyz[b][keep].detach().cpu(), ed_aa[b][keep].detach().cpu()))
     return rows
@@ -555,16 +557,29 @@ def main() -> None:
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     done = set()
+    n_prior_failed = 0
     if out_path.exists():
         for lineno, line in enumerate(out_path.read_text().splitlines(), 1):
             if not line.strip():
                 continue
             try:
-                done.add(json.loads(line)["run_key"])
-            except (json.JSONDecodeError, KeyError):
+                rec = json.loads(line)
+            except json.JSONDecodeError:
                 raise SystemExit(f"FATAL: corrupt row {out_path}:{lineno}. Delete and rerun.")
-    if done:
-        print(f"resuming: {len(done)} candidates already done", flush=True)
+            if "run_key" not in rec:
+                raise SystemExit(f"FATAL: row {out_path}:{lineno} has no run_key.")
+            # Only SUCCESSFUL candidates count as done. A failed row is retried on resume,
+            # because the usual reason a resume happens after failures is that the cause was
+            # fixed -- treating failures as done would skip exactly the candidates the fix was
+            # for, and the file would keep reporting the old error. Failures are cheap to
+            # retry: a permanent one fails fast again.
+            if rec.get("status") == "ok":
+                done.add(rec["run_key"])
+            else:
+                n_prior_failed += 1
+    if done or n_prior_failed:
+        print(f"resuming: {len(done)} done, {n_prior_failed} previously-failed will be retried",
+              flush=True)
     if args.pdb_dir:
         Path(args.pdb_dir).mkdir(parents=True, exist_ok=True)
 

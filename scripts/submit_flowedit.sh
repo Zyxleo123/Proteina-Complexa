@@ -31,6 +31,10 @@ GEN_TIME="08:00:00"; ROSETTA_TIME="08:00:00"; REPORT_TIME="01:00:00"
 # The smoke asks for much less wall time than the sweep on purpose: a6000s here are often
 # backfill-reserved, and a short request schedules in a gap a long one cannot fit.
 SMOKE_TIME="00:30:00"
+# Host memory. The sbatch files ask 64G, which is right for a full sweep shard but too
+# much for a smoke: a6000 nodes here are often the free GPU on a box whose RAM is mostly
+# taken, and an over-provisioned request simply does not schedule.
+GPU_MEM=""
 SHARDS=1
 SMOKE=0
 declare -a EXTRA_ENV=()
@@ -52,6 +56,7 @@ while [[ $# -gt 0 ]]; do
     --set)           EXTRA_ENV+=("$2"); shift 2 ;;
     --smoke)         SMOKE=1;           shift ;;
     --smoke-time)    SMOKE_TIME="$2";   shift 2 ;;
+    --mem)           GPU_MEM="$2";      shift 2 ;;
     --dry-run)       DRYRUN=1;          shift ;;
     -h|--help)       usage 0 ;;
     *) echo "unknown arg: $1" >&2; usage 1 >&2 ;;
@@ -104,6 +109,7 @@ echo "env file: $ENV_FILE"
 sed 's/^/  /' "$ENV_FILE"
 
 NODELIST_ARG=(); [[ -n "$GPU_NODELIST" ]] && NODELIST_ARG=(--nodelist="$GPU_NODELIST")
+MEM_ARG=();      [[ -n "$GPU_MEM" ]]      && MEM_ARG=(--mem="$GPU_MEM")
 
 submit() {  # submit <description> <sbatch args...>
   local desc="$1"; shift
@@ -127,7 +133,7 @@ if [[ "$STAGE" == "smoke" ]]; then
   for m in flowedit sdedit; do
     submit "smoke:$m" \
       --partition="$GPU_PARTITION" --gres="$GPU_GRES" --time="$SMOKE_TIME" \
-      "${NODELIST_ARG[@]}" \
+      "${NODELIST_ARG[@]}" "${MEM_ARG[@]}" \
       scripts/flowedit_gpu.sbatch "$ENV_FILE" "METHOD=$m" >/dev/null
   done
 fi
@@ -135,7 +141,7 @@ fi
 if [[ "$STAGE" == "gen" ]]; then
   submit "gen:${METHOD:-flowedit}" \
     --partition="$GPU_PARTITION" --gres="$GPU_GRES" --time="$GEN_TIME" \
-    "${ARRAY_ARG[@]}" "${NODELIST_ARG[@]}" \
+    "${ARRAY_ARG[@]}" "${NODELIST_ARG[@]}" "${MEM_ARG[@]}" \
     scripts/flowedit_gpu.sbatch "$ENV_FILE" "METHOD=${METHOD:-flowedit}" >/dev/null
 fi
 
@@ -145,7 +151,7 @@ if [[ "$STAGE" == "paired" || "$STAGE" == "all" ]]; then
   for m in flowedit sdedit; do
     GEN_JIDS+=("$(submit "gen:$m" \
       --partition="$GPU_PARTITION" --gres="$GPU_GRES" --time="$GEN_TIME" \
-      "${ARRAY_ARG[@]}" "${NODELIST_ARG[@]}" \
+      "${ARRAY_ARG[@]}" "${NODELIST_ARG[@]}" "${MEM_ARG[@]}" \
       scripts/flowedit_gpu.sbatch "$ENV_FILE" "METHOD=$m")")
   done
 fi

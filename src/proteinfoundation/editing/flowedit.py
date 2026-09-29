@@ -238,6 +238,13 @@ def flowedit_simulate(
     trajectory: list[dict] = []
 
     zero_gt = {dm: 0.0 for dm in fm.data_modes}
+    # Diagnostic: how far apart are the two conditional fields? FlowEdit moves the state by
+    # the DIFFERENCE of velocities, so if the model does not yet distinguish `c_src` from
+    # `c_tar` the difference is ~0 and a faithful implementation correctly does almost
+    # nothing. Without this number, "the edit barely moved" is indistinguishable from a
+    # broken sampler -- and the two call for opposite responses (train longer vs fix code).
+    # Reported as the ratio |V_delta| / |v_target|, which is scale-free across tracks.
+    diag = {dm: {"delta": 0.0, "tar": 0.0, "n": 0} for dm in fm.data_modes}
 
     for step in range(nsteps):
         t = {dm: ts[dm][step] * torch.ones(bs, device=device) for dm in fm.data_modes}
@@ -267,6 +274,10 @@ def flowedit_simulate(
                                          predict_for_sampling, guidance_w, x_sc_tar)
                 for dm in fm.data_modes:
                     v_delta[dm] = v_delta[dm] + (v_tar[dm] - v_src[dm]) / n_avg
+                    d = diag[dm]
+                    d["delta"] += float((v_tar[dm] - v_src[dm]).norm())
+                    d["tar"] += float(v_tar[dm].norm())
+                    d["n"] += 1
                     if self_cond:
                         acc_src[dm] = acc_src.get(dm, 0) + p_src[dm] / n_avg
                         acc_tar[dm] = acc_tar.get(dm, 0) + p_tar[dm] / n_avg
@@ -299,7 +310,16 @@ def flowedit_simulate(
                  "x": {dm: val.detach().clone() for dm, val in z.items()}}
             )
 
-    return {"x": z, "x_1_pred": x_1_pred_tar, "trajectory": trajectory}
+    cond_sep = {}
+    for dm, d in diag.items():
+        if d["n"]:
+            cond_sep[f"vdelta_norm_{dm}"] = d["delta"] / d["n"]
+            cond_sep[f"vtarget_norm_{dm}"] = d["tar"] / d["n"]
+            cond_sep[f"cond_separation_{dm}"] = (
+                d["delta"] / d["tar"] if d["tar"] > 0 else float("nan")
+            )
+    return {"x": z, "x_1_pred": x_1_pred_tar, "trajectory": trajectory,
+            "cond_separation": cond_sep}
 
 
 def _sample_noise_like(fm, *, n: int, bs: int, mask: Tensor, device, generator):
