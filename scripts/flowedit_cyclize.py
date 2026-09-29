@@ -55,6 +55,7 @@ import json
 import os
 import sys
 import time
+import traceback
 from functools import partial
 from pathlib import Path
 
@@ -102,9 +103,29 @@ def binder_endpoints(mask_row: torch.Tensor) -> tuple[int, int]:
     return int(idx[0]), int(idx[-1])
 
 
-def _strip_batch(t):
-    """Drop a leading singleton batch dim if present."""
-    return t[0] if (hasattr(t, "dim") and t.dim() >= 3 and t.shape[0] == 1) else t
+def _row0(t, want_dim: int, name: str):
+    """Take row 0 of a batched tensor, dropping the batch dim to reach `want_dim`.
+
+    The seed batch is `[sample] * B`, so every row carries the SAME receptor and row 0 is
+    the whole of it. Stripping only when `shape[0] == 1` was the bug this replaced: at B > 1
+    a 3-D `target_mask` reached `np.nonzero`, which returned three index arrays instead of
+    two and failed with "too many values to unpack (expected 2)" on every candidate.
+
+    The rows being identical is asserted rather than assumed: if the batch ever stops being
+    copies of one example this must fail loudly, not quietly score against row 0.
+    """
+    if t is None:
+        return None
+    if t.dim() == want_dim:
+        return t
+    if t.dim() == want_dim + 1:
+        if t.shape[0] > 1 and not bool((t[0] == t[1]).all()):
+            raise ValueError(
+                f"{name}: batch rows differ, so row 0 is not the whole receptor. The seed "
+                "batch is meant to be copies of one example; this batch is not."
+            )
+        return t[0]
+    raise ValueError(f"{name}: expected {want_dim} or {want_dim + 1} dims, got {t.dim()}")
 
 
 def receptor_arrays(batch) -> tuple:
@@ -114,12 +135,9 @@ def receptor_arrays(batch) -> tuple:
             "batch has no `x_target`; contacts need the receptor. Is "
             "ExtractTargetCoordinatesTransform in the transform stack?"
         )
-    xyz = _strip_batch(batch["x_target"]) * NM_TO_ANG
-    aa = _strip_batch(batch["seq_target"])
-    m = batch.get("target_mask")
-    m = _strip_batch(m) if m is not None else None
-    if aa.dim() > 1:
-        aa = aa[0]
+    xyz = _row0(batch["x_target"], 3, "x_target") * NM_TO_ANG
+    aa = _row0(batch["seq_target"], 1, "seq_target")
+    m = _row0(batch.get("target_mask"), 2, "target_mask")
     return xyz, aa, m
 
 
@@ -602,6 +620,12 @@ def main() -> None:
                                 device=args.device, method=args.method,
                             )
                         except Exception as exc:  # noqa: BLE001
+                            # The traceback, not just the message. A bare
+                            # "ValueError: too many values to unpack (expected 2)" on every
+                            # candidate says nothing about WHERE, and costs a whole GPU
+                            # round trip to localise.
+                            tb = traceback.format_exc()
+                            print(tb, file=sys.stderr, flush=True)
                             n_fail += len(chunk)
                             for k, s in zip(keys, chunk):
                                 fh.write(json.dumps({
@@ -610,6 +634,7 @@ def main() -> None:
                                     "t_ca_start": t_ca, "t_lat_start": t_lat,
                                     "edit_end_frac": ee, "n_avg": na, "seed": s,
                                     "error": f"{type(exc).__name__}: {exc}",
+                                    "traceback": tb.splitlines()[-6:],
                                 }) + "\n")
                             fh.flush()
                             print(f"  FAIL {keys[0]}..: {type(exc).__name__}: {exc}", flush=True)
