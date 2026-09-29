@@ -8,8 +8,8 @@
 #SBATCH --ntasks=1
 #SBATCH --requeue
 #SBATCH --open-mode=append
-#SBATCH --output=slurm_logs/%x_%j_%a.out
-#SBATCH --error=slurm_logs/%x_%j_%a.out
+#SBATCH --output=slurm_logs/%x_%j.out
+#SBATCH --error=slurm_logs/%x_%j.out
 #
 # Paired interface dG on the shortlist. CPU: it reads artefacts the GPU stage wrote, so
 # asking for a GPU would just queue this behind real work.

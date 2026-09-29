@@ -9,8 +9,8 @@
 #SBATCH --ntasks=1
 #SBATCH --requeue
 #SBATCH --open-mode=append
-#SBATCH --output=slurm_logs/%x_%j_%a.out
-#SBATCH --error=slurm_logs/%x_%j_%a.out
+#SBATCH --output=slurm_logs/%x_%j.out
+#SBATCH --error=slurm_logs/%x_%j.out
 #
 # FlowEdit (or the paired SDEdit control) candidate generation, one shard per array task.
 #
