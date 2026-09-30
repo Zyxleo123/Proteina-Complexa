@@ -347,7 +347,16 @@ def get_model_n_ckpt_resume(cfg_exp, ckpt_path_store: str) -> tuple[Proteina, st
     Handles pre-trained checkpoint loading (with weight splicing for shape mismatches),
     LoRA layer replacement, and training resumption from last checkpoint.
     """
-    model = Proteina(cfg_exp)
+    # The CP->LP generator is a Proteina subclass with a second branch and a second
+    # optimizer. Selected by config rather than by a separate entry point so it inherits
+    # every piece of this function -- pretrained splicing, LoRA, resume -- unchanged.
+    if (cfg_exp.get("cp2lp", None) or {}).get("enabled", False):
+        from proteinfoundation.cp2lp.module import CP2LPGenerator
+
+        log_info("cp2lp.enabled=true -> building CP2LPGenerator")
+        model = CP2LPGenerator(cfg_exp)
+    else:
+        model = Proteina(cfg_exp)
 
     # get last ckpt if needs to resume training from there
     last_ckpt_name = _fetch_resume_ckpt_name(cfg_exp, ckpt_path_store)
@@ -575,6 +584,20 @@ def main(cfg_exp) -> None:
     plugins = [SLURMEnvironment(auto_requeue=True)] if is_cluster_run else []
     # show_prog_bar = args.show_prog_bar or not is_cluster_run
     show_prog_bar = show_prog_bar or not is_cluster_run
+    # Lightning refuses to drive gradient clipping OR gradient accumulation for a module
+    # that owns its optimizer steps, and a two-optimizer model (the CP->LP generator and
+    # its discriminator) has no choice but to be manual. Both are therefore handed to the
+    # module, which applies the SAME clip norm and the SAME accumulation count from the
+    # same config keys -- see `CP2LPGenerator._step_optimizer` / `training_step`. This is a
+    # relocation, not a removal: silently dropping the clip on the one arm that adds an
+    # adversary and a differentiable rollout would be the wrong way to satisfy the check.
+    manual_optimization = bool((cfg_exp.get("cp2lp", None) or {}).get("enabled", False))
+    if manual_optimization:
+        log_info(
+            "Manual optimization: the module owns gradient clipping (norm, 1.0) and "
+            f"accumulation ({cfg_exp.opt.accumulate_grad_batches}); Trainer-side both off."
+        )
+
     trainer = Trainer(
         max_epochs=cfg_exp.opt.max_epochs,
         accelerator=cfg_exp.hardware.accelerator,
@@ -590,11 +613,11 @@ def main(cfg_exp) -> None:
         enable_progress_bar=show_prog_bar,
         plugins=plugins,
         limit_val_batches=100,
-        accumulate_grad_batches=cfg_exp.opt.accumulate_grad_batches,
+        accumulate_grad_batches=1 if manual_optimization else cfg_exp.opt.accumulate_grad_batches,
         num_sanity_val_steps=0,
         precision=get_training_precision(cfg_exp, is_cluster_run),
-        gradient_clip_algorithm="norm",
-        gradient_clip_val=1.0,
+        gradient_clip_algorithm=None if manual_optimization else "norm",
+        gradient_clip_val=None if manual_optimization else 1.0,
         limit_train_batches=cfg_exp.opt.get("limit_train_batches", None),
     )
     # Create model, warm-up or last ckpt

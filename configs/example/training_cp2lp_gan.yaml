@@ -1,0 +1,275 @@
+# @package _global_
+# CP -> LP GENERATOR, adversarial arm.
+#
+# Turns a bound CYCLIC peptide into a bound LINEAR one so we can manufacture paired
+# (LP, CP, target) triplets and supervise the LP -> CP direction. The provenance route is
+# dead -- the AFDB fragments CPSea rows were cut from are already closed, so the "linear
+# precursor" they would provide is an identity map -- and constructed corruption pairs
+# leak their anchors. Generating the LP side is what is left.
+#
+# Its control is `training_cp2lp_contactonly.yaml`, which differs from THIS file in one
+# line: `cp2lp.adversarial.enabled`.
+#
+# ----------------------------------------------------------------------------------
+# THE CHECKPOINT PAIRING IS NOT A FREE VARIABLE.
+#
+#   autoencoder_ckpt_path : shared_ae_lpcp_128/frozen_ae.ckpt   (inherited from lpmix)
+#   pretrain_ckpt_path    : cpsea_lpmix_from_v4cfg/cp2lp_init.ckpt   (a PIN, see below)
+#
+# `local_latents` is DEFINED by the autoencoder. A flow checkpoint trained against a
+# different AE emits latents in a different space, so decoding them with this AE gives
+# meaningless geometry from step zero -- and every loss here (adversarial, contact, clash,
+# geometry) is computed on DECODED all-atom coordinates, so nothing would catch it except
+# the samples being garbage.
+#
+# This is why the init is the LP-MIXING run and not `cpsea_bondunroll_pin20260828`, which
+# is otherwise the stronger CPSea checkpoint: bondunroll was trained against
+# `finetune_full_128`, a CPSea-only AE that has never encoded a linear peptide. The
+# lpmix run is the only CPSea flow checkpoint trained against the shared LP/CP AE, and it
+# additionally arrives with the LINEAR topology token already trained, which this arm
+# depends on.
+#
+# THE INIT IS A PIN, NOT A LIVE PATH. `cp2lp_init.ckpt` is a snapshot of that run's
+# `last-EMA.ckpt`, taken with `scripts/pin_cp2lp_init.sh`. The lpmix run is STILL TRAINING
+# and rewrites `last-EMA.ckpt` every 1500 steps, so pointing at it directly would mean two
+# arms launched an hour apart start from different weights -- and a job that happened to
+# read during a write would load a torn file. The `.source` sidecar records which
+# checkpoint and when.
+#
+# ----------------------------------------------------------------------------------
+# WHY THE NEW FEATURES ARE APPENDED AT THE END OF EACH LIST.
+#
+# Each feature factory concatenates its features in list order and projects the result
+# with ONE Linear, so a feature at position k owns a fixed column range determined by the
+# dims before it. `_splice_pretrained_weights` copies the overlapping LEADING subtensor,
+# which means appending at the end preserves every existing feature's weights exactly and
+# zero-initialises only the new columns -- a clean warm start. Inserting anywhere else
+# shifts the columns of everything after it and silently re-binds trained weights to the
+# wrong inputs. `cyclization_ring_pe` therefore stops being last, which is fine: the rule
+# that matters is "append, never insert", and its own offsets are untouched.
+#
+# METRIC TO WATCH FIRST: `train/cp2lp_d_shortcut_probe_acc`. Real LPs sit on PepBench
+# receptors and generated ones on CPSea receptors, so a discriminator can in principle
+# separate the classes from the pocket alone and never look at the peptide. The probe
+# reads the interface block with the peptide masked out; near 0.5 means the adversarial
+# signal is about peptides, climbing towards 1.0 means it is about datasets. If it climbs,
+# drop `discriminator.pocket_identity` to `none` before touching anything else.
+#
+# Run:
+#   bash scripts/submit_cp2lp.sh --submit smoke   # one batch, generator->AE->D->backward
+#   bash scripts/submit_cp2lp.sh --submit gan
+
+defaults:
+  - /example/training_cpsea_lpmix_from_v4cfg
+  - _self_
+
+run_name: cp2lp_gan_v2
+
+# The CPSea flow checkpoint trained against the shared LP/CP AE. See the header.
+pretrain_ckpt_path: /zfsauton/scratch/yixiz/Proteina-Complexa/training_runs/store/cpsea_lpmix_from_v4cfg/cp2lp_init.ckpt
+
+log:
+  wandb_project: cpsea_cp2lp
+  # MEASURED (job 68353): ~4 optimizer steps/min, because every step pays for a
+  # differentiable rollout. The inherited 1500 is therefore ~6.3 HOURS between
+  # checkpoints -- that arm crashed after 76 minutes and left NOTHING resumable, so the
+  # restart replays everything. 250 steps is ~1 hour, which is what makes "hitting the
+  # time limit means resubmitting, not restarting" actually true for this arm.
+  last_ckpt_every_n_steps: 250
+
+# The source CP reaches the network through these. Without them the generator is
+# unconditional and the CP argument does nothing -- `warn_if_condition_unused` says so
+# loudly at startup, but it is easier to not make the mistake.
+nn:
+  feats_seq:
+    - xt_bb_ca
+    - xt_local_latents
+    - x_sc_bb_ca
+    - x_sc_local_latents
+    - optional_ca_coors_nm_seq_feat
+    - optional_res_type_seq_feat
+    - hotspot_mask_seq
+    - res_seq_pdb_idx
+    # --- appended: source-CP condition
+    - x_src_cp_bb_ca
+    - x_src_cp_local_latents
+    - src_cp_present
+  feats_pair_repr:
+    - rel_seq_sep
+    - xt_bb_ca_pair_dists
+    - x_sc_bb_ca_pair_dists
+    - optional_ca_pair_dist
+    - chain_idx_pair
+    - hotspot_mask_pair
+    - cyclization_ring_pe
+    # --- appended: source-CP internal geometry
+    - x_src_cp_bb_ca_pair_dists
+
+dataset:
+  unified:
+    datamodule:
+      # `dataset_source` is loaded so the discriminator's real pool can be restricted to
+      # genuinely BOUND linear peptides -- see `cp2lp.real_lp_sources`.
+      columns_to_load:
+        - example_id
+        - path
+        - binder_chain_id
+        - cluster_id
+        - peptide_length
+        - cyclization_type
+        - dataset_source
+      # Train on the receptor families reserved for training. The eval families are held
+      # out for generation, so a triplet is never produced for a receptor the generator
+      # trained on -- otherwise "held-out" measures memorisation.
+      metadata_file: /zfsauton/scratch/yixiz/LPData/preprocessed/metadata_mixed/cp2lp_train.parquet
+      val_metadata_file: /zfsauton/scratch/yixiz/LPData/preprocessed/metadata_mixed/cp2lp_eval.parquet
+      # Both kinds are needed in EVERY batch: CPSea rows are generator inputs, the linear
+      # rows are the discriminator's real pool and the flow-matching anchor. A batch of 16
+      # at these fractions gives ~10 CP and ~6 LP, and `max_cp_per_step` caps how many of
+      # the CPs actually get a rollout.
+      source_fractions:
+        cpsea: 0.60
+        pepbench: 0.16
+        protfrag: 0.24
+      # val_filters is inherited (cpsea-only) so val_gen stays comparable with the CPSea
+      # arms; the CP->LP quantities are logged from the training step, not from val_gen.
+
+# The cyclization machinery stays ON for the CPSea rows so the source CP is still labelled
+# and the ring positional encoding still describes it. The GENERATED state is stamped
+# LINEAR by `request_linear_topology`, which makes ring PE inactive and the bond loss skip
+# it -- nothing pulls the generated termini back together.
+cyclization:
+  bond_loss:
+    unroll:
+      # The CP->LP rollout already holds a differentiable trajectory in memory. Running
+      # the bond-loss unroll beside it on the same step is what OOMs a 48 GB card.
+      max_samples: 2
+
+cp2lp:
+  enabled: true
+  # LPs per source CP per step, from independent noise draws. >1 is what makes the
+  # within-CP diversity metric meaningful and is cheap relative to the rollout itself.
+  samples_per_cp: 2
+  # Source CPs given a rollout per step. THE memory knob: each one is a full
+  # `nsteps`-deep forward with `grad_steps` of it holding activations.
+  #
+  # MEASURED: 4 (x samples_per_cp 2 = 8 concurrent rollouts) OOMs a 48G a6000 at
+  # `manual_backward`, job 68347. Peak memory is NOT constant across batches -- the pair
+  # features are O(n_target^2) and the receptor crop runs to 256 residues, so a batch of
+  # large receptors costs several times one of small ones. A single passing step proves
+  # nothing about the peak; that is exactly how the smoke missed this.
+  #
+  # With accum 8 this still gives 16 source CPs and 32 generated LPs per optimizer step.
+  max_cp_per_step: 2
+
+  rollout:
+    # Short on purpose. This trajectory exists so discriminator gradients can reach the
+    # flow network; it is not the sampler anything is exported from. Export uses the full
+    # 200-step deployed sampler (`cp2lp_generate.py --nsteps`).
+    nsteps: 24
+    # Steps at the END of the trajectory that keep gradients (truncated backprop). The
+    # OTHER memory knob -- each one holds a full forward's activations, and the backward
+    # through them is where job 68347 ran out. 1 is what the cyclization rollout uses and
+    # is enough for the endpoint gradient to reach the weights; 2 mainly buys a longer
+    # credit path. Raise it only after the arm is known to fit.
+    grad_steps: 1
+    self_cond: null   # follow the design sampler
+
+  adversarial:
+    enabled: true     # <- THE ONE LINE the contact-only control changes
+    # 0.3, DOWN from 1.0 (v1). The generator's gradient is clipped to a fixed norm, so the
+    # terms compete for one budget: whatever share the adversary takes is taken FROM the
+    # others. And the adversary never gives any back -- `hinge_g_loss` is `-fake_logits`,
+    # which has constant gradient -1 w.r.t. the logit no matter how confident D is, while
+    # every other term saturates as it converges. In v1 that pinned contact retention at
+    # 0.158 for 39k steps while the control, identical but for this term, reached 0.435.
+    weight: 0.3
+    # 5e-5, DOWN from 2e-4. v1's D ran away: real logit +1.52, fake -1.83, i.e. BOTH past
+    # the hinge margin, so D's own gradient had largely vanished (`d_acc` 0.996) and the
+    # generator was pushing at full magnitude against a critic that had stopped learning.
+    # `loss_adv_g` ROSE 1.72 -> 1.92 over the run: G lost ground against a frozen D.
+    d_lr: 5.0e-5
+    d_steps_per_g: 1
+    # Generator-only warmup. The discriminator is randomly initialised, so its early
+    # gradient is noise; letting the contact/sequence/geometry terms establish a sane
+    # starting point first is the cheapest guard against an early collapse.
+    warmup_g_steps: 300
+
+  discriminator:
+    hidden_dim: 192
+    nlayers: 3
+    nheads: 6
+    k_pocket: 8
+    # Coarse 5-way chemistry rather than 20-way identity, to blunt the receptor shortcut.
+    # Options: chem | restype | none.
+    pocket_identity: chem
+    shortcut_probe: true
+    dropout: 0.1
+
+  losses:
+    contact_weight: 1.0
+    sequence_weight: 0.5
+    # Retire the sequence term once it has essentially converged. MEASURED (smoke 68421):
+    # sequence contributes max|g| 2.40 into the flow network against contact retention's
+    # 2.30e-02 -- a hundredfold difference, with contact carrying the larger WEIGHT. Under a
+    # fixed clip that makes sequence the term that decides how much step contact gets. It is
+    # also solved early and stays solved (exact match 0.93-0.96 by 39k in both v1 arms), so
+    # it is spending the budget on nothing. In the v1 control, retention only started moving
+    # after exact match saturated -- this makes that hand-off deliberate instead of lucky.
+    # Never reaches zero: the term still has to DEFEND the sequence, which the export gate
+    # requires exactly.
+    # OFF after v2. The mechanism worked exactly as designed (`seq_weight_scale` 1.0 -> 0.65,
+    # generator gradient norm halved 21 -> 11, which CONFIRMS sequence was the dominant
+    # term), but backbone geometry degraded in both v2 arms (peptide_bond_mae 0.24 -> 0.51
+    # gan, 0.22 -> 0.33 control) and this is the only other change that reaches the control,
+    # so it is the prime suspect: the sequence term may have been implicitly holding the
+    # latents in regions the decoder can render. Not separable from the sharpness change
+    # without a third arm, so both revert together and the code stays for a later test.
+    sequence_decay:
+      enabled: false
+      start_exact_match: 0.9
+      floor: 0.05
+      ema_beta: 0.99
+    geometry_weight: 0.5
+    clash_weight: 0.5
+    # Only has to escape "return the CP unchanged"; flat-bottomed past min_open_gap_nm, so
+    # it never argues with the adversarial term about how far apart real LP termini sit.
+    open_weight: 0.2
+    contact_cutoff_nm: 0.8
+    # BACK TO 0.1 after v2 MEASURED it as a regression (control retention 0.349 -> 0.185,
+    # step-matched at 28-30k). Widening the sigmoid widens the gradient's support but ALSO
+    # SOFTENS THE PENALTY, and the softening wins: `lost = relu(c_src - c_gen)`, and a wider
+    # sigmoid raises c_gen for a drifted pair while lowering c_src for the original contact.
+    # For a source contact at 0.4 nm, loss at 0.3 as a fraction of loss at 0.1 is 0.52x at
+    # 0.9 nm, 0.60x at 1.2 nm, 0.72x at 1.5 nm -- worst exactly at the near distances where
+    # the recoverable contacts are. Widening the support needs a term whose MAGNITUDE does
+    # not shrink with width (a distance hinge), not a wider sigmoid.
+    contact_sharpness_nm: 0.1
+    # 0.20 nm, NOT 0.27: the larger value rejects 43 of 60 native crystal complexes, so
+    # training against it pushes away from native-like packing.
+    clash_threshold_nm: 0.20
+    min_open_gap_nm: 0.45
+
+  # The real-data anchor. Dropping this leaves a pure GAN on a pretrained init, which is
+  # the configuration most likely to collapse.
+  real_lp_flow_weight: 1.0
+
+  # Which linear rows count as REAL BOUND LPs for the discriminator. PepBench is real
+  # peptide-protein complexes; ProtFrag fragments come from monomeric protein contexts, so
+  # their "interface" is intramolecular packing rather than a binding event -- teaching the
+  # discriminator that those are what a bound peptide looks like would be teaching it the
+  # wrong thing. ProtFrag still contributes to the flow-matching anchor, which is about LP
+  # geometry and not about binding. Empty list = every linear row, which is the behaviour
+  # when `dataset_source` is not loaded.
+  real_lp_sources: [pepbench]
+
+  reservoir:
+    capacity_per_length: 64
+    # Exact length matching only. Any slack is a crack the discriminator can read peptide
+    # length through; `cp2lp_d_match_frac` reports how often matching succeeds.
+    max_length_slack: 0
+
+opt:
+  lr: 5.0e-5          # halved from the lpmix arm: this is a finetune with an adversary
+  warmup_steps: 500
+  val_check_interval: 2500

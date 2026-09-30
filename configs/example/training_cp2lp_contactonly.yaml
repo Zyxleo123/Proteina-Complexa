@@ -1,0 +1,40 @@
+# @package _global_
+# CP -> LP GENERATOR, contact-loss-only arm. THE ABLATION.
+#
+# Identical to `training_cp2lp_gan.yaml` except that the adversarial term is off. That is
+# the single variable: same init, same AE, same data, same source-CP conditioning, same
+# contact / sequence / geometry / clash / opening losses, same rollout, same seed.
+#
+# WHAT IT TESTS. Without an adversary, nothing tells the generator what a REAL bound
+# linear peptide looks like. The remaining terms say: keep the CP's contacts, keep its
+# sequence, keep the backbone chemically sane, do not clash, and get the termini apart.
+# A peptide can satisfy all of that and still be an obviously artificial object -- a
+# macrocycle with one bond deleted and the ends pulled open, holding a conformation no
+# unconstrained peptide would adopt in that pocket. The adversarial term exists precisely
+# to price that, and this arm is how we find out whether it buys anything.
+#
+# It is also the cheaper arm and the safer fallback. If the discriminator turns out to be
+# reading a receptor shortcut (watch `cp2lp_d_shortcut_probe_acc` in the GAN arm), its
+# gradient is noise with respect to LP quality and THIS is the arm whose triplets to
+# trust.
+#
+# HOW TO COMPARE THE TWO. Same CPs, same sampling budget:
+#   scripts/submit_cp2lp.sh --submit generate     # runs both arms over the eval families
+#   scripts/submit_cp2lp.sh --submit report       # one table, both arms, real reference
+# Read `terminal separation` and `min peptide-pocket distance` against the REAL column
+# first -- those are the two the adversary should move if it is doing anything -- then
+# `CP contact retention`, which both arms optimise directly and which should be roughly
+# equal if the ablation is clean.
+#
+# Run:
+#   bash scripts/submit_cp2lp.sh --submit contactonly
+
+defaults:
+  - /example/training_cp2lp_gan
+  - _self_
+
+run_name: cp2lp_contactonly_v2
+
+cp2lp:
+  adversarial:
+    enabled: false
