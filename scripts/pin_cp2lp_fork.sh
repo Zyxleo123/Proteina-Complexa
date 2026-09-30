@@ -23,7 +23,39 @@ set -euo pipefail
 
 STORE="${STORE:-/zfsauton/scratch/yixiz/Proteina-Complexa/training_runs/store}"
 FORK_RUN="${FORK_RUN:-cp2lp_onepass_fork}"
-SRC="${1:-${STORE}/${FORK_RUN}/checkpoints/last.ckpt}"
+CKPT_DIR="${STORE}/${FORK_RUN}/checkpoints"
+
+# PREFER THE G-UPDATE MILESTONE over `last.ckpt`, and the difference is not cosmetic.
+#
+# `last.ckpt` is written by `last_ckpt_every_n_steps` (250), which triggers on
+# `global_step`; the warmup STOPS at `max_g_updates` (300). So `last.ckpt` is whatever the
+# last periodic save caught -- g=250 -- while `g000300.ckpt` is the run's actual endpoint.
+# Pinning `last.ckpt` would make the docs' "the fork is the g=300 evaluation point" false,
+# and the arms would inherit 250 and get 10,050 post-warmup updates against a budget that
+# reads 10300.
+#
+# It would not break the COMPARISON (all five arms inherit the same number either way), but
+# it would quietly make the budget arithmetic wrong, and that is the sort of thing that is
+# discovered while reading a results table. Highest-numbered milestone wins.
+if [[ -z "${1:-}" ]]; then
+  # `|| true` is load-bearing under `set -e`: with no match, `ls` exits 2, and a failing
+  # command substitution inside an assignment aborts the script -- so this died with a bare
+  # exit 2 before reaching the "run the warmup first" message below, which is the single
+  # most useful line in the file.
+  SRC="$(ls -1 "${CKPT_DIR}"/g[0-9][0-9][0-9][0-9][0-9][0-9].ckpt 2>/dev/null | sort | tail -1 || true)"
+  if [[ -n "${SRC}" ]]; then
+    echo "[pin] using the G-update milestone: $(basename "${SRC}")"
+  else
+    SRC="${CKPT_DIR}/last.ckpt"
+    echo "[pin] NOTE: no g??????.ckpt milestone found; falling back to last.ckpt."
+    echo "[pin]       That file is written on a global_step cadence, so it is probably a"
+    echo "[pin]       few updates SHORT of max_g_updates. Harmless for the comparison (all"
+    echo "[pin]       arms inherit the same count) but the budget arithmetic in the docs"
+    echo "[pin]       assumes the milestone. Check g_updates_in_fork below."
+  fi
+else
+  SRC="$1"
+fi
 DST="${DST:-${STORE}/${FORK_RUN}/${FORK_RUN}.ckpt}"
 
 [[ -f "$SRC" ]] || {
