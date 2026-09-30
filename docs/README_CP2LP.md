@@ -507,6 +507,65 @@ the 203- and 233-residue batches used less than the 154-residue one. The standin
 that peak is dominated by O(n_target^2) pair features held for the rollout arm, which
 retained a trajectory; it is not the binding constraint for the editor.
 
+### Early training, measured at matched G updates (band 700-1000 of 10,300)
+
+**One run each, ~10% of the budget. Signals, not verdicts.**
+
+| arm | d_acc | probe | dgan_p | retention | gap nm | dCA nm | bond MAE nm | pre-clip \|g\| |
+|---|---|---|---|---|---|---|---|---|
+| `contactonly` | — | — | — | 0.9971 | **0.504** | **0.0281** | **0.0066** | **0.74** |
+| `gan` | 0.820 | 0.505 | — | 0.9219 | 1.134 | 0.1743 | 0.0506 | 7.96 |
+| `gan_ar1` | 0.829 | 0.505 | — | 0.9202 | 1.103 | 0.1766 | 0.0498 | 7.24 |
+| `gan_noise` | 0.823 | 0.505 | 0.050 | 0.9247 | 1.187 | 0.1755 | 0.0506 | 7.45 |
+| `gan_nce` | 0.834 | 0.504 | — | **0.9384** | 1.011 | **0.1412** | 0.0431 | 7.77 |
+
+**THE CONTACT-ONLY ARM BARELY EDITS, and that inverts v1's reading.** It moves CAs by 0.028
+nm and opens the termini to 0.504 nm — i.e. just past the `min_open_gap_nm` hinge at 0.45 and
+then stops, exactly as a flat-bottomed hinge predicts. Its retention of 0.9971 and its
+excellent bond MAE are therefore not quality, they are *near-inaction*: a peptide that did
+not move keeps every contact and every bond. The adversarial arms move 6x further and open to
+1.0–1.19 nm, against a real-LP median of 2.14 nm. **The adversary is supplying the only
+pressure toward "looks like a real bound LP"**, which is what the objective says it is for.
+The cost is visible in the same row: bond MAE 0.05 nm against the export gate's 0.02, so on
+current geometry the GAN arms would fail `chain_intact` and the control would pass. That
+tension is the thing to watch, and it is why the comparison reports yield and quality
+together.
+
+**The clip only bites in the adversarial arms.** Pre-clip norm is **0.74 in the control** —
+*below* `grad_clip_val: 1.0`, so nothing is clipped there and its terms sum freely — against
+~7.5 in every GAN arm. So the adversarial term is most of the generator gradient, and v1's
+gradient-budget competition applies to the GAN arms only. That asymmetry did not exist in v1,
+where the control still carried the real-LP flow term.
+
+`gan_nce` is the most differentiated addon so far: highest retention, lowest CA drift, least
+terminal opening, best geometry of the GAN arms — the contrastive term preserving local
+content at the cost of opening, which is what it was built to do.
+
+#### The Diffusion-GAN controller was holding the noise near zero ON PURPOSE
+
+`dgan_p` = 0.050 at this band looked like a misconfigured adaptation rate, and the first
+conclusion drawn from it — "the controller is 10x too slow, arm B will never activate" — was
+**WRONG**. The trajectory says otherwise:
+
+- `p` changed **2198 times in 749 updates** (one adaptation per 0.3 updates), so it is not
+  adapting rarely; it is oscillating near zero.
+- `dgan_sign_real` averages **0.436, below the 0.6 target**. D is right on real examples only
+  ~72% of the time, so the controller is correctly *lowering* the noise: its whole job is to
+  make the task harder only while D is winning.
+- `p` began climbing as D sharpened and reached 0.175 by g=999, projecting to saturate around
+  **g ≈ 4500** — well inside the 10,300 budget.
+
+**READING TRAP: `d_acc` is not `dgan_sign_real`.** `d_acc` (0.82) is accuracy over both
+classes; `sign_real` (0.436) is the real class alone, and it is the controller's input. D here
+is much better at rejecting fakes (`d_fake_logit` −0.78) than at confirming reals
+(`d_real_logit` +1.15 with more spread), so the two numbers disagree and only one of them
+drives the noise. No intervention was made on arm B.
+
+**ANALYSIS TRAP, hit while producing the table above: `cp2lp_onepass_gan` is a PREFIX of
+`cp2lp_onepass_gan_ar1`, `_noise` and `_nce`.** An unanchored `wandb/run-*{name}*` glob
+resolves the reference arm to whichever addon arm sorts last, which made `gan` and `noise`
+come out identical to four decimal places. Anchor on `-{run_name}-[0-9a-f]+/`.
+
 ### What decides
 
 An addon is kept only if it improves valid LP quality **and** retention at **useful yield**
