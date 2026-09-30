@@ -797,3 +797,35 @@ def test_the_milestone_writer_names_files_by_generator_updates():
     assert re.search(r'f"g\{n:06d\}-EMA\.ckpt"', src), "the EMA milestone is not named by g_updates"
     # And it must go through the EMA callback's own swap, or the -EMA file holds raw weights.
     assert "save_ema_model" in src, "the EMA milestone is not written through the EMA swap"
+
+
+def test_the_fork_pin_job_does_not_override_the_milestone_preference():
+    """`pin_cp2lp_fork.sh` prefers the exact G-update milestone ONLY when given no argument.
+
+    MEASURED (pin job 69416): the sbatch hardcoded `last.ckpt` and passed it as $1, which
+    the script treats as an explicit override -- so the milestone-preference logic was dead
+    and the fork pinned at g=250 instead of g=300. The fix was in the helper; the bug was in
+    the caller. This test guards the caller, which is the half that was missed.
+    """
+    sbatch = (REPO / "scripts" / "cp2lp_fork_pin.sbatch").read_text()
+    invocations = [ln.strip() for ln in sbatch.splitlines() if "pin_cp2lp_fork.sh" in ln and not ln.strip().startswith("#")]
+    assert invocations, "the fork-pin job no longer calls pin_cp2lp_fork.sh"
+    for line in invocations:
+        after = line.split("pin_cp2lp_fork.sh", 1)[1].strip()
+        assert after == "", (
+            f"the fork-pin job passes an explicit source argument ({after!r}), which "
+            "overrides the milestone preference in pin_cp2lp_fork.sh and silently pins a "
+            "checkpoint short of max_g_updates."
+        )
+
+
+def test_the_pin_script_prefers_a_milestone_and_survives_having_none():
+    """Both halves of the helper: the glob must exclude the -EMA twin (the arms continue
+    training, so they need raw weights), and a missing glob must not abort under `set -e`
+    before the 'run the warmup first' message -- a failing command substitution inside an
+    assignment does exactly that."""
+    src = (REPO / "scripts" / "pin_cp2lp_fork.sh").read_text()
+    assert "g[0-9][0-9][0-9][0-9][0-9][0-9].ckpt" in src, "the milestone glob is gone"
+    assert "-EMA" not in src.split("SRC=\"$(ls")[1].split(")\"")[0], "the glob would match the -EMA twin"
+    glob_line = next(ln for ln in src.splitlines() if "ls -1" in ln and "g[0-9]" in ln)
+    assert "|| true" in glob_line, "the glob substitution would abort the script under set -e"

@@ -158,8 +158,23 @@ The one-pass arms therefore count generator updates themselves, in a persistent 
 `cp2lp.max_g_updates` ends the run, `cp2lp.eval_checkpoint_g_updates` writes retained
 milestone checkpoints, the adversarial warmup is gated on it, and `train/cp2lp_g_updates`
 is logged so every plot can be x-axed on the comparable quantity. The counter is inherited
-from the fork (300), which is why the arms' budget reads `10300` — 10,000 post-warmup
-updates, with the fork itself as the `g=300` evaluation point.
+from the fork, which is why the arms' budget reads `10300`.
+
+**MEASURED: the fork was pinned at `g=250`, not 300** (pin job 69416). The warmup stopped
+correctly at 300 and wrote `g000300.ckpt`, but `cp2lp_fork_pin.sbatch` hardcoded
+`last.ckpt` and passed it as an explicit argument, which overrode `pin_cp2lp_fork.sh`'s
+milestone preference — the helper was fixed and its CALLER was not. `last.ckpt` is written
+on a *global_step* cadence (every 250), hence 250.
+
+Consequences, in order of how much they matter: **none for the comparison** — all five arms
+load the same file, so they share an identical initialisation and an identical budget. The
+arms therefore get **10,050 post-warmup updates, not 10,000**, and their milestones land at
+1,050 / 5,050 / 10,050 post-warmup. Quote those numbers, not the round ones. The caller is
+fixed for the next fork and guarded by
+`test_the_fork_pin_job_does_not_override_the_milestone_preference`; the running tranche was
+NOT relaunched, because cancelling five arms to recover 50 updates of cosmetic alignment
+would cost real GPU time for no scientific gain. `g_updates_in_fork` in the `.source`
+sidecar is what made this visible at all.
 
 ## How the rollout mode works (legacy)
 

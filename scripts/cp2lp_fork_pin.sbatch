@@ -27,13 +27,24 @@ _cp2lp_defaults
 _cp2lp_banner "fork-pin"
 
 cd "$REPO"
-SRC="${STORE}/${FORK_RUN}/checkpoints/last.ckpt"
-if [[ ! -f "$SRC" ]]; then
+# PASS NO SOURCE ARGUMENT. `pin_cp2lp_fork.sh` prefers the highest-numbered
+# `g??????.ckpt` milestone -- the run's exact `max_g_updates` endpoint -- and falls back to
+# `last.ckpt`, which is written on a *global_step* cadence and so lands a few updates short.
+#
+# MEASURED THE HARD WAY (pin job 69416): this line used to hardcode `last.ckpt` and pass it
+# as $1, which the script treats as an explicit override. The milestone-preference fix
+# therefore did nothing, and the fork was pinned at g=250 instead of g=300. Harmless to that
+# comparison -- all five arms inherited the same 250 -- but it is the whole class of bug
+# where the helper is fixed and its CALLER is not. Guarded by
+# `test_the_fork_pin_job_does_not_override_the_milestone_preference`.
+CKPT_DIR="${STORE}/${FORK_RUN}/checkpoints"
+if ! ls -1 "${CKPT_DIR}"/g[0-9][0-9][0-9][0-9][0-9][0-9].ckpt "${CKPT_DIR}"/last.ckpt >/dev/null 2>&1; then
   # Gate, not failure. A non-zero exit here strands all five arms in
   # DependencyNeverSatisfied with nothing explaining why.
-  echo "GATE: the warmup produced no checkpoint at ${SRC}."
+  echo "GATE: the warmup produced no usable checkpoint under ${CKPT_DIR}."
   echo "      Read the warmup job's .out before resubmitting: a job that fails to source"
   echo "      its preamble exits 0 and releases its dependents having done no work."
+  ls -1 "${CKPT_DIR}" 2>/dev/null | sed 's/^/      have: /' || true
   exit 0
 fi
-FORCE="${FORCE_PIN:-0}" PY="$PY" bash scripts/pin_cp2lp_fork.sh "$SRC"
+FORCE="${FORCE_PIN:-0}" PY="$PY" bash scripts/pin_cp2lp_fork.sh
