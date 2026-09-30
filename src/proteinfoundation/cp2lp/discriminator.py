@@ -97,6 +97,7 @@ class PeptideInterfaceDiscriminator(nn.Module):
         pocket_identity: str = "chem",
         shortcut_probe: bool = True,
         dropout: float = 0.1,
+        noise_level_dim: int = 0,
     ):
         super().__init__()
         if pocket_identity not in ("chem", "restype", "none"):
@@ -140,9 +141,30 @@ class PeptideInterfaceDiscriminator(nn.Module):
         # Global summary: terminal gap, radius of gyration, total soft contacts,
         # mean min-distance to pocket.
         self.n_global = 4
+
+        # Optional NOISE-LEVEL input, for the Diffusion-GAN-inspired arm only. The
+        # official implementation hands the corruption level to D through its conditioning
+        # mapping; there is no conditioning path here, so it joins the pooled vector.
+        #
+        # APPENDED LAST, which is what lets `_splice_pretrained_weights` warm-start this
+        # arm's D from the common fork: the head's leading columns are copied and only the
+        # noise-level columns are zero-padded. Inserting it before `glob` would re-bind
+        # every trained column to a different input.
+        self.noise_level_dim = int(noise_level_dim)
+        if self.noise_level_dim > 0:
+            # Fourier features of the level, as a BUFFER rather than a parameter: the
+            # embedding must mean the same thing on every step and in every arm, and a
+            # learnable frequency set would drift while the controller is also moving.
+            self.register_buffer(
+                "noise_level_freqs",
+                2.0 ** torch.arange(self.noise_level_dim // 2).float(),
+                persistent=False,
+            )
+
+        head_in = 2 * hidden_dim + self.n_global + self.noise_level_dim
         self.head = nn.Sequential(
-            nn.LayerNorm(2 * hidden_dim + self.n_global),
-            nn.Linear(2 * hidden_dim + self.n_global, hidden_dim),
+            nn.LayerNorm(head_in),
+            nn.Linear(head_in, hidden_dim),
             nn.GELU(),
             nn.Dropout(dropout),
             nn.Linear(hidden_dim, 1),
@@ -290,15 +312,83 @@ class PeptideInterfaceDiscriminator(nn.Module):
 
     # ------------------------------------------------------------------ forward
 
-    def forward(self, feats: dict[str, torch.Tensor]) -> torch.Tensor:
-        """[b] realness logit from a feature dict produced by :meth:`build_features`."""
+    # ------------------------------------------------------------- feature layout
+
+    def continuous_column_masks(self) -> dict[str, torch.Tensor]:
+        """Which columns of each feature block are CONTINUOUS, and so eligible for noise.
+
+        Both feature-space addons (approximate R1, Diffusion-GAN corruption) perturb
+        features, and both must leave the non-continuous ones alone. Ownership lives here
+        because this class decides the layout in :meth:`build_features`; a copy of these
+        offsets anywhere else would go stale the first time a feature is appended.
+
+        Excluded, and why each one:
+
+        * ``res`` -- sequence PROBABILITIES. A simplex; additive noise takes it off the
+          simplex and the perturbation stops being interpretable as "a slightly different
+          peptide". Also the generator's own output, so noising it would blur the very
+          thing sequence retention is supposed to pin.
+        * ``mask`` -- padding. Noising it invents residues.
+        * the one-hot POCKET IDENTITY columns inside ``iface`` -- categorical.
+        * the two TERMINAL FLAGS at the end of ``geom`` -- categorical, and they mark the
+          chain ends, which is what "is this an open peptide" is read from.
+        """
+        # geom = [dihed(4), neighbour CA dists(3), intra bond dev(2), d_centroid(1),
+        #         is_first(1), is_last(1)]
+        geom = torch.ones(self.n_geom, dtype=torch.bool)
+        geom[-2:] = False
+        # iface = [topk dists(k), pocket one-hot(k*pid), min heavy dist(1), contacts(1)]
+        iface = torch.ones(self.n_iface, dtype=torch.bool)
+        if self.pocket_id_dim > 0:
+            start = self.k_pocket
+            iface[start : start + self.k_pocket * self.pocket_id_dim] = False
+        return {
+            "geom": geom,
+            "iface": iface,
+            "glob": torch.ones(self.n_global, dtype=torch.bool),
+        }
+
+    def embed_noise_level(self, level: torch.Tensor) -> torch.Tensor:
+        """``[b] -> [b, noise_level_dim]`` Fourier features of the corruption level."""
+        if self.noise_level_dim <= 0:
+            raise RuntimeError("discriminator was built with noise_level_dim=0")
+        ang = level[:, None] * self.noise_level_freqs[None, :] * (2.0 * torch.pi)
+        emb = torch.cat([torch.sin(ang), torch.cos(ang)], dim=-1)
+        if emb.shape[-1] < self.noise_level_dim:  # odd dim
+            emb = F.pad(emb, (0, self.noise_level_dim - emb.shape[-1]))
+        return emb[:, : self.noise_level_dim]
+
+    # ------------------------------------------------------------------ forward
+
+    def forward(
+        self,
+        feats: dict[str, torch.Tensor],
+        noise_level: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """[b] realness logit from a feature dict produced by :meth:`build_features`.
+
+        ``noise_level`` is the Diffusion-GAN arm's corruption level, ``[b]``, and is
+        required exactly when the module was built with ``noise_level_dim > 0``. Required
+        rather than optional-with-a-default: a silently zero-filled level would tell D
+        every example is clean, which is the one thing that makes the corruption
+        uninformative instead of merely noisy.
+        """
         mask = feats["mask"]
         h = torch.cat([self.res_emb(feats["res"]), feats["geom"], feats["iface"]], dim=-1)
         h = self.in_proj(h)
         h = self.trunk(h, src_key_padding_mask=~mask)
         h = torch.nan_to_num(h)
-        pooled = torch.cat([_masked_mean(h, mask), _masked_max(h, mask), feats["glob"]], dim=-1)
-        return self.head(pooled).squeeze(-1)
+        parts = [_masked_mean(h, mask), _masked_max(h, mask), feats["glob"]]
+        if self.noise_level_dim > 0:
+            if noise_level is None:
+                raise ValueError(
+                    "this discriminator was built with noise_level_dim > 0 and needs a "
+                    "`noise_level` on every call -- see cp2lp.addons.FeatureNoiseController."
+                )
+            parts.append(self.embed_noise_level(noise_level.to(h.dtype)))
+        elif noise_level is not None:
+            raise ValueError("noise_level passed to a discriminator built with noise_level_dim=0")
+        return self.head(torch.cat(parts, dim=-1)).squeeze(-1)
 
     def probe_forward(self, feats: dict[str, torch.Tensor]) -> torch.Tensor | None:
         """[b] receptor-only diagnostic logit, or None when the probe is disabled.

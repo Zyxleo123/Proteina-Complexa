@@ -4,7 +4,32 @@ A ``Proteina`` subclass, so the flow network, the frozen mixed AE, the samplers 
 checkpoint plumbing are all inherited rather than reimplemented. What it adds is a second
 training branch and a second optimizer.
 
-ONE OPTIMIZER STEP, THREE TERMS.
+TWO GENERATOR MODES, SELECTED BY ``cp2lp.mode``.
+
+``onepass`` (the direct editor, and the one the five-arm comparison uses)
+    One network evaluation per generated batch. The encoded source CP is fed through the
+    ordinary coordinate/latent input channels, a pair of zero-initialised residual heads
+    emit an edit displacement, the sum is decoded by the frozen AE, and that is the
+    sample. ``t`` is pinned at a configured constant and is an architecture input, not a
+    sampling coordinate: no ODE, no velocity-to-clean conversion, no CFG, no
+    self-conditioning pass, and the same function serves training and export. See
+    :mod:`proteinfoundation.cp2lp.editor`. The real-LP flow-matching term is OFF in this
+    mode -- it supervises a velocity field the residual heads are not connected to -- and
+    nothing replaces it; real bound LPs remain the discriminator's real class.
+
+``rollout`` (legacy, still the default, unchanged)
+    The original generator: a short differentiable ODE trajectory with DRaFT-K gradients
+    and export from a 200-step sampler. Kept so the three measured generations in
+    ``docs/README_CP2LP.md`` stay reproducible. It is not part of the five-arm comparison
+    -- the generator objective differs too, so it is historical context rather than a
+    clean architecture ablation.
+
+THREE ADD-ONS, AT MOST ONE AT A TIME, selected by ``cp2lp.addon`` and all default-off.
+``ar1`` and ``noise`` are discriminator-side; ``nce`` is generator-side. Every one of them
+is measured against the plain one-pass GAN, never against another addon. See
+:mod:`proteinfoundation.cp2lp.addons`.
+
+ONE OPTIMIZER STEP, THREE TERMS (rollout mode; one-pass drops the first).
 
 *real-LP flow matching* -- ordinary conditional flow matching on PepBench/ProtFrag rows
 with the source-CP condition explicitly absent. This is the anchor: it is the only term
@@ -45,6 +70,16 @@ from functools import partial
 import torch
 from loguru import logger
 
+from proteinfoundation.cp2lp.addons import (
+    AddonRandomStreams,
+    FeatureNoiseController,
+    FeatureScaleCache,
+    LocalRetentionNCE,
+    approx_r1_penalty,
+    describe_arm,
+    feature_widths,
+    validate_addon,
+)
 from proteinfoundation.cp2lp.conditioning import (
     SRC_CP_KEY,
     attach_source_cp_condition,
@@ -52,6 +87,14 @@ from proteinfoundation.cp2lp.conditioning import (
     request_linear_topology,
     source_cp_terminal_gap_nm,
     warn_if_condition_unused,
+)
+from proteinfoundation.cp2lp.editor import (
+    DEFAULT_EDITOR_T,
+    DEFAULT_NOISE_CHANNELS,
+    apply_residuals,
+    build_editor_batch,
+    make_noise_generator,
+    sample_editor_noise,
 )
 from proteinfoundation.cp2lp.data import RealLPFeatureReservoir, slice_batch, split_roles
 from proteinfoundation.cp2lp.discriminator import (
@@ -105,6 +148,21 @@ class CP2LPGenerator(Proteina):
         self.cp2lp_samples_per_cp = int(cfg.get("samples_per_cp", 2))
         self.cp2lp_max_cp = int(cfg.get("max_cp_per_step", 4))
 
+        # `rollout` is the ORIGINAL generator: a short differentiable ODE trajectory,
+        # DRaFT-K gradients, export from a 200-step sampler. Kept, unchanged, and still the
+        # default, so the three measured generations in docs/README_CP2LP.md remain
+        # reproducible. `onepass` is the direct editor -- one network evaluation, a residual
+        # edit of the encoded source CP, no sampler anywhere. The two modes share the
+        # losses, the discriminator and the export gate and nothing else.
+        self.cp2lp_mode = str(cfg.get("mode", "rollout")).lower()
+        if self.cp2lp_mode not in ("rollout", "onepass"):
+            raise ValueError(f"cp2lp.mode must be 'rollout' or 'onepass', got {self.cp2lp_mode!r}")
+
+        op = cfg.get("onepass", None) or {}
+        self.onepass_t = float(op.get("t_fixed", DEFAULT_EDITOR_T))
+        self.onepass_noise_channels = int(op.get("noise_channels", DEFAULT_NOISE_CHANNELS))
+        self.onepass_noise_adapter_std = float(op.get("noise_adapter_std", 0.02))
+
         roll = cfg.get("rollout", None) or {}
         self.cp2lp_nsteps = int(roll.get("nsteps", 24))
         self.cp2lp_grad_steps = int(roll.get("grad_steps", 2))
@@ -119,6 +177,26 @@ class CP2LPGenerator(Proteina):
         # looks like. Turning the adversary off is `adversarial.enabled: false`.
         self.adv_d_steps = max(1, int(adv.get("d_steps_per_g", 1)))
         self.adv_warmup_steps = int(adv.get("warmup_g_steps", 200))
+
+        # ONE addon at a time, and only alongside an adversary. Validated here rather than
+        # checked at the point of use so a contradictory config dies at startup instead of
+        # producing an arm whose result cannot be attributed to anything.
+        self.cp2lp_addon = validate_addon(cfg.get("addon", "none"), self.adv_enabled)
+
+        ar1 = cfg.get("ar1", None) or {}
+        # lambda 10, not the paper's 100. The paper's D is a large image/video critic with a
+        # logit scale of its own; this one is three transformer layers over <=16 residues,
+        # and lambda*penalty has to stay commensurate with a hinge loss whose terms are
+        # O(1). 10 is a pilot value -- `loss_d_ar1_weighted` is logged next to `loss_d` so
+        # the ratio can be read off a run rather than guessed at again.
+        self.ar1_lambda = float(ar1.get("lambda", 10.0))
+        self.ar1_sigma_rel = float(ar1.get("sigma_rel", 0.01))
+
+        dgan = cfg.get("dgan", None) or {}
+        self.dgan_noise_level_dim = int(dgan.get("noise_level_dim", 16))
+
+        nce = cfg.get("nce", None) or {}
+        self.nce_weight = float(nce.get("weight", 0.1))
 
         lw = cfg.get("losses", None) or {}
         self.w_contact = float(lw.get("contact_weight", 1.0))
@@ -162,7 +240,53 @@ class CP2LPGenerator(Proteina):
             pocket_identity=str(dcfg.get("pocket_identity", "chem")),
             shortcut_probe=bool(dcfg.get("shortcut_probe", True)),
             dropout=float(dcfg.get("dropout", 0.1)),
+            # Only the Diffusion-GAN arm gives D a noise-level input. Every other arm
+            # builds the SAME discriminator as the common fork, bit for bit, which is what
+            # makes "fork all five arms from one checkpoint" mean anything.
+            noise_level_dim=(self.dgan_noise_level_dim if self.cp2lp_addon == "noise" else 0),
         )
+
+        # ---- addon state. Built only for the arm that uses it, so a checkpoint carries no
+        # dormant addon buffers and the four other arms' state dicts stay identical in shape.
+        self.feature_scales = None
+        self.dgan = None
+        self.nce = None
+        if self.cp2lp_addon in ("ar1", "noise"):
+            sc = cfg.get("feature_scales", None) or {}
+            self.feature_scales = FeatureScaleCache(
+                widths=feature_widths(self.discriminator),
+                min_examples=int(sc.get("min_examples", 128)),
+                std_floor=float(sc.get("std_floor", 1e-3)),
+            )
+        if self.cp2lp_addon == "noise":
+            self.dgan = FeatureNoiseController(
+                max_std=float(dgan.get("max_std", 0.2)),
+                n_levels=int(dgan.get("n_levels", 32)),
+                pool_size=int(dgan.get("pool_size", 64)),
+                target_sign=float(dgan.get("target_sign", 0.6)),
+                adapt_rate_examples=float(dgan.get("adapt_rate_examples", 5000.0)),
+                adapt_every_n_steps=int(dgan.get("adapt_every_n_steps", 4)),
+                p_init=float(dgan.get("p_init", 0.0)),
+                p_max=float(dgan.get("p_max", 1.0)),
+            )
+        if self.cp2lp_addon == "nce":
+            self.nce = LocalRetentionNCE(
+                k_neighbors=int(nce.get("k_neighbors", 8)),
+                temperature=float(nce.get("temperature", 0.07)),
+                proj_dim=int(nce.get("proj_dim", 64)),
+                use_projection=bool(nce.get("use_projection", True)),
+                max_positions=int(nce.get("max_positions", 16)),
+                exclude_terminal=int(nce.get("exclude_terminal", 2)),
+                contact_cutoff_nm=self.contact_cutoff_nm,
+            )
+
+        # Lazily created, on the right device, at first use. Deliberately NOT buffers: a
+        # torch.Generator has no state_dict, so a requeue restarts these streams. That is
+        # acceptable for noise and it is worth writing down -- it means a resumed run is
+        # not bit-identical to an uninterrupted one, while two arms launched together and
+        # never requeued are.
+        self._editor_noise_gen = None
+        self._addon_streams = None
 
         self.real_lp_sources = [str(s) for s in (cfg.get("real_lp_sources", None) or [])]
 
@@ -172,6 +296,26 @@ class CP2LPGenerator(Proteina):
         self.grad_clip_val = float(cfg.get("grad_clip_val", 1.0))
         self.grad_clip_algorithm = str(cfg.get("grad_clip_algorithm", "norm"))
 
+        # GENERATOR-UPDATE ACCOUNTING, and it is not a convenience.
+        #
+        # `trainer.global_step` under manual optimization is the number of `optimizer.step()`
+        # calls SUMMED OVER OPTIMIZERS (lightning/pytorch/loops/optimization/manual.py
+        # increments on every lightning optimizer's `_on_after_step`). This arm steps two
+        # optimizers, so an adversarial arm advances `global_step` by 2 per accumulation
+        # boundary -- or by 1 when the length-matched reservoir could not pair anything and
+        # the D step was skipped -- while the contact-only arm always advances by 1.
+        #
+        # So `global_step` is NOT comparable across these arms, and a budget or a warmup
+        # expressed in it means a different amount of generator training in each. Every
+        # budget, milestone and warmup below is therefore counted in G updates. A buffer,
+        # so a requeue resumes the count instead of restarting the schedule.
+        self.register_buffer("g_updates", torch.zeros((), dtype=torch.long), persistent=True)
+        self.max_g_updates = int(cfg.get("max_g_updates", 0) or 0)
+        self.eval_ckpt_g_updates = sorted(
+            int(s) for s in (cfg.get("eval_checkpoint_g_updates", None) or [])
+        )
+        self._milestones_written: set[int] = set()
+
         rcfg = cfg.get("reservoir", None) or {}
         self.reservoir = RealLPFeatureReservoir(
             capacity_per_length=int(rcfg.get("capacity_per_length", 64)),
@@ -180,14 +324,71 @@ class CP2LPGenerator(Proteina):
         self.reservoir_slack = int(rcfg.get("max_length_slack", 0))
 
         warn_if_condition_unused(list(cfg_exp.nn.feats_seq), list(cfg_exp.nn.feats_pair_repr))
-        logger.info(
-            f"CP2LP generator enabled: samples_per_cp={self.cp2lp_samples_per_cp}, "
-            f"max_cp_per_step={self.cp2lp_max_cp}, rollout nsteps={self.cp2lp_nsteps} "
-            f"grad_steps={self.cp2lp_grad_steps}, adversarial={self.adv_enabled} "
-            f"(weight={self.adv_weight}, warmup={self.adv_warmup_steps})"
-        )
+        if self.cp2lp_mode == "onepass":
+            self._validate_onepass_wiring(cfg_exp)
+            logger.info(
+                f"CP2LP ONE-PASS editor: arm={describe_arm(self.cp2lp_addon, self.adv_enabled)}, "
+                f"t_fixed={self.onepass_t}, noise_channels={self.onepass_noise_channels}, "
+                f"samples_per_cp={self.cp2lp_samples_per_cp}, max_cp_per_step={self.cp2lp_max_cp}, "
+                f"adversarial={self.adv_enabled} (weight={self.adv_weight}, warmup={self.adv_warmup_steps})"
+            )
+        else:
+            logger.info(
+                f"CP2LP generator enabled (LEGACY ROLLOUT mode): samples_per_cp={self.cp2lp_samples_per_cp}, "
+                f"max_cp_per_step={self.cp2lp_max_cp}, rollout nsteps={self.cp2lp_nsteps} "
+                f"grad_steps={self.cp2lp_grad_steps}, adversarial={self.adv_enabled} "
+                f"(weight={self.adv_weight}, warmup={self.adv_warmup_steps})"
+            )
         if not self.adv_enabled:
             logger.info("CP2LP: ADVERSARIAL TERM OFF -- this is the contact-loss-only ablation arm.")
+
+    def _validate_onepass_wiring(self, cfg_exp) -> None:
+        """Hard checks that only matter in one-pass mode, all of them silent failures.
+
+        Each of these produces a run that trains, logs falling losses and answers a
+        different question than the one asked:
+
+        * no residual heads -> ``apply_residuals`` raises, which is the good case, but it
+          raises on the first batch of a queued GPU job rather than at config time;
+        * no noise feature -> a deterministic editor, one LP per CP for ever, and the
+          within-parent diversity column of the comparison table is structurally zero;
+        * a nonzero real-LP flow weight -> the branch this mode disables would still be
+          adding a velocity objective the editor's readouts are not even connected to.
+        """
+        if not bool(cfg_exp.nn.get("enable_editor_residual", False)):
+            raise ValueError(
+                "cp2lp.mode=onepass requires `nn.enable_editor_residual: true`. Without it "
+                "the trunk emits only a flow VELOCITY, and reading that as an edit "
+                "displacement would start the editor at x_src + v(x_src, t) -- an arbitrary "
+                "jump, not the identity edit the zero-initialised residual heads give."
+            )
+        feats = list(cfg_exp.nn.feats_seq)
+        if "editor_noise_seq" not in feats:
+            raise ValueError(
+                "cp2lp.mode=onepass requires `editor_noise_seq` in nn.feats_seq (append it "
+                "LAST). One network evaluation with no random input can only ever produce "
+                "one LP per source CP."
+            )
+        if feats[-1] != "editor_noise_seq":
+            logger.warning(
+                f"`editor_noise_seq` is at position {feats.index('editor_noise_seq')} of "
+                f"{len(feats)} in nn.feats_seq, not last. Features are concatenated in list "
+                "order and `_splice_pretrained_weights` copies the LEADING columns, so "
+                "anything after it has its pretrained weights re-bound to the wrong inputs."
+            )
+        if int(cfg_exp.nn.get("editor_noise_channels", DEFAULT_NOISE_CHANNELS)) != self.onepass_noise_channels:
+            raise ValueError(
+                f"nn.editor_noise_channels != cp2lp.onepass.noise_channels "
+                f"({cfg_exp.nn.get('editor_noise_channels')} vs {self.onepass_noise_channels}); "
+                "the feature block width and the sampler must agree."
+            )
+        if self.w_real_lp_flow != 0.0:
+            raise ValueError(
+                "cp2lp.mode=onepass requires `cp2lp.real_lp_flow_weight: 0.0`. The flow "
+                "objective supervises a velocity field; the editor's residual heads are a "
+                "different readout and the term does not reach them. Real bound LPs remain "
+                "the discriminator's real class -- that path is unaffected and stays on."
+            )
 
     @property
     def _data_modes(self) -> list[str]:
@@ -378,6 +579,97 @@ class CP2LPGenerator(Proteina):
         decoded = self._decode(samples, gen_batch["mask"])
         return gen_batch, decoded, samples
 
+    # ------------------------------------------------------- one-pass direct editor
+
+    def init_editor_noise_adapter(self) -> tuple[int, int] | None:
+        """Small nonzero input weights for the noise block. Call AFTER a pretrained splice.
+
+        Not done in ``__init__``: the splice runs later and would overwrite it with the
+        checkpoint's (zero) columns for an appended feature. ``train.py`` calls this
+        immediately after loading ``pretrain_ckpt_path``, and a RESUME does not call it at
+        all -- resuming loads the arm's own full state dict, where the columns already
+        carry whatever they learned.
+        """
+        if self.cp2lp_mode != "onepass":
+            return None
+        from proteinfoundation.cp2lp.editor import init_noise_adapter_
+
+        return init_noise_adapter_(self.nn.init_repr_factory, std=self.onepass_noise_adapter_std)
+
+    def _noise_generator(self) -> torch.Generator:
+        if self._editor_noise_gen is None:
+            self._editor_noise_gen = make_noise_generator(int(self.cfg_exp.get("seed", 0)), self.device)
+        return self._editor_noise_gen
+
+    def _streams(self) -> AddonRandomStreams:
+        if self._addon_streams is None:
+            self._addon_streams = AddonRandomStreams(int(self.cfg_exp.get("seed", 0)), self.device)
+        return self._addon_streams
+
+    def generate_onepass(
+        self,
+        cp_batch: dict,
+        noise: torch.Tensor | None = None,
+        deterministic: bool = False,
+    ) -> tuple[dict, dict, dict]:
+        """ONE network evaluation: encoded source CP in, edited-and-decoded LP out.
+
+        The single entry point for both training and export. Sharing it is not tidiness:
+        the previous generation trained on a 24-step trajectory and exported from a
+        200-step one, and every training-side geometry number was therefore uninformative
+        about what would be exported (``geom_chain_intact_frac`` read 0 by construction in
+        the logs while the export gate used a different sampler). With one function there
+        is one number.
+
+        Args:
+            cp_batch: a CPSea batch after ``add_clean_samples``.
+            noise: ``[b, n, c]`` to reuse an exact draw -- the rotation check and the
+                train/export agreement check both need the same noise twice.
+            deterministic: omit the noise entirely. Only the frame-sensitivity measurement
+                wants this; a deterministic editor is not a usable generator.
+
+        Returns:
+            ``(gen_batch, decoded, extras)``. ``extras`` carries the edited latent state
+            and the residual magnitudes -- a residual norm pinned at zero is what a head
+            that never left its zero init looks like, and it is otherwise indistinguishable
+            from a generator that has decided not to edit.
+        """
+        bs, n = cp_batch["mask"].shape
+        ref = cp_batch["x_1"][self._data_modes[0]]
+        if noise is None and not deterministic:
+            noise = sample_editor_noise(
+                bs, n, self.onepass_noise_channels, ref.device, ref.dtype, self._noise_generator()
+            )
+        gen_batch = build_editor_batch(
+            cp_batch, data_modes=self._data_modes, t_fixed=self.onepass_t, noise=noise
+        )
+
+        # ONE call. `n_recycle=0` is what makes that literally true: a recycle is another
+        # full forward, and `cp2lp_onepass_smoke.py` counts trunk calls with a forward hook
+        # rather than trusting this line.
+        nn_out = self.call_nn(gen_batch, n_recycle=0)
+        edited, deltas = apply_residuals(gen_batch["x_t"], nn_out, gen_batch["mask"], self._data_modes)
+        decoded = self._decode(edited, gen_batch["mask"])
+
+        mask = gen_batch["mask"].bool()
+        denom = mask.sum().clamp(min=1)
+        extras = {"edited": edited, "deltas": deltas}
+        with torch.no_grad():
+            extras["metrics"] = {
+                "delta_ca_rms_nm": torch.sqrt((deltas["bb_ca"] ** 2).sum() / (denom * 3)),
+                "delta_latent_rms": torch.sqrt(
+                    (deltas["local_latents"] ** 2).sum() / (denom * deltas["local_latents"].shape[-1])
+                ),
+            }
+        return gen_batch, decoded, extras
+
+    def _generate(self, cp_batch: dict) -> tuple[dict, dict, dict]:
+        """Mode dispatch. ``(gen_batch, decoded, extras)``; ``extras`` is mode-specific."""
+        if self.cp2lp_mode == "onepass":
+            return self.generate_onepass(cp_batch)
+        gen_batch, decoded, samples = self._generate_from_cp(cp_batch)
+        return gen_batch, decoded, {"samples": samples, "metrics": {}}
+
     def _generator_loss_terms(self, gen_batch: dict, decoded: dict) -> dict[str, torch.Tensor]:
         """The generator's non-adversarial terms, UNWEIGHTED and separate.
 
@@ -528,20 +820,45 @@ class CP2LPGenerator(Proteina):
         real_feats_live = None
         if linear_idx.any():
             lp_batch = slice_batch(batch, linear_idx, bs)
-            flow_loss, n_lp = self._real_lp_flow_loss(lp_batch)
-            g_loss = g_loss + self.w_real_lp_flow * flow_loss
-            metrics["loss_real_lp_flow"] = flow_loss.detach()
-            metrics["n_real_lp"] = torch.tensor(float(n_lp))
+            # THE FLOW BRANCH IS OFF IN ONE-PASS MODE. It supervises a velocity field; the
+            # editor's readouts are residual heads, so the term does not reach them, and
+            # nothing has been substituted for it -- no identity loss, no distillation, no
+            # reconstruction. Real bound LPs still arrive here and still go into the
+            # discriminator's real pool below, which is the role they have in this mode.
+            if self.cp2lp_mode == "rollout":
+                flow_loss, n_lp = self._real_lp_flow_loss(lp_batch)
+                g_loss = g_loss + self.w_real_lp_flow * flow_loss
+                metrics["loss_real_lp_flow"] = flow_loss.detach()
+                metrics["n_real_lp"] = torch.tensor(float(n_lp))
+            else:
+                metrics["n_real_lp"] = torch.tensor(float(lp_batch["mask"].shape[0]))
 
             # The real pool the discriminator sees is the AE ROUND TRIP of a real LP, not
             # its crystal coordinates -- otherwise "was this decoded?" separates the two
             # classes perfectly and the generator learns nothing about LP realness.
             with torch.no_grad():
-                lp_clean = {dm: lp_batch["x_1"][dm].detach() for dm in self._data_modes}
                 lp_mask = lp_batch["mask"].bool()
+                # Masked explicitly. In rollout mode `corrupt_batch` has already applied
+                # the mask to `x_1` as a side effect; one-pass mode never calls it, and
+                # relying on a side effect for one mode and not the other is how the two
+                # real pools would quietly stop being the same pool.
+                lp_clean = {
+                    dm: lp_batch["x_1"][dm].detach() * lp_mask[..., None].to(lp_batch["x_1"][dm].dtype)
+                    for dm in self._data_modes
+                }
                 real_decoded = self._decode(lp_clean, lp_mask)
                 real_feats_live = self._featurize(real_decoded, lp_batch, lp_mask)
                 pool = self._real_pool_index(lp_batch)
+                if self.feature_scales is not None and not self.feature_scales.ready:
+                    # Fed from the REAL rows of the TRAINING stream only -- the eval
+                    # families never reach this branch. Both noise-related addons define
+                    # their amplitude in units of these scales, so estimating them on
+                    # anything held out would put evaluation data inside the objective.
+                    keep_sc = real_feats_live if pool is None else {
+                        k: v[pool.to(v.device)] for k, v in real_feats_live.items()
+                    }
+                    if int(keep_sc["mask"].shape[0]) > 0:
+                        self.feature_scales.update(keep_sc)
                 if pool is not None:
                     keep = pool.nonzero(as_tuple=True)[0]
                     if keep.numel():
@@ -569,15 +886,39 @@ class CP2LPGenerator(Proteina):
                 idx = torch.arange(keep, device=batch["mask"].device).repeat_interleave(self.cp2lp_samples_per_cp)
                 cp_batch = slice_batch(cp_batch, idx, keep)
 
-            gen_batch, decoded, _ = self._generate_from_cp(cp_batch)
+            gen_batch, decoded, extras = self._generate(cp_batch)
             aux_loss, aux_metrics = self._generator_losses(gen_batch, decoded)
             g_loss = g_loss + aux_loss
             metrics.update(aux_metrics)
+            metrics.update(extras.get("metrics", {}))
             metrics["n_generated"] = torch.tensor(float(gen_batch["mask"].shape[0]))
+
+            # ---- arm C addon: local contrastive retention. Generator-side, and the only
+            # addon that changes the generator's objective rather than the discriminator's.
+            if self.nce is not None:
+                mask_g = gen_batch["mask"].bool()
+                src_dec = self._decode(gen_batch[SRC_CP_KEY], mask_g)
+                nce_loss, nce_metrics = self.nce(
+                    gen_atom37=decoded["coors_nm"],
+                    src_atom37=src_dec["coors_nm"].detach(),
+                    src_atom_mask=src_dec["atom_mask_eff"].detach(),
+                    pep_mask=mask_g,
+                    target_atom37=gen_batch["x_target"],
+                    target_atom_mask=gen_batch["target_mask"],
+                    target_mask=gen_batch["seq_target_mask"].bool(),
+                )
+                g_loss = g_loss + self.nce_weight * nce_loss
+                metrics.update(nce_metrics)
+                metrics["loss_nce_weighted"] = (self.nce_weight * nce_loss).detach()
 
             if self.adv_enabled:
                 fake_feats = self._featurize(decoded, gen_batch, gen_batch["mask"].bool())
-                if int(self.global_step) >= self.adv_warmup_steps:
+                # G UPDATES in one-pass mode, `global_step` in the legacy one. The legacy
+                # arms were trained and measured against `global_step`, and silently
+                # doubling their effective warmup would make a rerun differ from the runs
+                # docs/README_CP2LP.md reports. New mode, corrected counter.
+                progress = int(self.g_updates) if self.cp2lp_mode == "onepass" else int(self.global_step)
+                if progress >= self.adv_warmup_steps:
                     # The discriminator is a FIXED FUNCTION during the generator's step.
                     # Without this the generator's `-D(fake)` term backprops into D's own
                     # parameters and is still sitting there when the D optimizer steps --
@@ -587,7 +928,14 @@ class CP2LPGenerator(Proteina):
                     # gradient w.r.t. D's *inputs* (which is what the generator needs)
                     # flows regardless.
                     with self._frozen_discriminator():
-                        adv = hinge_g_loss(self.discriminator(fake_feats))
+                        # Arm B scores G through the SAME corruption D is trained under.
+                        # Scoring G on clean features while D only ever sees corrupted ones
+                        # would hand the generator gradient from a function D is not being
+                        # fit to, which is a different (and unadvertised) algorithm.
+                        # Gradient is preserved through the corruption -- it is an affine
+                        # map of the features, so it passes gradient to the generator.
+                        scored, level = self._maybe_corrupt(fake_feats)
+                        adv = hinge_g_loss(self.discriminator(scored, noise_level=level))
                     g_loss = g_loss + self.adv_weight * adv
                     metrics["loss_adv_g"] = adv.detach()
 
@@ -601,9 +949,13 @@ class CP2LPGenerator(Proteina):
             logger.warning(f"CP2LP: step {self.global_step} produced no differentiable generator loss; skipping backward.")
         if (batch_idx + 1) % accum == 0:
             self._step_optimizer(opt_g, tag="g")
+            self.g_updates += 1
             sch = self.lr_schedulers()
             if sch is not None:
                 (sch[0] if isinstance(sch, (list, tuple)) else sch).step()
+            self._maybe_save_milestone()
+            self._maybe_stop()
+        metrics["g_updates"] = self.g_updates.detach().float()
 
         # -------------------------------------------------- discriminator step
         if self.adv_enabled and fake_feats is not None and opt_d is not None:
@@ -613,6 +965,36 @@ class CP2LPGenerator(Proteina):
         metrics["loss_g_total"] = g_loss.detach()
         self._log_cp2lp(metrics, log_prefix, bs)
         return g_loss.detach()
+
+    def _maybe_corrupt(self, feats: dict) -> tuple[dict, torch.Tensor | None]:
+        """Arm B's corruption, or a pass-through. ``(features_to_score, noise_level)``.
+
+        Returns ``(feats, None)`` in every other arm, and the ``None`` is what a
+        ``noise_level_dim=0`` discriminator requires -- passing a zero level to a D that
+        has no such input raises rather than being silently ignored, which is the
+        behaviour that keeps the arms from drifting into each other.
+
+        Levels are drawn per example from the shared pool, i.i.d. for real and for fake.
+        The corruption is skipped entirely until the feature scales are frozen: before
+        that the standardisation would divide by an estimate made from a handful of
+        examples, and the amplitude would mean something different every step.
+        """
+        if self.dgan is None:
+            return feats, None
+        b = feats["mask"].shape[0]
+        device = feats["mask"].device
+        if self.feature_scales is None or not self.feature_scales.ready:
+            return feats, torch.zeros(b, device=device)
+        streams = self._streams()
+        level = self.dgan.sample_levels(b, device, cpu_generator=streams.cpu)
+        corrupted = self.dgan.corrupt(
+            feats,
+            scales=self.feature_scales,
+            levels=level,
+            col_masks=self.discriminator.continuous_column_masks(),
+            generator=streams.dev,
+        )
+        return corrupted, level
 
     def _discriminator_step(self, fake_feats: dict, opt_d, accum: int, batch_idx: int) -> dict:
         """Hinge update on LENGTH-MATCHED real/fake pairs.
@@ -636,16 +1018,35 @@ class CP2LPGenerator(Proteina):
         fake_det = {k: v[keep].detach() for k, v in fake_feats.items()}
 
         for _ in range(self.adv_d_steps):
-            real_logits = self.discriminator(real_feats)
-            fake_logits = self.discriminator(fake_det)
+            real_scored, real_level = self._maybe_corrupt(real_feats)
+            fake_scored, fake_level = self._maybe_corrupt(fake_det)
+            real_logits = self.discriminator(real_scored, noise_level=real_level)
+            fake_logits = self.discriminator(fake_scored, noise_level=fake_level)
             d_loss = hinge_d_loss(real_logits, fake_logits)
 
+            # The shortcut probe reads CLEAN features in every arm, including arm B. It is
+            # a cross-arm diagnostic, and a probe fed corrupted features in one arm only
+            # would not be comparable with the same number from the other four. It also
+            # stays detached from the trunk, so this choice does not shape anything.
             probe_loss = None
             probe_real = self.discriminator.probe_forward(real_feats)
             if probe_real is not None:
                 probe_fake = self.discriminator.probe_forward(fake_det)
                 probe_loss = hinge_d_loss(probe_real, probe_fake)
                 d_loss = d_loss + probe_loss
+
+            # ---- arm A addon: approximate R1, on REAL features only, D-side only.
+            if self.cp2lp_addon == "ar1":
+                penalty, ar1_metrics = approx_r1_penalty(
+                    self.discriminator,
+                    real_feats,
+                    scales=self.feature_scales,
+                    sigma_rel=self.ar1_sigma_rel,
+                    generator=self._streams().dev,
+                )
+                d_loss = d_loss + self.ar1_lambda * penalty
+                out.update(ar1_metrics)
+                out["loss_d_ar1_weighted"] = (self.ar1_lambda * penalty).detach()
 
             # Belt and braces beside the val_step guard at the top of `training_step`:
             # `d_loss` reaches the weights ONLY through the discriminator's parameters
@@ -668,6 +1069,40 @@ class CP2LPGenerator(Proteina):
         out["d_acc"] = torch.tensor(discriminator_accuracy(real_logits, fake_logits))
         out["d_real_logit"] = real_logits.detach().mean()
         out["d_fake_logit"] = fake_logits.detach().mean()
+
+        # ---- arm B: controller state, and the CLEAN diagnostics beside the corrupted ones.
+        # `d_acc` in this arm is accuracy on CORRUPTED features and falls as the controller
+        # raises the noise -- which is the controller working, not the discriminator losing.
+        # `d_acc_clean` is the number comparable with the other four arms, and it is also
+        # the guard against the failure mode where raising the noise becomes a way to stop
+        # D objecting to a chemically broken peptide.
+        if self.dgan is not None:
+            # The controller's statistic is the sign of the CORRUPTED real logits, as in
+            # the reference (its `run_D` diffuses before scoring, and `Loss/signs/real` is
+            # read off that output). Feeding it the clean logits would close the loop on a
+            # quantity the corruption does not affect, and the noise level would stop
+            # responding to the difficulty it is supposed to be controlling.
+            self.dgan.observe(real_logits)
+            out.update(self.dgan.maybe_adapt(int(self.global_step)))
+            out["dgan_level_real_mean"] = (
+                real_level.detach().mean() if real_level is not None else torch.tensor(0.0)
+            )
+            with torch.no_grad():
+                was = self.discriminator.training
+                self.discriminator.eval()
+                try:
+                    zero = torch.zeros(real_feats["mask"].shape[0], device=real_feats["mask"].device)
+                    zero_f = torch.zeros(fake_det["mask"].shape[0], device=fake_det["mask"].device)
+                    clean_real = self.discriminator(real_feats, noise_level=zero)
+                    clean_fake = self.discriminator(fake_det, noise_level=zero_f)
+                finally:
+                    if was:
+                        self.discriminator.train()
+            out["d_acc_clean"] = torch.tensor(discriminator_accuracy(clean_real, clean_fake))
+            out["d_real_logit_clean"] = clean_real.mean()
+            out["d_fake_logit_clean"] = clean_fake.mean()
+        if self.feature_scales is not None:
+            out.update({k: torch.tensor(v) for k, v in self.feature_scales.summary().items()})
         if probe_real is not None:
             # The shortcut number. Near 0.5 means the discriminator is judging peptides;
             # climbing towards 1.0 means it can tell the datasets apart from the receptor
@@ -675,6 +1110,63 @@ class CP2LPGenerator(Proteina):
             out["d_shortcut_probe_acc"] = torch.tensor(discriminator_accuracy(probe_real, probe_fake))
             out["loss_d_probe"] = probe_loss.detach()
         return out
+
+    def _maybe_stop(self) -> None:
+        """Ends the run at the configured GENERATOR-update budget, not at a global_step.
+
+        Asked of the Trainer rather than imposed with ``Trainer(max_steps=...)`` because
+        ``max_steps`` reads ``global_step``, which double-counts the adversarial arms. A
+        budget set that way would give the GAN arms half the generator training of the
+        control at the same nominal number -- which is exactly the confound this counter
+        exists to remove.
+        """
+        if self.max_g_updates and int(self.g_updates) >= self.max_g_updates:
+            if self.trainer is not None and not self.trainer.should_stop:
+                logger.info(
+                    f"CP2LP: reached the budget of {self.max_g_updates} generator updates "
+                    f"(global_step={int(self.global_step)}); stopping."
+                )
+                self.trainer.should_stop = True
+
+    def _maybe_save_milestone(self) -> None:
+        """Writes a RETAINED checkpoint at each configured G-update milestone.
+
+        The rolling ``last.ckpt`` is overwritten every ``last_ckpt_every_n_steps``, so
+        "evaluate at 1k, 5k and 10k updates" needs checkpoints that survive. Two reasons
+        this is done here rather than with another ``ModelCheckpoint``:
+
+        * ``every_n_train_steps`` triggers on ``global_step``, which is not the same
+          quantity in an adversarial arm as in the control -- the milestones would land at
+          different amounts of generator training in different arms, and the comparison
+          would silently stop being matched;
+        * the file naming then carries the number the comparison is indexed by.
+
+        Both a raw and an ``-EMA`` copy, matching the convention ``cp2lp_generate.py``
+        already expects, and produced through the EMA callback's own swap so the EMA file
+        holds EMA weights in ``state_dict`` rather than buried in the optimizer state.
+        """
+        n = int(self.g_updates)
+        if n not in self.eval_ckpt_g_updates or n in self._milestones_written or self.trainer is None:
+            return
+        self._milestones_written.add(n)
+        try:
+            import os
+
+            from proteinfoundation.utils.ema_callback import EMA
+
+            ckpt_dir = getattr(self.trainer.checkpoint_callback, "dirpath", None)
+            if not ckpt_dir:
+                logger.warning(f"CP2LP: no checkpoint dirpath; skipping the g={n} milestone.")
+                return
+            raw = os.path.join(ckpt_dir, f"g{n:06d}.ckpt")
+            self.trainer.save_checkpoint(raw)
+            ema_cb = next((c for c in self.trainer.callbacks if isinstance(c, EMA)), None)
+            if ema_cb is not None:
+                with ema_cb.save_ema_model(self.trainer):
+                    self.trainer.save_checkpoint(os.path.join(ckpt_dir, f"g{n:06d}-EMA.ckpt"))
+            logger.info(f"CP2LP: wrote the g={n} milestone checkpoint(s) to {ckpt_dir}")
+        except Exception as exc:  # a failed milestone must not kill a two-day run
+            logger.warning(f"CP2LP: could not write the g={n} milestone checkpoint: {exc!r}")
 
     def _step_optimizer(self, opt, tag: str) -> None:
         """Clips, NaN-guards and steps one optimizer.
@@ -768,15 +1260,32 @@ class CP2LPGenerator(Proteina):
             idx = torch.arange(bs, device=batch["mask"].device).repeat_interleave(samples_per_cp)
             batch = slice_batch(batch, idx, bs)
 
-        saved_nsteps = self.cp2lp_nsteps
-        saved_grad = self.cp2lp_grad_steps
-        try:
-            self.cp2lp_nsteps = int(nsteps) if nsteps is not None else saved_nsteps
-            self.cp2lp_grad_steps = 1
-            gen_batch, decoded, samples = self._generate_from_cp(batch)
-        finally:
-            self.cp2lp_nsteps = saved_nsteps
-            self.cp2lp_grad_steps = saved_grad
+        if self.cp2lp_mode == "onepass":
+            # EXPORT AND TRAINING GO THROUGH THE SAME FUNCTION. There is no sampler to fall
+            # back to here, and `nsteps` has no meaning -- it is accepted and ignored only
+            # because `cp2lp_generate.py` passes its default to both modes. Ignored loudly:
+            # a silently honoured `--nsteps 200` would imply an integration that does not
+            # happen, and the 24-vs-200-step discrepancy that made every training-side
+            # geometry number uninformative in the rollout arms is exactly what this mode
+            # removes.
+            if nsteps is not None and not getattr(self, "_warned_nsteps_ignored", False):
+                self._warned_nsteps_ignored = True
+                logger.warning(
+                    f"cp2lp.mode=onepass ignores nsteps={nsteps}: the editor is ONE network "
+                    "evaluation, not an ODE. Nothing on this path integrates."
+                )
+            gen_batch, decoded, _ = self.generate_onepass(batch)
+            samples = None
+        else:
+            saved_nsteps = self.cp2lp_nsteps
+            saved_grad = self.cp2lp_grad_steps
+            try:
+                self.cp2lp_nsteps = int(nsteps) if nsteps is not None else saved_nsteps
+                self.cp2lp_grad_steps = 1
+                gen_batch, decoded, samples = self._generate_from_cp(batch)
+            finally:
+                self.cp2lp_nsteps = saved_nsteps
+                self.cp2lp_grad_steps = saved_grad
 
         mask = gen_batch["mask"].bool()
         src_cp = self._decode(gen_batch[SRC_CP_KEY], mask)

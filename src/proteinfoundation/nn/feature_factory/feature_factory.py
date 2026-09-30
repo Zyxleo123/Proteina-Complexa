@@ -33,16 +33,19 @@ from proteinfoundation.nn.feature_factory.pair_feats import (
     XscBBCAPairwiseDistancesPairFeat,
     XtBBCAPairwiseDistancesPairFeat,
 )
+from proteinfoundation.cp2lp.conditioning import SRC_CP_KEY
 from proteinfoundation.nn.feature_factory.seq_cond_feats import (
     BinderCenterFeat,
     ChainBreakPerResidueSeqFeat,
     ChainIdxSeqFeat,
     ContactTypeSeqFeat,
     CyclizationTypeSeqFeat,
+    EditorNoiseSeqFeat,
     FoldEmbeddingSeqFeat,
     HotspotMaskSeqFeat,
     IdxEmbeddingSeqFeat,
     IdxEmbeddingSeqFeatGenie2,
+    SourceCPPresenceSeqFeat,
     StochasticTranslationSeqFeat,
     TimeEmbeddingPairFeat,
     TimeEmbeddingSeqFeat,
@@ -135,11 +138,20 @@ class FeatureFactory(torch.nn.Module):
                 - "cyclization_type_emb": Desired cyclization type, broadcast over residues
                   (requires CyclizationLabelTransform; UNSPECIFIED when absent)
 
+            Source-CP condition (CP -> LP generator):
+                - "x_src_cp_bb_ca": frozen encoded source-CP CA coordinates
+                - "x_src_cp_local_latents": frozen encoded source-CP per-residue latents
+                - "src_cp_present": whether a source CP is attached to this row
+                - "editor_noise_seq": per-residue invariant Gaussian channels, the one-pass
+                  editor's only source of randomness (zeros when absent)
+
         Pair features include:
             Distance features:
                 - "xt_bb_ca_pair_dists": Target backbone CA pairwise distances
                 - "x_sc_bb_ca_pair_dists": Self-conditioning backbone CA pairwise distances
                 - "x_recycle_bb_ca_pair_dists": Recycled backbone CA pairwise distances
+                - "x_src_cp_bb_ca_pair_dists": Source-CP internal CA pairwise distances
+                  (CP -> LP generator; frame-independent view of the CP being edited)
                 - "x_target_pair_dists": Target pairwise distances
                 - "ca_coors_nm_pair_dists": CA coordinates pairwise distances in nanometers
                 - "x1_bb_pair_dists_nm": Backbone pairwise distances in nanometers
@@ -257,6 +269,21 @@ class FeatureFactory(torch.nn.Module):
             elif f == "x_recycle_local_latents":
                 return XscLocalLatentsSeqFeat(mode_key="x_recycle", **kwargs)
 
+            # Source-CP condition (CP -> LP generator). Same tensor layout as `x_sc`, so
+            # the self-conditioning feature classes read it verbatim under another key --
+            # but it is a *persistent* condition, not the evolving state: see
+            # proteinfoundation/cp2lp/conditioning.py.
+            elif f == "x_src_cp_bb_ca":
+                return XscBBCASeqFeat(mode_key=SRC_CP_KEY, **kwargs)
+            elif f == "x_src_cp_local_latents":
+                return XscLocalLatentsSeqFeat(mode_key=SRC_CP_KEY, **kwargs)
+            elif f == "src_cp_present":
+                return SourceCPPresenceSeqFeat(**kwargs)
+            # The one-pass editor's randomness. Per-residue invariant scalars, so the same
+            # draw means the same thing in every frame. MUST be appended LAST in feats_seq.
+            elif f == "editor_noise_seq":
+                return EditorNoiseSeqFeat(**kwargs)
+
             # Structural features (angles)
             elif f == "x1_bb_angles":
                 return BackboneTorsionAnglesSeqFeat(**kwargs)
@@ -337,6 +364,11 @@ class FeatureFactory(torch.nn.Module):
                 return XscBBCAPairwiseDistancesPairFeat(**kwargs)
             elif f == "x_recycle_bb_ca_pair_dists":
                 return XscBBCAPairwiseDistancesPairFeat(mode_key="x_recycle", **kwargs)
+            elif f == "x_src_cp_bb_ca_pair_dists":
+                # The source CP's own internal geometry. This is the channel that makes
+                # the CP's *shape* (including its closed termini) legible to the network
+                # in a frame-independent way -- the seq feature alone is absolute coords.
+                return XscBBCAPairwiseDistancesPairFeat(mode_key=SRC_CP_KEY, **kwargs)
             elif f == "ca_coors_nm_pair_dists":
                 return CaCoorsNanometersPairwiseDistancesPairFeat(**kwargs)
             elif f == "optional_ca_pair_dist":

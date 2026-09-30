@@ -1,0 +1,224 @@
+# @package _global_
+# SHARED BASE for the one-pass CP -> LP editor. NOT AN ARM -- nothing is launched from
+# this file directly. Six thin children differ from it by a handful of lines each:
+#
+#   training_cp2lp_onepass_warmup.yaml        the common fork (adversary off, 300 G updates)
+#   training_cp2lp_onepass_contactonly.yaml   adversary off            -- is the GAN worth it?
+#   training_cp2lp_onepass_gan.yaml           adversary on, addon none -- THE REFERENCE
+#   training_cp2lp_onepass_gan_ar1.yaml       + approximate R1
+#   training_cp2lp_onepass_gan_noise.yaml     + adaptive discriminator noise
+#   training_cp2lp_onepass_gan_nce.yaml       + local contrastive retention
+#
+# Every addon is measured against `onepass_gan`, never against another addon, and no arm
+# inherits another's addon. Editing THIS file moves all six together, which is what keeps
+# each comparison single-variable for free.
+#
+# ----------------------------------------------------------------------------------
+# WHAT CHANGED FROM THE ROLLOUT ARMS, AND WHY.
+#
+# The rollout generator integrated a 24-step differentiable trajectory and exported from a
+# 200-step sampler. MEASURED consequence (docs/README_CP2LP.md, "the geometry tell"):
+# generated peptides carried backbone bond deviations of 0.058-1.93 nm against real LPs'
+# 0.0010-0.0205 -- completely disjoint distributions, generated minimum 3.3x above the real
+# maximum, on 0 of 40,133 batches did they overlap. A single scalar threshold separated the
+# classes perfectly for the whole run, so the discriminator was a broken-backbone detector
+# and `d_acc` reached 0.9995 no matter how much `d_lr` was cut.
+#
+# The cause was structural: fakes came out of a 24-step rollout, reals out of a clean AE
+# round trip. The one-pass editor removes the asymmetry rather than correcting for it --
+# both classes now pass through exactly one AE round trip and nothing else.
+#
+# ----------------------------------------------------------------------------------
+# GENERATOR UPDATES, NOT `global_step`. MEASURED (lightning 2.5.6, manual optimization,
+# accum 8, 64 batches): with one optimizer `global_step` reads 8 after 8 generator updates;
+# with two it reads 16. This arm steps two optimizers, so `global_step` counts G+D and an
+# adversarial arm advances it twice as fast as the control. Every budget, milestone and
+# warmup here is therefore in `cp2lp.max_g_updates` / `eval_checkpoint_g_updates`, which
+# count generator updates only. `train/cp2lp_g_updates` is logged so plots can be x-axed on
+# the comparable quantity.
+#
+# Run:
+#   bash scripts/submit_cp2lp_onepass.sh --submit smoke
+#   bash scripts/submit_cp2lp_onepass.sh --submit warmup     # then pin the fork
+#   bash scripts/submit_cp2lp_onepass.sh --submit arms
+
+defaults:
+  - /example/training_cp2lp_gan
+  - _self_
+
+run_name: cp2lp_onepass_base
+
+# The COMMON FORK, produced by the warmup stage and pinned by
+# scripts/pin_cp2lp_fork.sh. All five arms start from these exact weights, including the
+# discriminator's random initialisation, so nothing in an addon comparison can be explained
+# by a different warmup. The warmup config overrides this back to the lpmix init.
+pretrain_ckpt_path: /zfsauton/scratch/yixiz/Proteina-Complexa/training_runs/store/cp2lp_onepass_fork/cp2lp_onepass_fork.ckpt
+
+log:
+  wandb_project: cpsea_cp2lp
+  last_ckpt_every_n_steps: 250
+
+nn:
+  # The residual readouts. Zero-initialised, so the editor's first output is exactly the AE
+  # round trip of the source CP -- the identity edit. Without this the trunk emits only a
+  # flow VELOCITY, and reading that as an edit displacement would start every arm at
+  # `x_src + v(x_src, 0.5)`, an arbitrary jump.
+  enable_editor_residual: true
+  # Width of the invariant noise block. Must equal `cp2lp.onepass.noise_channels`; the
+  # module raises at startup if they disagree.
+  editor_noise_channels: 16
+
+  # feats_seq is redeclared in full because Hydra REPLACES lists rather than merging them.
+  # `editor_noise_seq` is LAST: each feature factory concatenates in list order and
+  # projects with one Linear, and `_splice_pretrained_weights` copies the overlapping
+  # LEADING columns -- so appending preserves every pretrained feature's weights and
+  # zero-initialises only the new ones. Inserting anywhere else silently re-binds trained
+  # weights to the wrong inputs.
+  feats_seq:
+    - xt_bb_ca
+    - xt_local_latents
+    - x_sc_bb_ca
+    - x_sc_local_latents
+    - optional_ca_coors_nm_seq_feat
+    - optional_res_type_seq_feat
+    - hotspot_mask_seq
+    - res_seq_pdb_idx
+    - x_src_cp_bb_ca
+    - x_src_cp_local_latents
+    - src_cp_present
+    # --- appended: the editor's randomness. Per-residue INVARIANT Gaussian channels, so
+    # one draw means the same thing in every frame. An untransformed random Cartesian
+    # vector would be read as geometry by a trunk that consumes absolute coordinates.
+    - editor_noise_seq
+  # Unchanged from the GAN arm; restated so a future edit to one list cannot desynchronise
+  # the two.
+  feats_pair_repr:
+    - rel_seq_sep
+    - xt_bb_ca_pair_dists
+    - x_sc_bb_ca_pair_dists
+    - optional_ca_pair_dist
+    - chain_idx_pair
+    - hotspot_mask_pair
+    - cyclization_ring_pe
+    - x_src_cp_bb_ca_pair_dists
+
+val_generation:
+  # OFF. `val_generation` samples CYCLIC peptides with the 400-step deployed sampler to
+  # score CPSea generation quality -- a question about the pretrained trunk, not about the
+  # editor, and it would cost a large share of a 10k-update pilot in all six runs. The
+  # validation LOSS pass still runs (it delegates to the parent) and is worth keeping: it is
+  # the only instrument that would show the trunk forgetting its flow behaviour.
+  enabled: false
+
+cp2lp:
+  # THE SWITCH. `onepass` = the direct editor. `rollout` = the legacy differentiable
+  # trajectory, kept for the historical comparison and not part of this tranche.
+  mode: onepass
+
+  onepass:
+    # Fed to the trunk's time embedding and held there. NOT a sampling time: nothing
+    # integrates, and there is no velocity-to-clean conversion on this path. 0.5 is
+    # mid-schedule -- the region the pretrained trunk saw most of, and furthest from both
+    # degenerate ends (t->1 blows up the `1/(1-t)` factors in the flow machinery; t=0 tells
+    # the trunk its input is pure noise, which an encoded source CP is not).
+    t_fixed: 0.5
+    noise_channels: 16
+    # Small NONZERO input weights for the noise columns, set after the pretrained splice.
+    # The splice zero-fills appended columns, and with the residual heads also at zero the
+    # trunk would get no gradient on step one -- the noise would only become readable after
+    # the heads had moved, so the editor would learn a deterministic edit first and
+    # discover its random input later.
+    noise_adapter_std: 0.02
+
+  # No addon in the base. Each arm sets exactly one; the module rejects any addon without
+  # an adversary, and rejects anything outside none|ar1|noise|nce.
+  addon: none
+
+  # THE REAL-LP FLOW TERM IS OFF, and must be: it supervises a velocity field, and the
+  # editor's readouts are residual heads the term does not reach. Nothing replaces it --
+  # no identity loss, no distillation, no reconstruction objective. Real bound LPs still
+  # arrive every batch and are still the discriminator's real class, which is the role they
+  # have in this mode. The module raises if this is nonzero with mode=onepass.
+  real_lp_flow_weight: 0.0
+
+  # Unchanged from the rollout arms, deliberately: the memory envelope is far smaller here
+  # (one forward instead of 24, no retained trajectory), but holding the source-CP load
+  # fixed keeps "how many LPs per CP, from how many CPs" the same question it was, and
+  # samples_per_cp > 1 is what makes the within-parent diversity column meaningful.
+  max_cp_per_step: 2
+  samples_per_cp: 2
+
+  adversarial:
+    enabled: true
+    weight: 0.3
+    d_lr: 5.0e-5
+    d_steps_per_g: 1
+    # In GENERATOR updates in this mode (`global_step` in the legacy one -- see the header).
+    warmup_g_steps: 300
+
+  # ---- addon settings. Read only by the arm that enables the addon; inert elsewhere.
+  ar1:
+    # 10, not the paper's 100. arXiv:2501.08316 uses lambda=100 with sigma=0.01 (images) or
+    # 0.1 (video) on a large critic whose logits have their own scale. This discriminator is
+    # three transformer layers over <=16 residues against a hinge loss whose terms are O(1),
+    # so the weighted penalty has to stay commensurate with it. A PILOT VALUE:
+    # `loss_d_ar1_weighted` is logged beside `loss_d` so the ratio can be read off a run.
+    lambda: 10.0
+    # RELATIVE to each channel's own standard deviation, unlike the paper's absolute sigma.
+    # These feature blocks mix nm distances (~0.2-3.0), dihedral components (-1..1) and soft
+    # contact counts (0..~40); one absolute sigma is a rounding error on one and a scramble
+    # of another.
+    sigma_rel: 0.01
+  dgan:
+    # Maximum injected standard deviation, in units of a channel's own std. The controller
+    # moves the eligible RANGE up to this, as the reference moves `T`.
+    max_std: 0.2
+    n_levels: 32
+    pool_size: 64
+    # The reference's own starting value for the `mean(sign(real_logits))` target.
+    target_sign: 0.6
+    # Examples to traverse the whole range of `p`. The reference uses 100k (ada_kimg=100),
+    # sized for batches of 32-64 images; a D step here scores a handful of length-matched
+    # pairs, so 100k would be tens of thousands of updates and `p` would never move inside a
+    # 10k-update pilot. PILOT VALUE -- `dgan_p` is logged.
+    adapt_rate_examples: 5000.0
+    adapt_every_n_steps: 4
+    p_init: 0.0
+    noise_level_dim: 16
+  nce:
+    # CUT's own temperature. Its weight there is 1.0 against an image GAN loss; 0.1 here
+    # because this term is added to a generator objective whose other five terms are already
+    # competing for a clipped gradient budget. MEASURED at initialisation on synthetic
+    # chains: the loss is monotone in the perturbation amplitude (1.39 / 1.40 / 1.58 / 1.66
+    # for 0 / 0.05 / 0.2 / 0.6 nm of noise, 8 positions) but its FLOOR is ~1.4, not 0 -- a
+    # random projection makes all descriptors nearly collinear. Read changes in it, never
+    # its absolute value.
+    weight: 0.1
+    temperature: 0.07
+    proj_dim: 64
+    use_projection: true
+    max_positions: 16
+    k_neighbors: 8
+    # The first and last two residues are never scored. Opening the ring IS the task, so
+    # asking the termini to keep their local environment is asking the edit not to happen.
+    exclude_terminal: 2
+  feature_scales:
+    # Frozen after this many real LPs, then never updated: both noise-related addons define
+    # their amplitude in units of these scales, so an estimate that keeps moving makes the
+    # effective amplitude drift for reasons unrelated to the controller.
+    min_examples: 128
+    std_floor: 1.0e-3
+
+  # ---- budgets, in GENERATOR updates. The counter is a persistent buffer, so it is
+  # inherited from the fork (300) and survives a requeue. The arms are therefore offset by
+  # the warmup: 10300 is 10,000 post-warmup updates, and the fork itself IS the g=300
+  # evaluation point the comparison starts from. `g_updates` is logged at fit start so the
+  # job log states which number the run actually began at.
+  max_g_updates: 10300
+  eval_checkpoint_g_updates: [1300, 5300, 10300]
+
+opt:
+  lr: 5.0e-5
+  warmup_steps: 500
+  # Validation loss only (val_generation is off above), so this can be frequent and cheap.
+  val_check_interval: 2500

@@ -2490,11 +2490,14 @@ class Proteina(L.LightningModule):
         # Rosetta sidecar: dump a capped sample of complexes to disk so a SEPARATE CPU job can score
         # interface dG offline (see eval/val_gen_dump.py). OFF unless `val_generation.rosetta_dump_dir`
         # is set. dG never runs on this GPU path -- it would stall training for minutes per batch.
-        # Never dumped from the sequence-conditioned pass: the sidecar writes one flat pool of
-        # complexes keyed by step, so mixing conditioned and unconditioned samples would give a
-        # dG distribution that is an average over two different experiments with no way to
-        # separate them after the fact.
-        dump_dir = None if seq_cond else vg.get("rosetta_dump_dir", None)
+        # Never dumped from the sequence-conditioned pass DURING TRAINING: the sidecar writes one
+        # flat pool of complexes keyed by step, so mixing the conditioned and unconditioned passes
+        # (both fire each validation) would give a dG distribution that averages two different
+        # experiments with no way to separate them after the fact. A standalone eval that runs ONLY
+        # the seq-cond pass has no such pool to pollute, so it may opt in with
+        # `val_generation.rosetta_dump_seqcond: true` (default False -> training behaviour intact).
+        allow_seqcond_dump = bool(vg.get("rosetta_dump_seqcond", False))
+        dump_dir = vg.get("rosetta_dump_dir", None) if (not seq_cond or allow_seqcond_dump) else None
         if dump_dir:
             from proteinfoundation.eval.val_gen_dump import dump_val_gen_complexes
 

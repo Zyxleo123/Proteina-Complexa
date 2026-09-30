@@ -1,0 +1,44 @@
+# @package _global_
+# THE COMMON FORK. One short run with the shared non-adversarial losses; all five arms
+# start from its checkpoint.
+#
+# WHY A SEPARATE RUN AND NOT A PER-ARM WARMUP. Five arms each doing their own 300-update
+# warmup would differ by 300 updates of independently-seeded training before the addon was
+# ever switched on, and that difference is a live alternative explanation for any addon
+# result. Forking from one saved checkpoint removes it -- including for the discriminator,
+# which is built in every arm (`cp2lp.enabled` builds it regardless of
+# `adversarial.enabled`) and therefore lands in this checkpoint with its random
+# initialisation, so the four GAN arms get the SAME initial D rather than the same seed and
+# a hope that nothing upstream consumed a different number of random draws.
+#
+# The adversary is off here, so these 300 updates are pure contact/sequence/geometry/clash/
+# opening -- a sane starting structure before any critic has an opinion. This is TRAINING,
+# not a preflight gate: it produces weights, and the smoke is what gates on correctness.
+#
+# After it finishes:
+#   bash scripts/pin_cp2lp_fork.sh
+# which snapshots `last.ckpt` to the path the base config's `pretrain_ckpt_path` names. A
+# pin, not a live path: `last.ckpt` is rewritten every 250 steps, so five arms launched
+# minutes apart would otherwise start from different weights -- and a job that read during
+# a write would load a torn file.
+
+defaults:
+  - /example/training_cp2lp_onepass
+  - _self_
+
+run_name: cp2lp_onepass_fork
+
+# Back to the LP-MIXING init: the fork is what produces the fork, so it cannot start from
+# it. This is the only checkpoint pairing that works -- `local_latents` is DEFINED by the
+# autoencoder, and cpsea_lpmix_from_v4cfg is the only CPSea flow run trained against the
+# shared LP/CP AE (and the only one arriving with the LINEAR topology token trained).
+pretrain_ckpt_path: /zfsauton/scratch/yixiz/Proteina-Complexa/training_runs/store/cpsea_lpmix_from_v4cfg/cp2lp_init.ckpt
+
+cp2lp:
+  adversarial:
+    enabled: false
+  addon: none
+  # 300 GENERATOR updates. Every arm then inherits this count, which is why their budgets
+  # read 10300 rather than 10000 and why the fork is the g=300 evaluation point.
+  max_g_updates: 300
+  eval_checkpoint_g_updates: [300]

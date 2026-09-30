@@ -52,16 +52,37 @@ _cp2lp_defaults() {
   EVAL_META="${EVAL_META:-${LPDATA}/cp2lp_eval.parquet}"
   EVAL_REAL_META="${EVAL_REAL_META:-${LPDATA}/cp2lp_eval_real_lp.parquet}"
 
-  ARM="${ARM:-gan}"                       # gan | contactonly
+  ARM="${ARM:-gan}"
   case "${ARM}" in
     # These MUST track `run_name` in the configs: cp2lp_train.sbatch passes
     # `++run_name=${RUN_NAME}`, a Hydra override, which beats the yaml. Leaving them at a
     # previous version silently points a new config's run at the OLD run directory and
     # overwrites its checkpoints and wandb history -- the only record of the arm you are
-    # comparing against.
+    # comparing against. Guarded by `test_preamble_run_names_track_the_configs`.
+    #
+    # --- legacy rollout arms (differentiable trajectory, 200-step export). Kept so the
+    # three measured generations in docs/README_CP2LP.md stay reproducible.
     gan)         CONFIG_NAME="${CONFIG_NAME:-example/training_cp2lp_gan}";          RUN_NAME="${RUN_NAME:-cp2lp_gan_v2}" ;;
     contactonly) CONFIG_NAME="${CONFIG_NAME:-example/training_cp2lp_contactonly}";  RUN_NAME="${RUN_NAME:-cp2lp_contactonly_v2}" ;;
+    # --- one-pass direct editor: the common fork, then the five disjoint arms.
+    onepass_warmup)      CONFIG_NAME="${CONFIG_NAME:-example/training_cp2lp_onepass_warmup}";      RUN_NAME="${RUN_NAME:-cp2lp_onepass_fork}" ;;
+    onepass_contactonly) CONFIG_NAME="${CONFIG_NAME:-example/training_cp2lp_onepass_contactonly}"; RUN_NAME="${RUN_NAME:-cp2lp_onepass_contactonly}" ;;
+    onepass_gan)         CONFIG_NAME="${CONFIG_NAME:-example/training_cp2lp_onepass_gan}";         RUN_NAME="${RUN_NAME:-cp2lp_onepass_gan}" ;;
+    onepass_gan_ar1)     CONFIG_NAME="${CONFIG_NAME:-example/training_cp2lp_onepass_gan_ar1}";     RUN_NAME="${RUN_NAME:-cp2lp_onepass_gan_ar1}" ;;
+    onepass_gan_noise)   CONFIG_NAME="${CONFIG_NAME:-example/training_cp2lp_onepass_gan_noise}";   RUN_NAME="${RUN_NAME:-cp2lp_onepass_gan_noise}" ;;
+    onepass_gan_nce)     CONFIG_NAME="${CONFIG_NAME:-example/training_cp2lp_onepass_gan_nce}";     RUN_NAME="${RUN_NAME:-cp2lp_onepass_gan_nce}" ;;
     *)           CONFIG_NAME="${CONFIG_NAME:-example/training_cp2lp_gan}";          RUN_NAME="${RUN_NAME:-cp2lp_${ARM}}" ;;
+  esac
+
+  # The five one-pass arms all start from THIS checkpoint, produced by the warmup stage and
+  # snapshotted by scripts/pin_cp2lp_fork.sh. The warmup itself starts from FLOW_CKPT (the
+  # lpmix pin) -- it is what produces the fork, so it cannot start from it.
+  FORK_RUN="${FORK_RUN:-cp2lp_onepass_fork}"
+  FORK_CKPT="${FORK_CKPT:-${STORE}/${FORK_RUN}/${FORK_RUN}.ckpt}"
+  case "${ARM}" in
+    onepass_warmup) INIT_CKPT="${INIT_CKPT:-${FLOW_CKPT}}" ;;
+    onepass_*)      INIT_CKPT="${INIT_CKPT:-${FORK_CKPT}}" ;;
+    *)              INIT_CKPT="${INIT_CKPT:-${FLOW_CKPT}}" ;;
   esac
 
   WANDB_PROJECT="${WANDB_PROJECT:-cpsea_cp2lp}"
@@ -74,6 +95,18 @@ _cp2lp_defaults() {
   GEN_SAMPLES_PER_CP="${GEN_SAMPLES_PER_CP:-4}"
   GEN_SEEDS="${GEN_SEEDS:-0,1}"
   GEN_BATCH="${GEN_BATCH:-4}"
+
+  # The one-pass comparison's fixed evaluation manifest: 64 held-out CP parents, 8 fixed
+  # noise seeds each, identical in every arm. `GEN_NSTEPS` is meaningless for a one-pass
+  # editor (nothing integrates) and is ignored with a warning on that path.
+  EVAL_N_CP="${EVAL_N_CP:-64}"
+  EVAL_SEEDS="${EVAL_SEEDS:-0,1,2,3,4,5,6,7}"
+  EVAL_SAMPLES_PER_CP="${EVAL_SAMPLES_PER_CP:-1}"
+  EVAL_BATCH="${EVAL_BATCH:-8}"
+  # Which milestone to evaluate. `last-EMA` is the end of the run; the numbered files are
+  # the retained G-update milestones the module writes (g001300, g005300, g010300).
+  EVAL_CKPT_TAG="${EVAL_CKPT_TAG:-last-EMA}"
+  EVAL_MANIFEST="${EVAL_MANIFEST:-${LPDATA}/cp2lp_eval64.parquet}"
 
   TRIPLET_ROOT="${TRIPLET_ROOT:-${STORE}/cp2lp_triplets}"
   REFERENCE_DIR="${REFERENCE_DIR:-${TRIPLET_ROOT}/real_reference}"
@@ -92,7 +125,8 @@ _cp2lp_banner() {
   echo "config   : ${CONFIG_NAME}"
   echo "run_name : ${RUN_NAME}"
   echo "AE       : ${AE_CKPT}"
-  echo "flow init: ${FLOW_CKPT}"
+  echo "flow init: ${INIT_CKPT}"
+  [[ "${INIT_CKPT}" != "${FLOW_CKPT}" ]] && echo "  (fork)   : lpmix pin is ${FLOW_CKPT}"
   echo "train    : ${TRAIN_META}"
   echo "eval     : ${EVAL_META}"
   echo "request  : ${SLURM_JOB_PARTITION:-?} gres=${SLURM_JOB_GRES:-?} cpus=${SLURM_CPUS_PER_TASK:-?} mem=${SLURM_MEM_PER_NODE:-?}"
@@ -119,16 +153,23 @@ _cp2lp_preflight() {
 # The flow init is checked separately: a training job cannot start without it, but a
 # generate/report job does not need it at all.
 _cp2lp_preflight_flow_ckpt() {
-  [[ -f "${FLOW_CKPT}" ]] || {
-    echo "ERROR: missing flow init checkpoint: ${FLOW_CKPT}" >&2
-    echo "       This must be a CPSea flow run trained against ${AE_CKPT}." >&2
+  [[ -f "${INIT_CKPT}" ]] || {
+    echo "ERROR: missing init checkpoint: ${INIT_CKPT}" >&2
+    case "${ARM}" in
+      onepass_warmup) echo "       This must be a CPSea flow run trained against ${AE_CKPT}." >&2 ;;
+      onepass_*)      echo "       This is the COMMON FORK. Run the warmup, then pin it:" >&2
+                      echo "         bash scripts/submit_cp2lp_onepass.sh --submit warmup" >&2
+                      echo "         bash scripts/pin_cp2lp_fork.sh" >&2 ;;
+      *)              echo "       This must be a CPSea flow run trained against ${AE_CKPT}." >&2 ;;
+    esac
     return 1
   }
   # A checkpoint whose AE differs from the one being loaded is the failure mode that
   # produces plausible-looking losses and meaningless geometry, so say which pair is in
   # use rather than only that the file exists.
-  echo "[preflight] flow init: ${FLOW_CKPT}"
-  echo "[preflight] AE       : ${AE_CKPT}"
+  echo "[preflight] init: ${INIT_CKPT}"
+  echo "[preflight] AE  : ${AE_CKPT}"
+  [[ -f "${INIT_CKPT}.source" ]] && sed 's/^/[preflight]   /' "${INIT_CKPT}.source"
   return 0
 }
 

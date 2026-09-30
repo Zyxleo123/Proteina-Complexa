@@ -1,0 +1,39 @@
+# @package _global_
+# ARM C: local contrastive retention, and nothing else.
+#
+# One generator-side term. For each selected interior residue, a continuous invariant local
+# descriptor (backbone distances at sequence offsets +-1..3, three backbone bond lengths,
+# and distances to the SAME source-selected pocket neighbours) is projected and normalised;
+# the generated residue i must be classified against its own source residue i among the
+# other selected residues of the same peptide. Adapted from CUT's PatchNCE -- the
+# formulation, the within-peptide negatives, the masked diagonal, temperature 0.07 and the
+# two-layer projection with L2 normalisation -- not its image generator.
+#
+# The residue-index correspondence is EXACT here in a way it never is for images: CP and LP
+# share a length and a sequence, so residue i is the same residue in both, and CUT's patch
+# sampling is unnecessary.
+#
+# Residue IDENTITY is deliberately absent from the descriptor. The sequence is pinned by
+# another term, so a descriptor containing it would let the task be solved by reading the
+# sequence and the term would preserve no geometry.
+#
+# The first and last two residues are never scored and no wrap-around neighbour enters the
+# descriptor: opening the ring is the task, and a descriptor that encoded the closing bond
+# would ask for the macrocycle back.
+#
+# MEASURED at initialisation: the loss is monotone in how far the generated structure is
+# from the source, but its floor is ~1.4 rather than 0, because a random projection leaves
+# all descriptors nearly collinear. Read changes in `nce_loss`, never its absolute value.
+# `nce_n_scored` is the number to check first if the term looks inert.
+#
+# The original contact loss is unchanged; no R1, no discriminator noise. Differs from
+# `training_cp2lp_onepass_gan.yaml` in one line.
+
+defaults:
+  - /example/training_cp2lp_onepass
+  - _self_
+
+run_name: cp2lp_onepass_gan_nce
+
+cp2lp:
+  addon: nce   # <- THE ONE LINE

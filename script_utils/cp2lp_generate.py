@@ -27,6 +27,7 @@ import argparse
 import json
 import math
 import sys
+import time
 from pathlib import Path
 
 import torch
@@ -45,7 +46,21 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--n-cp", type=int, default=200, help="Number of source CPs to draw. -1 for all.")
     p.add_argument("--samples-per-cp", type=int, default=4, help="LPs generated per CP per seed.")
     p.add_argument("--seeds", default="0", help="Comma-separated noise seeds; each is a separate pass.")
-    p.add_argument("--nsteps", type=int, default=200, help="ODE steps for the deployed sampler.")
+    p.add_argument(
+        "--nsteps",
+        type=int,
+        default=200,
+        help="ODE steps for the deployed sampler. IGNORED for a one-pass checkpoint "
+        "(cp2lp.mode=onepass): the editor is one network evaluation and nothing integrates.",
+    )
+    p.add_argument(
+        "--expect-parents",
+        type=int,
+        default=None,
+        help="Number of source CPs the manifest is supposed to contain. Checked against "
+        "what the dataloader actually yielded, so a shuffled or last-batch-dropping loader "
+        "cannot quietly shrink the evaluation set.",
+    )
     p.add_argument("--batch-size", type=int, default=4, help="Source CPs per forward.")
     p.add_argument("--write-rejected", action="store_true", help="Also write PDBs for rejected samples.")
     p.add_argument(
@@ -131,10 +146,33 @@ def main() -> int:
     device = torch.device(args.device)
     model.to(device).eval()
 
+    # ONE-PASS checkpoints have no sampler to configure. Passing None keeps the module from
+    # warning on every batch, and makes `nsteps: null` the honest value in the summary --
+    # recording 200 there would imply an integration that did not happen.
+    onepass = getattr(model, "cp2lp_mode", "rollout") == "onepass"
+    nsteps = None if onepass else args.nsteps
+    # Recorded so a comparison table can state the budget each arm was evaluated at.
+    # `global_step` is NOT that budget: under manual optimization it counts G+D optimizer
+    # steps, so an adversarial arm reaches a given value with half the generator updates of
+    # the control. `g_updates` is the comparable quantity.
+    g_updates = int(model.g_updates) if hasattr(model, "g_updates") else None
+    logger.info(
+        f"mode={'onepass' if onepass else 'rollout'} addon={getattr(model, 'cp2lp_addon', 'n/a')} "
+        f"adversarial={getattr(model, 'adv_enabled', 'n/a')} g_updates={g_updates}"
+    )
+
     loader = datamodule.val_dataloader()
     n_batches = len(loader) if args.n_cp < 0 else math.ceil(args.n_cp / max(1, args.batch_size))
 
-    totals = {"n_samples": 0, "n_accepted": 0}
+    totals = {"n_samples": 0, "n_accepted": 0, "n_parents_seen": 0}
+    # COST, recorded because the addons need different amounts of computation and the
+    # comparison has to report that separately from quality rather than pretending the arms
+    # cost the same. `n_generation_calls` is the network-evaluation count per sample: 1 for
+    # the one-pass editor by construction, `nsteps` for the rollout sampler -- the single
+    # number that says the two modes are not the same kind of generator.
+    t_gen = 0.0
+    if torch.cuda.is_available() and device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats()
     for seed in seeds:
         seed_dir = out_dir / f"seed{seed}"
         seed_dir.mkdir(parents=True, exist_ok=True)
@@ -148,6 +186,8 @@ def main() -> int:
 
             batch = {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in batch.items()}
             source_ids = list(batch.get("example_id", [f"batch{bidx}_i{i}" for i in range(batch["mask"].shape[0])]))
+            if seed == seeds[0]:
+                totals["n_parents_seen"] += len(source_ids)
 
             if args.reference_mode:
                 # Real LPs: encode, decode, measure. Same round trip the discriminator's
@@ -170,12 +210,16 @@ def main() -> int:
                 logger.info(f"reference batch={bidx + 1}/{n_batches}: measured {summary['n_real']}")
                 continue
 
+            _t0 = time.perf_counter()
             result = model.generate_lp_for_cp(
                 batch,
-                nsteps=args.nsteps,
+                nsteps=nsteps,
                 samples_per_cp=args.samples_per_cp,
                 seed=seed * 100003 + bidx,  # distinct per (seed, shard), reproducible
             )
+            if device.type == "cuda":
+                torch.cuda.synchronize()  # or the timing measures queueing, not compute
+            t_gen += time.perf_counter() - _t0
             summary = export_triplets(
                 out_dir=str(seed_dir),
                 result=result,
@@ -194,8 +238,39 @@ def main() -> int:
             )
 
     totals["acceptance_rate"] = totals["n_accepted"] / max(1, totals["n_samples"])
+    if args.expect_parents is not None and totals["n_parents_seen"] != args.expect_parents:
+        # Loud, and not fatal: the triplets are still valid, but every per-parent statistic
+        # in the comparison is over a different denominator than the one that was asked for.
+        logger.warning(
+            f"MANIFEST MISMATCH: saw {totals['n_parents_seen']} source CPs, expected "
+            f"{args.expect_parents}. Check the loader is not shuffling or dropping a last "
+            "partial batch -- the arms must be compared on identical parents."
+        )
     with open(out_dir / "generate_summary.json", "w") as f:
-        json.dump({**totals, "seeds": seeds, "ckpt": str(ckpt_path)}, f, indent=2)
+        json.dump(
+            {
+                **totals,
+                "seeds": seeds,
+                "ckpt": str(ckpt_path),
+                "mode": "onepass" if onepass else "rollout",
+                "addon": getattr(model, "cp2lp_addon", None),
+                "adversarial": bool(getattr(model, "adv_enabled", False)),
+                "g_updates": g_updates,
+                "nsteps": nsteps,
+                "samples_per_cp": args.samples_per_cp,
+                "expect_parents": args.expect_parents,
+                "generation_seconds_total": round(t_gen, 3),
+                "seconds_per_output": round(t_gen / max(1, totals["n_samples"]), 4),
+                "n_generation_calls_per_sample": 1 if onepass else (nsteps or 0),
+                "peak_gpu_gib": (
+                    round(torch.cuda.max_memory_allocated() / 2**30, 3)
+                    if device.type == "cuda" and torch.cuda.is_available()
+                    else None
+                ),
+            },
+            f,
+            indent=2,
+        )
     logger.info(f"CP2LP generate done: {totals}")
     return 0
 

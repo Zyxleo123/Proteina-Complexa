@@ -1,0 +1,31 @@
+# @package _global_
+# ARM A: approximate R1, and nothing else.
+#
+# A discriminator-only penalty on D's sensitivity to a small perturbation of REAL features:
+#
+#     loss_ar1 = mean((D(real + eps) - D(real))**2)
+#     loss_D   = hinge_D + lambda_ar1 * loss_ar1
+#
+# Adapted from the Adversarial Post-Training paper (arXiv:2501.08316, eq. 9-10), whose
+# point is that this is a finite-difference stand-in for R1's ||grad_x D(x)||^2 and needs no
+# second-order backward. Real samples only, as there.
+#
+# FEATURE-SPACE, NOT COORDINATE-SPACE. The perturbation goes on the discriminator's
+# continuous feature channels -- peptide geometry and interface distances -- and never on
+# sequence probabilities, one-hot pocket identity, padding or the terminal flags. Gaussian
+# noise on a one-hot is not a nearby real sample.
+#
+# `lambda: 10` and `sigma_rel: 0.01` live in the shared base and are PILOT VALUES, not a
+# validated protein optimum: the paper's lambda is 100 against a much larger critic.
+#
+# No discriminator noise, no contrastive term. Compared against
+# `training_cp2lp_onepass_gan.yaml`, from which it differs in one line.
+
+defaults:
+  - /example/training_cp2lp_onepass
+  - _self_
+
+run_name: cp2lp_onepass_gan_ar1
+
+cp2lp:
+  addon: ar1   # <- THE ONE LINE

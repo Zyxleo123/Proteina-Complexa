@@ -1,0 +1,18 @@
+# @package _global_
+# THE REFERENCE ARM: the direct one-pass editor with a plain hinge GAN and no addon.
+#
+# Every addon arm is compared against THIS, not against the previous addon and not against
+# the rollout generation. It differs from the shared base
+# (`training_cp2lp_onepass.yaml`) in `run_name` alone -- the base already carries
+# `adversarial.enabled: true` and `addon: none` -- so anything changed in the base moves
+# this arm and the other four together.
+#
+# Its own control is `training_cp2lp_onepass_contactonly.yaml`, which differs from this
+# file in ONE line. That pair answers "does adversarial learning help at all"; the addon
+# arms answer "does this particular addition help the adversary".
+
+defaults:
+  - /example/training_cp2lp_onepass
+  - _self_
+
+run_name: cp2lp_onepass_gan

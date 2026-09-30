@@ -1,0 +1,34 @@
+# @package _global_
+# ARM B: adaptive discriminator-input noise, and nothing else.
+#
+# The same affine Gaussian corruption is applied to the continuous feature channels of BOTH
+# classes before ordinary GAN scoring, and the level is handed to D. Adapted from
+# Diffusion-GAN: the variance-preserving corruption law, the level pool in which half the
+# entries are zero and the rest are drawn with probability proportional to the level, the
+# level as a D input, and the bang-bang controller on `mean(sign(real_logits))` against a
+# target of 0.6 -- all as in the reference implementation. The schedule is parameterised
+# directly by the injected standard deviation instead of by a beta product, so `max_std`
+# reads as "a fifth of a channel's own standard deviation" and can be checked.
+#
+# TWO THINGS TO WATCH, because this arm can look like it is working when it is not:
+#
+#   `d_acc` here is accuracy on CORRUPTED features and FALLS as the controller raises the
+#   noise. That is the controller doing its job, not the discriminator improving. The
+#   number comparable with the other four arms is `d_acc_clean`, logged beside it.
+#
+#   Raising the noise until D stops objecting must not become a way to call a chemically
+#   broken peptide valid. The corruption is a discriminator input only: every generator
+#   geometry loss and every exported structure uses uncorrupted coordinates, and the export
+#   gate is unchanged. `chain_intact` and `peptide_bond_mae_nm` are the guards.
+#
+# No approximate R1, no contrastive term. Differs from
+# `training_cp2lp_onepass_gan.yaml` in one line.
+
+defaults:
+  - /example/training_cp2lp_onepass
+  - _self_
+
+run_name: cp2lp_onepass_gan_noise
+
+cp2lp:
+  addon: noise   # <- THE ONE LINE

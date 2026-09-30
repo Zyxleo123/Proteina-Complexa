@@ -510,3 +510,103 @@ class CyclizationTypeSeqFeat(Feature):
                     f"request a type the checkpoint knows.")
         emb = self.embedding(cond_type)  # [b, cyc_emb_dim]
         return emb[:, None, :].expand(b, n, -1)  # [b, n, cyc_emb_dim]
+
+
+class SourceCPPresenceSeqFeat(Feature):
+    """Whether this row carries a source-CP condition, broadcast over residues. [b, n, 2]
+
+    The CP->LP generator interleaves two batch kinds on one network: CP-conditioned rows
+    (adversarial branch) and real bound linear peptides (plain flow matching, condition
+    absent). ``x_src_cp`` is zero-filled on the second kind, but zero is a legal value for
+    a centred coordinate, so the tensor alone cannot distinguish "no source CP" from "a
+    source CP sitting at the origin".
+
+    A one-hot on the explicit flag makes absence a *trained* input mode instead of an
+    out-of-distribution one -- which matters because the real-LP branch is exactly the
+    term anchoring the shared trunk to real LP geometry, and it would otherwise be
+    training the network to read zeros as a degenerate conditioning signal.
+
+    Defaults to "absent" when the key is missing, so a plain CPSea or LNR batch run
+    through a generator checkpoint stays well-defined.
+    """
+
+    def __init__(self, **kwargs):
+        super().__init__(dim=2)
+        self._has_logged = False
+
+    def forward(self, batch):
+        from proteinfoundation.cp2lp.conditioning import SRC_CP_PRESENT_KEY
+
+        b, n = self.extract_bs_and_n(batch)
+        device = self.extract_device(batch)
+        if SRC_CP_PRESENT_KEY in batch:
+            present = batch[SRC_CP_PRESENT_KEY].to(device=device).float().clamp(0.0, 1.0)  # [b]
+        else:
+            if not self._has_logged:
+                logger.warning(
+                    f"No {SRC_CP_PRESENT_KEY} in batch, SourceCPPresenceSeqFeat defaults to absent."
+                )
+                self._has_logged = True
+            present = torch.zeros(b, device=device)
+        onehot = torch.stack([1.0 - present, present], dim=-1)  # [b, 2]
+        return onehot[:, None, :].expand(b, n, 2)
+
+
+class EditorNoiseSeqFeat(Feature):
+    """Per-residue INVARIANT Gaussian channels -- the one-pass editor's randomness. [b, n, c]
+
+    The direct CP->LP editor is one deterministic network evaluation, so without an
+    explicit random input it can only ever produce ONE linear peptide per source CP. These
+    channels are that input: resample them and the same CP yields a different LP, which is
+    what makes "search many seeds, keep the good triplets" possible at all.
+
+    WHY SCALARS AND NOT A RANDOM 3-VECTOR PER RESIDUE. The obvious alternative -- perturb
+    the source coordinates with Cartesian noise -- injects a quantity that does not rotate
+    with the structure. The trunk consumes absolute coordinates and is only
+    rotation-augmented, not rotation-equivariant, so it has no way to tell a genuine
+    displacement from a frame artefact, and the noise would be read as geometry. A
+    per-residue scalar vector is invariant under every rigid motion of the complex by
+    construction, so the same draw means the same thing in every frame.
+
+    Drawn OUTSIDE this class, from a dedicated generator, and passed in the batch: the
+    generator-noise stream has to stay independent of data order and of anything the
+    discriminator does, or two arms stop seeing the same examples and the same noise. See
+    `proteinfoundation.cp2lp.editor.sample_editor_noise`.
+
+    Absent key -> zeros, which is the correct meaning for every non-editor batch (the
+    real-LP rows, val_generation, a plain CPSea batch run through a generator checkpoint):
+    those are not edits and have no seed.
+    """
+
+    def __init__(self, editor_noise_channels: int = 16, **kwargs):
+        super().__init__(dim=int(editor_noise_channels))
+        self.channels = int(editor_noise_channels)
+        self._has_logged = False
+
+    def forward(self, batch):
+        from proteinfoundation.cp2lp.editor import EDITOR_NOISE_KEY
+
+        b, n = self.extract_bs_and_n(batch)
+        device = self.extract_device(batch)
+        z = batch.get(EDITOR_NOISE_KEY, None)
+        if z is None:
+            if not self._has_logged:
+                logger.warning(
+                    f"No {EDITOR_NOISE_KEY} in batch, EditorNoiseSeqFeat returns zeros "
+                    "(expected on real-LP rows and on any non-editor batch)."
+                )
+                self._has_logged = True
+            return torch.zeros(b, n, self.channels, device=device)
+        z = z.to(device=device)
+        if z.shape[-1] != self.channels:
+            raise ValueError(
+                f"{EDITOR_NOISE_KEY} has {z.shape[-1]} channels but the network was built "
+                f"for {self.channels}. `nn.editor_noise_channels` and the value passed to "
+                "`sample_editor_noise` must agree -- a mismatch would silently re-bind the "
+                "noise columns of `init_repr_factory.linear_out`."
+            )
+        if z.shape[0] != b or z.shape[1] != n:
+            raise ValueError(
+                f"{EDITOR_NOISE_KEY} is {tuple(z.shape[:2])} but the batch is {(b, n)}."
+            )
+        return z

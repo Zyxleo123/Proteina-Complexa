@@ -383,6 +383,14 @@ def get_model_n_ckpt_resume(cfg_exp, ckpt_path_store: str) -> tuple[Proteina, st
         ckpt = torch.load(pretrain_ckpt_path, map_location="cpu", weights_only=False)
         state_dict = _splice_pretrained_weights(model.state_dict(), ckpt["state_dict"])
         model.load_state_dict(state_dict, strict=False)
+        # The splice zero-fills the columns of any APPENDED feature, which is the right
+        # warm start for every feature except the one-pass editor's noise block: with the
+        # residual heads also zero-initialised, zero noise columns mean the trunk gets no
+        # gradient on step one and the noise only becomes readable after the heads have
+        # moved. Re-initialising it here -- after the splice, and never on a resume, which
+        # does not enter this branch -- is the only place that ordering works out.
+        if hasattr(model, "init_editor_noise_adapter"):
+            model.init_editor_noise_adapter()
 
     # If not resuming from `last` ckpt training set seed
     if last_ckpt_path is None:

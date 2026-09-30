@@ -1,0 +1,25 @@
+# @package _global_
+# NO ADVERSARY. Differs from `training_cp2lp_onepass_gan.yaml` in ONE line.
+#
+# Without a critic nothing tells the editor what a real bound LP looks like. The remaining
+# terms say: keep the source CP's contacts, keep its sequence, keep the backbone sane, do
+# not clash, get the termini apart. A peptide can satisfy every one of those and still be
+# an obviously artificial object -- whether the adversarial term prices that is the
+# question, and this arm is the reference for whether it is worth having at all.
+#
+# `addon` must stay `none` here: all three addons modify the adversarial objective, and the
+# module raises rather than letting an addon be configured with no adversary to modify.
+#
+# Keep this arm in the reading even if an addon wins. An addon that beats
+# `onepass_gan` while `onepass_gan` loses to THIS has improved a term that should not be
+# switched on.
+
+defaults:
+  - /example/training_cp2lp_onepass
+  - _self_
+
+run_name: cp2lp_onepass_contactonly
+
+cp2lp:
+  adversarial:
+    enabled: false   # <- THE ONE LINE

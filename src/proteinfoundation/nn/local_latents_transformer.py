@@ -177,6 +177,41 @@ class LocalLatentsTransformer(torch.nn.Module):
             torch.nn.Linear(self.token_dim, 3, bias=False),
         )
 
+        # Optional RESIDUAL readouts for the one-pass CP->LP editor. A second pair of heads
+        # rather than a reinterpretation of the two above, for two reasons:
+        #
+        #  * the pretrained heads emit a flow VELOCITY. Reading that as an edit displacement
+        #    would start the editor at `x_src + v(x_src, t=0.5)`, which is a large arbitrary
+        #    jump -- not "return the source unchanged". The plan for this arm is that step
+        #    zero is exactly the AE round trip of the source CP, and only a zero-initialised
+        #    head gives that.
+        #  * the legacy differentiable-rollout mode still needs `v`, so replacing the heads
+        #    in place would fork the checkpoint format between the two modes.
+        #
+        # ZERO INIT is load-bearing, not tidiness: it makes the editor's first output the
+        # identity edit, so the arm starts from a known-good structure instead of from noise.
+        # The cost is that the trunk receives NO gradient on the very first step (d(out)/d(h)
+        # is zero through a zero weight); it starts flowing as soon as the head itself has
+        # moved, which `cp2lp_onepass_smoke.py` checks explicitly rather than assuming.
+        #
+        # Cost when enabled: two extra Linears per forward, both computed alongside the
+        # velocity heads. Not worth branching the forward to save.
+        self.enable_editor_residual = bool(kwargs.get("enable_editor_residual", False))
+        if self.enable_editor_residual:
+            self.editor_latents_residual = torch.nn.Sequential(
+                torch.nn.LayerNorm(self.token_dim),
+                torch.nn.Linear(self.token_dim, kwargs["latent_dim"], bias=False),
+            )
+            self.editor_ca_residual = torch.nn.Sequential(
+                torch.nn.LayerNorm(self.token_dim),
+                torch.nn.Linear(self.token_dim, 3, bias=False),
+            )
+            torch.nn.init.zeros_(self.editor_latents_residual[1].weight)
+            torch.nn.init.zeros_(self.editor_ca_residual[1].weight)
+        else:
+            self.editor_latents_residual = None
+            self.editor_ca_residual = None
+
         # Optional oracle peptide-interface surface conditioning. Zero-init gates keep
         # pretrained receptor-only checkpoints bit-identical until the gates open.
         surface_cfg = kwargs.get("surface", {}) or {}
@@ -383,4 +418,17 @@ class LocalLatentsTransformer(torch.nn.Module):
         nn_out = {}
         nn_out["bb_ca"] = {self.output_param["bb_ca"]: ca_nm_out}
         nn_out["local_latents"] = {self.output_param["local_latents"]: local_latents_out}
+
+        # One-pass editor residuals, under a key of their own so nothing that reads `v`
+        # can pick them up by accident. `delta` is an EDIT DISPLACEMENT, in the same units
+        # as the state it is added to (nm for bb_ca, latent units for local_latents); the
+        # caller does the addition, see `proteinfoundation.cp2lp.editor`.
+        if self.enable_editor_residual:
+            d_lat = self.editor_latents_residual(seqs) * mask[..., None]
+            d_ca = self.editor_ca_residual(seqs) * mask[..., None]
+            if n_concat > 0:
+                d_lat = d_lat[:, :n_orig, :] * orig_mask[:, :, None]
+                d_ca = d_ca[:, :n_orig, :] * orig_mask[:, :, None]
+            nn_out["bb_ca"]["delta"] = d_ca
+            nn_out["local_latents"]["delta"] = d_lat
         return nn_out

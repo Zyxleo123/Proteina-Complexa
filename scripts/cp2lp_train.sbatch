@@ -68,7 +68,7 @@ set -x
   ++log.wandb_entity="$WANDB_ENTITY" \
   ++hardware.ncpus_per_task_train_="${SLURM_CPUS_PER_TASK:-8}" \
   ++autoencoder_ckpt_path="$AE_CKPT" \
-  ++pretrain_ckpt_path="$FLOW_CKPT" \
+  ++pretrain_ckpt_path="$INIT_CKPT" \
   ++dataset.unified.datamodule.metadata_file="$TRAIN_META" \
   ++dataset.unified.datamodule.val_metadata_file="$EVAL_META" \
   ++training.resume_from_last=true \

@@ -36,7 +36,18 @@ import torch
 from loguru import logger
 from openfold.np.residue_constants import restypes
 
-from proteinfoundation.cp2lp.geometry import CA_IDX, C_IDX, O_IDX, terminal_gap_nm
+from proteinfoundation.cp2lp.geometry import (
+    CA_IDX,
+    C_IDX,
+    N_IDX,
+    O_IDX,
+    ca_coords,
+    heavy_atom_distances,
+    residue_lengths,
+    safe_norm,
+    soft_contact,
+    terminal_gap_nm,
+)
 from proteinfoundation.cp2lp.losses import (
     CLASH_THRESHOLD_NM,
     MIN_OPEN_TERMINAL_GAP_NM,
@@ -175,6 +186,20 @@ def export_triplets(
     lin_ok = linear_terminus_valid(decoded["coors_nm"], mask, min_gap_nm=min_open_gap_nm)
     _, geom_metrics_all = open_chain_geometry_loss(decoded["coors_nm"], decoded["atom_mask_eff"], mask)
 
+    # Batch-level quantities the per-row loop below reads. Computed once, because they are
+    # cross-residue reductions and slicing to one row first would change nothing but cost
+    # b times as much.
+    tbond = terminal_bond_nm(decoded["coors_nm"], mask)
+    disp_all, disp_iface = displacement_from_source_nm(
+        gen_atom37=decoded["coors_nm"],
+        src_atom37=src_decoded["coors_nm"],
+        src_atom_mask=src_decoded["atom_mask_eff"],
+        pep_mask=mask,
+        target_atom37=gen_batch["x_target"],
+        target_atom_mask=gen_batch["target_mask"],
+        target_mask=gen_batch["seq_target_mask"].bool(),
+    )
+
     # ---- per-example scores, computed one row at a time so a row's numbers are its own
     rows = []
     n_accept = 0
@@ -258,12 +283,26 @@ def export_triplets(
                 "source_sequence": src_seq,
                 "accepted": bool(accepted),
                 "reject_reasons": reasons,
+                # Each gate as its own boolean, so a per-gate pass rate is a column rather
+                # than something inferred from the reason strings. `reject_reasons` stays:
+                # it records the ORDER a reviewer reads, these record the raw outcome.
+                "gates": {
+                    "sequence_ok": bool(seq_ok[i]),
+                    "linear_ok": bool(lin_ok[i]),
+                    "chain_intact": bool(chain_intact),
+                },
                 "gen_lp_pdb": gen_pdb if (accepted or write_rejected) else None,
                 "src_cp_pdb": src_pdb if (accepted or write_rejected) else None,
                 "scores": {
                     "terminal_gap_nm": float(tgap[i]),
                     "src_terminal_gap_nm": float(sgap[i]),
                     "terminal_gap_delta_nm": float(tgap[i] - sgap[i]),
+                    # The bond that must NOT exist, as a distance rather than a verdict.
+                    "terminal_bond_nm": float(tbond[i]),
+                    # Receptor-frame pose change, NEVER independently superposed -- see
+                    # `displacement_from_source_nm`.
+                    "ca_rmsd_from_source_nm": float(disp_all[i]),
+                    "interface_ca_rmsd_from_source_nm": float(disp_iface[i]),
                     "contact_retention_frac": float(cmetrics["contact_retention_frac"]),
                     "contact_n_source": float(cmetrics["contact_n_source"]),
                     "contact_n_kept": float(cmetrics["contact_n_kept"]),
@@ -296,6 +335,64 @@ def export_triplets(
         f"({100.0 * summary['acceptance_rate']:.1f}%) -> {manifest_path}"
     )
     return summary
+
+
+@torch.no_grad()
+def terminal_bond_nm(atom37: torch.Tensor, pep_mask: torch.Tensor) -> torch.Tensor:
+    """[b] the C(L-1)-N(0) distance, in nm -- the bond that must NOT exist.
+
+    ``linear_terminus_valid`` already thresholds this, but a boolean discards the number,
+    and the number is what says whether a rejected sample missed by 0.01 nm or by 2 nm.
+    Recorded per row so the gate can be recalibrated from disk instead of by regenerating.
+    """
+    pm = pep_mask.bool()
+    lengths = residue_lengths(pm)
+    idx = torch.arange(atom37.shape[0], device=atom37.device)
+    c_last = atom37[idx, (lengths - 1).clamp(min=0), C_IDX]
+    n_first = atom37[idx, 0, N_IDX]
+    return safe_norm(c_last - n_first, dim=-1)
+
+
+@torch.no_grad()
+def displacement_from_source_nm(
+    gen_atom37: torch.Tensor,
+    src_atom37: torch.Tensor,
+    src_atom_mask: torch.Tensor,
+    pep_mask: torch.Tensor,
+    target_atom37: torch.Tensor,
+    target_atom_mask: torch.Tensor,
+    target_mask: torch.Tensor,
+    contact_cutoff_nm: float = 0.8,
+    min_strength: float = 0.5,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """``(all_ca_rmsd, interface_ca_rmsd)`` in nm, IN THE RECEPTOR FRAME. Both [b].
+
+    NO SUPERPOSITION. The receptor is fixed and identical in both structures, so the two
+    peptides are already in one frame and the difference is the pose change -- which is the
+    quantity of interest. Independently aligning the generated peptide onto the source
+    before measuring would report only the conformational change and HIDE pose drift, and
+    pose drift away from the pocket is the specific way a retained-contact number can be
+    satisfied by a peptide that has slid off its binding mode.
+
+    The interface variant restricts to residues that carried a source contact, so a long
+    flexible tail swinging in solvent does not swamp the number that describes the binding
+    interface.
+    """
+    pm = pep_mask.bool()
+    gen_ca, src_ca = ca_coords(gen_atom37), ca_coords(src_atom37)
+    sq = ((gen_ca - src_ca) ** 2).sum(dim=-1)  # [b, n]
+    w_all = pm.to(sq.dtype)
+    all_rmsd = torch.sqrt((sq * w_all).sum(dim=1) / w_all.sum(dim=1).clamp(min=1.0) + 1e-12)
+
+    tm = target_mask.bool()
+    d_src = heavy_atom_distances(src_atom37, src_atom_mask, target_atom37, target_atom_mask)
+    c_src = soft_contact(d_src, contact_cutoff_nm) * (pm[:, :, None] & tm[:, None, :]).to(d_src.dtype)
+    iface = ((c_src >= min_strength).any(dim=-1) & pm).to(sq.dtype)
+    iface_rmsd = torch.sqrt((sq * iface).sum(dim=1) / iface.sum(dim=1).clamp(min=1.0) + 1e-12)
+    # No interface residue at all -> NaN rather than 0. A zero would average in as "the
+    # interface did not move", which is the opposite of "there was no interface".
+    iface_rmsd = torch.where(iface.sum(dim=1) > 0, iface_rmsd, torch.full_like(iface_rmsd, float("nan")))
+    return all_rmsd, iface_rmsd
 
 
 def _reject_histogram(rows: list[dict]) -> dict[str, int]:
