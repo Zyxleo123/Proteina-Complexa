@@ -180,11 +180,25 @@ def main() -> int:  # noqa: C901 -- a preflight is a checklist; splitting it hid
         ckpt = torch.load(cfg.pretrain_ckpt_path, map_location="cpu", weights_only=False)
         spliced = _splice_pretrained_weights(model.state_dict(), ckpt["state_dict"])
         missing, unexpected = model.load_state_dict(spliced, strict=False)
-        expected_new = ("discriminator.", "autoencoder.", "feature_scales.", "dgan.", "nce.")
+        # Keys that are SUPPOSED to be absent from a flow checkpoint, so that "OTHER
+        # missing" means what its label says. `nn.concat_pair_factory` is in
+        # `_splice_pretrained_weights`' own `skip_prefixes`; `g_updates` and the editor
+        # heads are new here; D / AE / addon state is new or deliberately withheld.
+        expected_new = (
+            "discriminator.",
+            "autoencoder.",
+            "feature_scales.",
+            "dgan.",
+            "nce.",
+            "nn.concat_pair_factory",
+            "nn.editor_",
+            "g_updates",
+        )
         other = [k for k in missing if not k.startswith(expected_new)]
         print(f"   init global_step: {ckpt.get('global_step')}")
         print(f"   init g_updates  : {int(model.g_updates)}  <- the arms inherit the fork's count")
-        print(f"   new keys        : {len(missing) - len(other)} (D / AE / addon state -- expected)")
+        print(f"   new keys        : {len(missing) - len(other)} (D / AE / addon / editor heads / "
+              f"splice-skipped -- all expected)")
         print(f"   OTHER missing   : {len(other)}  <- the number that matters")
         if other:
             print(f"     first 8: {other[:8]}")

@@ -237,9 +237,10 @@ blind to a tell that lives *in* the peptide.
 
 ## The five one-pass arms
 
-**Status: built, unit-tested and config-verified. NOT YET GPU-RUN.** Everything in this
-section describes the design and what has been checked without a GPU; there are no quality
-results yet, and none should be quoted from it.
+**Status: the editor is GPU-verified; the arms have not been trained.** The smoke passed on
+the real model (job 69354, a6000/gpu26) — see [Smoke, measured](#smoke-measured) — so the
+wiring is confirmed. There are still no quality results, and none should be quoted from
+this section.
 
 | arm | direct editor + retention/geometry losses | GAN | extra change |
 |---|---|---|---|
@@ -385,6 +386,50 @@ content was lost". It *is* monotone in how far the edit moved (1.39 / 1.40 / 1.5
 for 0 / 0.05 / 0.2 / 0.6 nm of noise at 8 positions; 1.19 / 1.20 / 1.29 / 1.60 without the
 projection). Read changes in `nce_loss`, never its level. VERIFIED: no gradient reaches the
 source geometry.
+
+### Smoke, measured
+
+Job 69354, `onepass_gan`, a6000 (47.4 GiB), against the lpmix init (the fork did not exist
+yet — the smoke is what gates on whether producing it is worth the GPU hours).
+
+| check | result |
+|---|---|
+| editor-trunk calls, training | **1** |
+| editor-trunk calls, export (`--nsteps 200` passed) | **1** — ignored, as designed |
+| residual at initialisation | `dCA rms 0.000e+00 nm`, `dz rms 0.000e+00` — the identity edit |
+| noise adapter span | columns `[315, 331)` of 331, i.e. exactly the last 16 |
+| missing checkpoint keys beyond the expected | **0** |
+| source / receptor tensors mutated | none |
+| AE parameters trainable | 0 |
+| residual-head gradient | 2 of 6 nonzero (only the two zero-init `Linear` weights can be) |
+| trunk gradient, step one | 0 of 454 — **expected** from a zero-init head |
+| trunk gradient, after one head update | **454 of 454**, no NaN, no Inf |
+| frame sensitivity, editor / base velocity head | **0.734x** (tolerance 1.5x) |
+| invariant noise unchanged under a rigid motion | yes |
+| peak GPU | **7.9 GiB of 47.4 (83% headroom)**, largest receptor 154 residues |
+
+**The identity edit makes the loss values self-checking, and they check out.** At
+`|delta| = 0` the output *is* the source CP, so `contact_retention_frac` and `seq_identity`
+are both exactly 1.0, `terminal_gap_nm` equals `src_terminal_gap_nm` to four decimals
+(0.3874), and `loss_contact`, `loss_sequence` and `loss_geometry` are all exactly 0. The
+only nonzero term is `loss_open = 0.0626`, which is `relu(0.45 - 0.3874)` exactly — the
+open-chain hinge reading the source ring as closed, which is the one thing it should say.
+
+**`global_step=7` against `g_updates=4`** — the double-counting confirmed in this arm, not
+just in a toy.
+
+**The editor uses about a sixth of the card the rollout arm needed.** 7.9 GiB against a
+rollout configuration that OOMed a 48 GB a6000 at twice this load. Two consequences worth
+deciding before launch rather than after: `max_cp_per_step` could go well above 2 (it is
+the memory knob, and more source CPs per step is a better gradient estimate for the same
+wall clock), and an a5000 is plausible if a6000 contention is the bottleneck. Both are part
+of the config the comparison holds fixed, so **changing either after any arm has started
+invalidates the comparison** — decide once, apply to all five. The 83% figure is also one
+draw: peak is O(n_target^2) and the crop runs to 256 residues against the 154 measured here.
+
+Absolute frame deviations, for the record: editor `rel_dev` 2.10, base velocity head 2.86.
+Both far above 1, i.e. **neither is equivariant** — which is the honest statement about this
+architecture. Only the ratio is meaningful.
 
 ### What decides
 
@@ -738,12 +783,20 @@ returns `n_real` and never populates the acceptance counter that `cp2lp_generate
 
 ### Current state
 
-**The one-pass editor and its five arms are built, unit-tested and config-verified, and
-have not been run on a GPU.** 42 new unit tests pass alongside the 51 existing ones; the
-editor has been exercised on the real trunk on CPU (one call per batch, exact identity edit
-at initialisation, noise adapter at the last 16 columns, frame sensitivity 0.93–1.10x the
-base head); the evaluation manifest is built and reproducible. No quality number exists
-yet. The next action is the smoke, then the warmup and the pin, then the five arms.
+**The one-pass editor is GPU-verified; the five arms have not been trained.** The smoke
+passed on the real model (job 69354) — see [Smoke, measured](#smoke-measured). 42 new unit
+tests pass alongside the 51 existing ones, and the evaluation manifest is built and
+reproducible. No quality number exists yet.
+
+Next actions, in order:
+
+1. `--submit smoke` — the other four arms, so the aR1, corruption and contrastive paths are
+   each exercised once (only the reference arm has run).
+2. Decide `max_cp_per_step` and the GPU class, given 83% headroom, **before** launching —
+   both are part of the fixed config.
+3. `--submit warmup`, then `--submit pin` — the common fork.
+4. `--submit arms` — five siblings, 10,000 post-warmup generator updates each.
+5. `--submit evaluate` and `--submit report`.
 
 The legacy rollout arms:
 
