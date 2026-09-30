@@ -158,12 +158,32 @@ cp2lp:
 
   # ---- addon settings. Read only by the arm that enables the addon; inert elsewhere.
   ar1:
-    # 10, not the paper's 100. arXiv:2501.08316 uses lambda=100 with sigma=0.01 (images) or
-    # 0.1 (video) on a large critic whose logits have their own scale. This discriminator is
-    # three transformer layers over <=16 residues against a hinge loss whose terms are O(1),
-    # so the weighted penalty has to stay commensurate with it. A PILOT VALUE:
-    # `loss_d_ar1_weighted` is logged beside `loss_d` so the ratio can be read off a run.
-    lambda: 10.0
+    # 100 -- the PAPER's value (arXiv:2501.08316), after MEASURING that the reasoning for a
+    # smaller one was wrong.
+    #
+    # The original choice was 10, on the argument that this discriminator is three
+    # transformer layers over <=16 residues against an O(1) hinge, so an image model's
+    # weight would overwhelm it. That premise assumed the penalty is O(1)-ish. It is not:
+    # measured at initialisation (smoke job 69368), a perturbation of 0.01 x per-channel std
+    # moves D's logit by 1.0e-4, and the penalty is the SQUARE of that -- 1.0e-08, giving
+    # `loss_d_ar1_weighted / loss_d = 2.6e-08`. At lambda=10 the term is a no-op.
+    #
+    # It should grow by orders of magnitude as D sharpens, because an R1-type penalty
+    # measures exactly that sharpness and a fresh D is nearly constant in its inputs (v1's D
+    # reached logits of +-1.5-1.8 within a few thousand steps). So lambda=10 MIGHT become
+    # active. 100 makes that far likelier, and the two failure modes are not symmetric:
+    #
+    #   too small -> arm A is inert, reports "approximate R1 does not help", and that false
+    #                negative is INDISTINGUISHABLE from a true one;
+    #   too large -> aR1 dominates D's loss and D stops discriminating, which is VISIBLE in
+    #                `d_acc` and `d_acc_clean` and so is diagnosable from the logs.
+    #
+    # Prefer the detectable failure. Still a pilot value.
+    #
+    # WATCH `loss_d_ar1_weighted / loss_d` AT THE g=1300 MILESTONE. Below ~1e-3 there means
+    # arm A never became active, and its result must be reported as NOT MEASURED rather than
+    # as "no effect". Read only by the ar1 arm, so this line is inert in the other four.
+    lambda: 100.0
     # RELATIVE to each channel's own standard deviation, unlike the paper's absolute sigma.
     # These feature blocks mix nm distances (~0.2-3.0), dihedral components (-1..1) and soft
     # contact counts (0..~40); one absolute sigma is a rounding error on one and a scramble

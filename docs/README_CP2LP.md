@@ -419,13 +419,21 @@ open-chain hinge reading the source ring as closed, which is the one thing it sh
 just in a toy.
 
 **The editor uses about a sixth of the card the rollout arm needed.** 7.9 GiB against a
-rollout configuration that OOMed a 48 GB a6000 at twice this load. Two consequences worth
-deciding before launch rather than after: `max_cp_per_step` could go well above 2 (it is
-the memory knob, and more source CPs per step is a better gradient estimate for the same
-wall clock), and an a5000 is plausible if a6000 contention is the bottleneck. Both are part
-of the config the comparison holds fixed, so **changing either after any arm has started
-invalidates the comparison** — decide once, apply to all five. The 83% figure is also one
-draw: peak is O(n_target^2) and the crop runs to 256 residues against the 154 measured here.
+rollout configuration that OOMed a 48 GB a6000 at twice this load. **`max_cp_per_step` was nevertheless left at 2**, and the earlier framing of that headroom as
+free gradient signal was wrong: the editor runs one network evaluation per sample, so 3x the
+samples is 3x the compute per update. Raising it trades wall clock for gradient quality at an
+unmeasured ratio, and `accum: 8` already gives 16 source CPs / 32 generated LPs per generator
+update. The headroom's real value is that these arms would also fit an a5000, which matters
+only if a6000 contention blocks the queue — and the GPU class must then be the same for all
+five. The 83% figure is one draw: peak is O(n_target^2) and the crop runs to 256 residues
+against the 233 largest measured.
+
+**`grad_clip_val` was left at 1.0.** Raising it looked like the obvious lever given the
+6-17.5 pre-clip norms, but at `lr: 5e-5` an unclipped norm of 17 is an effective step of
+8.5e-4 — a 17x learning-rate increase in disguise, applied blind to five arms at once. The v1
+finding is a reason to watch the per-term gradient attribution, not to unclip. If retention
+stalls in all five arms *together*, that is the moment to test it, as its own single-variable
+arm.
 
 Absolute frame deviations, for the record: editor `rel_dev` 2.10, base velocity head 2.86.
 Both far above 1, i.e. **neither is equivariant** — which is the honest statement about this
@@ -452,14 +460,21 @@ and it carries over unchanged. `grad_clip_val` is shared config, so raising it k
 comparison single-variable — it is the first lever to reach for if retention stalls in every
 arm at once.
 
-**aR1 is 2.6e-08 of the hinge at initialisation. Do NOT read that as a verdict on
-`lambda: 10`.** The penalty is QUADRATIC in D's logit shift, and a freshly initialised D is
+**aR1 is 2.6e-08 of the hinge at initialisation, which is why `lambda` is now the paper's
+100 and not 10.** The penalty is QUADRATIC in D's logit shift, and a freshly initialised D is
 nearly constant in its inputs — a 1%-of-std feature perturbation moves its logit by 1.0e-4,
 so the penalty is 1.0e-08 before any weight is applied. There is nothing for an R1-type
 term to penalise until D sharpens, and v1's D reached logits of ±1.5–1.8 within a few
 thousand steps. **Re-read `loss_d_ar1_weighted / loss_d` at the `g=1300` milestone:** if it
-is still below ~1e-3 there, arm A is inert and its result would be a statement about the
-weight rather than about approximate R1. The paper's own weight is 100, not 10.
+is still below ~1e-3 there, arm A never became active and its result must be reported as
+**NOT MEASURED**, not as "no effect".
+
+The weight was raised from 10 to 100 because the argument for 10 rested on a premise the
+measurement falsified — it assumed the penalty was O(1)-ish against an O(1) hinge, and it is
+1e-08. The two failure modes are also not symmetric: too small makes arm A inert and its
+false negative *indistinguishable from a true one*, while too large makes aR1 dominate D and
+is visible in `d_acc` / `d_acc_clean`. Prefer the detectable failure. `sigma_rel` was left at
+0.01 deliberately — changing two knobs in one arm makes an unhelpful result unattributable.
 
 **`loss_g_total` is NOT comparable across arms, and arm C is why.** The contrastive term is
 0.709 of that total at initialisation — partly because the *other* terms are near zero at
