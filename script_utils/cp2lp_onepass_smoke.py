@@ -41,6 +41,8 @@ from pathlib import Path
 import torch
 from dotenv import load_dotenv
 from hydra import compose, initialize_config_dir
+from lightning.pytorch.loggers import Logger
+from lightning.pytorch.utilities import rank_zero_only
 from loguru import logger
 from omegaconf import OmegaConf
 
@@ -84,6 +86,113 @@ def parse_args() -> argparse.Namespace:
         "absolute one.",
     )
     return p.parse_args()
+
+
+class _CaptureLogger(Logger):
+    """An in-memory Lightning logger, so the ADDON MAGNITUDES survive the smoke.
+
+    Without a logger, every `self.log(...)` call in `training_step` warns and discards its
+    value -- which is exactly the wrong thing to lose here. `ar1.lambda: 10` and
+    `nce.weight: 0.1` are PILOT values, and the question they beg is whether the weighted
+    term is commensurate with the hinge loss it is added to. A term 100x too large silently
+    becomes the objective; one 100x too small is inert and the arm measures nothing. Both
+    look like a passing smoke.
+
+    Writes nothing: no files, no wandb run, nothing to clean up. It keeps the last value of
+    every key, which is all the preflight needs.
+
+    SUBCLASSES `Logger` rather than duck-typing it. A plain object with `log_metrics` and
+    `log_hyperparams` looks sufficient and is not -- Lightning also calls `log_graph`
+    during `_log_hyperparams`, and `trainer.fit` dies with an `AttributeError` several
+    seconds in. Subclassing inherits every no-op default, so the surface cannot drift out
+    from under this again on a Lightning upgrade.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.metrics: dict[str, float] = {}
+
+    @property
+    def name(self) -> str:
+        return "cp2lp_smoke_capture"
+
+    @property
+    def version(self) -> str:
+        return "0"
+
+    @property
+    def save_dir(self) -> None:
+        return None
+
+    @rank_zero_only
+    def log_metrics(self, metrics, step=None) -> None:
+        for k, v in metrics.items():
+            try:
+                self.metrics[k] = float(v)
+            except (TypeError, ValueError):
+                pass
+
+    @rank_zero_only
+    def log_hyperparams(self, *args, **kwargs) -> None:
+        pass
+
+
+#: What to print per arm, and against what. The comparison that matters is the weighted
+#: addon term against `loss_d` (for the D-side addons) or `loss_g_total` (for the G-side
+#: one) -- an absolute value says nothing about whether it will dominate.
+ADDON_REPORT = {
+    "ar1": (
+        ["ar1_penalty", "loss_d_ar1_weighted", "ar1_logit_shift_abs", "ar1_mean_sigma",
+         "ar1_n_perturbed_cols", "scales_frozen", "scales_n_examples"],
+        "loss_d_ar1_weighted",
+        "loss_d",
+    ),
+    "noise": (
+        ["dgan_p", "dgan_eligible_levels", "dgan_max_level_std", "dgan_level_real_mean",
+         "dgan_sign_real", "d_acc", "d_acc_clean", "scales_frozen"],
+        None,
+        None,
+    ),
+    "nce": (
+        ["nce_loss", "loss_nce_weighted", "nce_n_scored", "nce_positions_per_example",
+         "nce_n_skipped_examples"],
+        "loss_nce_weighted",
+        "loss_g_total",
+    ),
+}
+
+
+def _report_addon(addon: str, captured: dict[str, float]) -> None:
+    """Prints this arm's addon diagnostics and the ratio that decides if it is scaled sanely."""
+    if addon not in ADDON_REPORT:
+        print("   addon          : none -- nothing extra to report")
+        return
+    keys, num, den = ADDON_REPORT[addon]
+
+    def get(name):
+        for k in (f"train/cp2lp_{name}_step", f"train/cp2lp_{name}", f"train/cp2lp_{name}_epoch"):
+            if k in captured:
+                return captured[k]
+        return None
+
+    print(f"   addon `{addon}` diagnostics (last logged value):")
+    for name in keys:
+        v = get(name)
+        print(f"     {name:<26}: {'-' if v is None else f'{v:.6g}'}")
+    if num and den:
+        a, b = get(num), get(den)
+        if a is None or b is None or b == 0:
+            print(f"     ratio {num}/{den}: not computable from this run")
+        else:
+            r = abs(a) / abs(b)
+            verdict = (
+                "DOMINATES -- it is the objective now" if r > 10
+                else "INERT -- the arm would measure nothing" if r < 0.001
+                else "commensurate"
+            )
+            print(f"     |{num}| / |{den}|  = {r:.4g}   <- {verdict}")
+            print("     (a PILOT weight; this ratio is the number to retune on, and it must")
+            print("      be changed for the addon arm only, before that arm starts)")
 
 
 def _largest_receptor_index(batch: dict) -> int:
@@ -413,6 +522,7 @@ def main() -> int:  # noqa: C901 -- a preflight is a checklist; splitting it hid
     # configured 8 and a capped epoch the optimizer never steps, `max_steps` is never
     # reached and the Trainer loops epochs forever -- it looks like a hang.
     model.cfg_exp.opt.accumulate_grad_batches = 1
+    capture = _CaptureLogger()
     trainer = L.Trainer(
         accelerator="gpu" if device.type == "cuda" else "cpu",
         devices=1,
@@ -424,7 +534,14 @@ def main() -> int:  # noqa: C901 -- a preflight is a checklist; splitting it hid
         limit_val_batches=1,
         num_sanity_val_steps=1,
         enable_checkpointing=False,
-        logger=False,
+        # A capturing logger, not `False`: see `_CaptureLogger` -- `logger=False` discards
+        # every addon metric, which is the one class of number this step exists to show.
+        logger=capture,
+        # 1, not the default 50. The smoke runs 6 steps, so at the default Lightning
+        # buffers every metric and flushes none of them -- the capture comes back empty and
+        # the addon report prints dashes, which reads as "the addon is inert" when it is
+        # only unflushed.
+        log_every_n_steps=1,
         enable_progress_bar=False,
         enable_model_summary=False,
         gradient_clip_val=None,
@@ -433,6 +550,12 @@ def main() -> int:  # noqa: C901 -- a preflight is a checklist; splitting it hid
     )
     trainer.fit(model, datamodule=datamodule)
     print(f"   global_step={trainer.global_step}  g_updates={int(model.g_updates)}")
+    for name in ("loss_g_total", "loss_d", "d_acc", "d_match_frac", "grad_norm_preclip_g"):
+        for k in (f"train/cp2lp_{name}_step", f"train/cp2lp_{name}"):
+            if k in capture.metrics:
+                print(f"     {name:<26}: {capture.metrics[k]:.6g}")
+                break
+    _report_addon(addon, capture.metrics)
     print("   NOTE: global_step counts G+D optimizer steps under manual optimization. "
           "g_updates is the comparable one.")
     if model.adv_enabled and trainer.global_step <= int(model.g_updates):
