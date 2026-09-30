@@ -238,6 +238,42 @@ def arm_stats(rows: list[dict], directory: Path, with_diversity: bool) -> dict:
         out.update(_q(divs, "within_parent_diversity_nm"))
         out["n_parents_with_2plus_valid"] = len(divs)
 
+    # ---- EXEMPLAR STRUCTURES. Three accepted samples per arm -- best, median and worst
+    # retention -- named in the summary so a reviewer can open the actual PDBs instead of
+    # taking the table's word for it. Worst-accepted is included deliberately: the best
+    # sample of any arm looks good, and what distinguishes a usable arm is what its
+    # *marginal* accepted output looks like.
+    scored_acc = sorted(
+        (
+            (r["scores"].get("contact_retention_frac"), r)
+            for r in acc
+            if r["scores"].get("contact_retention_frac") is not None
+            and math.isfinite(r["scores"]["contact_retention_frac"])
+        ),
+        key=lambda kv: kv[0],
+    )
+    if scored_acc:
+        picks = {
+            "best_retention": scored_acc[-1],
+            "median_retention": scored_acc[len(scored_acc) // 2],
+            "worst_accepted": scored_acc[0],
+        }
+        out["exemplars"] = {
+            label: {
+                "triplet_id": r["triplet_id"],
+                "source_id": r["source_id"],
+                "seed": r.get("seed"),
+                "peptide_length": r.get("peptide_length"),
+                "contact_retention_frac": v,
+                "terminal_gap_nm": r["scores"].get("terminal_gap_nm"),
+                "peptide_bond_mae_nm": r["scores"].get("peptide_bond_mae_nm"),
+                "clash_min_inter_nm": r["scores"].get("clash_min_inter_nm"),
+                "gen_lp_pdb": r.get("gen_lp_pdb"),
+                "src_cp_pdb": r.get("src_cp_pdb"),
+            }
+            for label, (v, r) in picks.items()
+        }
+
     # ---- cost, from the generation summary. Reported SEPARATELY from quality: the addons
     # require different computation, and folding cost into a quality verdict hides which
     # one is being paid for.
@@ -371,6 +407,105 @@ def render_deltas(stats: dict[str, dict], reference: str, order: list[str]) -> s
     return "\n".join(lines)
 
 
+#: The decision rule, as stated in the plan, applied mechanically. Quality AND retention at
+#: useful yield -- a lower discriminator accuracy or a nicer loss curve is not in it.
+VERDICT_QUALITY = [
+    ("contact retention (accepted)", "acc_contact_retention_median", "higher"),
+    ("bond MAE nm (all)", "all_bond_mae_nm_median", "lower"),
+    ("min pocket dist nm (all)", "all_min_pocket_dist_nm_median", "higher"),
+]
+VERDICT_YIELD = [
+    ("acceptance rate", "acceptance_rate", "higher"),
+    ("coverage", "coverage", "higher"),
+]
+
+
+def _beats(a: dict, b: dict, metrics, tol: float = 0.0) -> tuple[int, int, list[str]]:
+    """``(n_better, n_worse, notes)`` for ``a`` against ``b`` over ``metrics``."""
+    better = worse = 0
+    notes = []
+    for label, key, direction in metrics:
+        x, y = a.get(key), b.get(key)
+        if not isinstance(x, (int, float)) or not isinstance(y, (int, float)):
+            notes.append(f"{label}: missing")
+            continue
+        d = x - y
+        if abs(d) <= tol:
+            notes.append(f"{label}: tie ({x:.4f})")
+            continue
+        good = (d > 0) if direction == "higher" else (d < 0)
+        better += int(good)
+        worse += int(not good)
+        notes.append(f"{label}: {'better' if good else 'worse'} ({x:.4f} vs {y:.4f}, {d:+.4f})")
+    return better, worse, notes
+
+
+def render_verdict(stats: dict[str, dict], reference: str, control: str, order: list[str]) -> str:
+    """The recommendation, derived from the table rather than written by hand.
+
+    Mechanical on purpose. The decision rule was fixed before any of these arms ran, and
+    applying it in code is what stops it being re-read after the fact in whichever
+    direction the numbers happen to point. It is a starting point for the write-up, not a
+    substitute for looking at the structures.
+    """
+    lines = ["RECOMMENDATION (the stated rule, applied mechanically):", ""]
+
+    if reference not in stats:
+        return "RECOMMENDATION: the reference arm did not produce rows; no verdict."
+
+    # Does adversarial learning help at all?
+    if control in stats:
+        qb, qw, qn = _beats(stats[reference], stats[control], VERDICT_QUALITY)
+        yb, yw, yn = _beats(stats[reference], stats[control], VERDICT_YIELD)
+        gan_wins = qb > qw and yb >= yw
+        lines.append(
+            f"  * Does the adversary help at all? {_short(reference)} vs {_short(control)}: "
+            f"quality {qb} better / {qw} worse, yield {yb} better / {yw} worse "
+            f"-> {'YES' if gan_wins else 'NO'}."
+        )
+        for n in qn + yn:
+            lines.append(f"      {n}")
+        if not gan_wins:
+            lines.append(
+                "    Read every addon result against this: an addon that beats the GAN while"
+            )
+            lines.append(
+                "    the GAN loses to the control has improved a term that should not be on."
+            )
+    else:
+        lines.append(f"  * {control} produced no rows, so 'does the adversary help' is unanswered.")
+
+    # Does any single addon beat the plain one-pass GAN?
+    lines.append("")
+    winners = []
+    for arm in order:
+        if arm in (reference, control) or arm not in stats:
+            continue
+        qb, qw, qn = _beats(stats[arm], stats[reference], VERDICT_QUALITY)
+        yb, yw, yn = _beats(stats[arm], stats[reference], VERDICT_YIELD)
+        # "improves quality AND retention at useful yield": quality must net-improve and
+        # yield must not net-degrade. A quality gain bought with lost yield is not a win.
+        wins = qb > qw and yw <= yb
+        lines.append(
+            f"  * {_short(arm)}: quality {qb} better / {qw} worse, yield {yb} better / {yw} worse "
+            f"-> {'BEATS' if wins else 'does NOT beat'} {_short(reference)}."
+        )
+        for n in qn + yn:
+            lines.append(f"      {n}")
+        if wins:
+            winners.append(arm)
+
+    lines.append("")
+    if winners:
+        lines.append(f"  => Candidate addon(s): {', '.join(_short(w) for w in winners)}.")
+        if len(winners) > 1:
+            lines.append("     Do NOT combine them in this tranche; each was measured alone.")
+    else:
+        lines.append("  => NO addon beats the plain one-pass GAN on this evaluation. That is an")
+        lines.append("     informative result and is not to be rescued by retuning a single arm.")
+    return "\n".join(lines)
+
+
 def render_figure(stats: dict[str, dict], order: list[str], out_png: Path) -> bool:
     try:
         import matplotlib
@@ -454,6 +589,21 @@ def main() -> int:
 
     table = render_table(stats, order, real)
     deltas = render_deltas(stats, args.reference_arm, order)
+    verdict = render_verdict(stats, args.reference_arm, args.control_arm, order)
+    exemplars = ["SELECTED STRUCTURES (open these rather than trusting the table):", ""]
+    for arm in order:
+        ex = stats[arm].get("exemplars")
+        if not ex:
+            exemplars.append(f"  {_short(arm)}: no accepted sample with a retention score")
+            continue
+        exemplars.append(f"  {_short(arm)}:")
+        for label, row in ex.items():
+            exemplars.append(
+                f"    {label:<18} retention {row['contact_retention_frac']:.3f}  "
+                f"gap {row['terminal_gap_nm']:.2f} nm  bond MAE {row['peptide_bond_mae_nm']:.4f} nm"
+            )
+            exemplars.append(f"      {row['gen_lp_pdb']}")
+            exemplars.append(f"      {row['src_cp_pdb']}")
     text = [
         "CP->LP ONE-PASS EDITOR: FIVE-ARM COMPARISON",
         "",
@@ -464,6 +614,10 @@ def main() -> int:
         table,
         "",
         deltas,
+        "",
+        verdict,
+        "",
+        "\n".join(exemplars),
         "",
         "HOW TO READ THIS:",
         "  * An addon is worth keeping only if it improves valid LP quality AND retention at",
@@ -487,7 +641,10 @@ def main() -> int:
 
     (out_dir / "comparison.md").write_text("\n".join(text) + "\n")
     (out_dir / "comparison.json").write_text(
-        json.dumps({"arms": stats, "real_lp": real, "order": order, "warnings": warn}, indent=2)
+        json.dumps(
+            {"arms": stats, "real_lp": real, "order": order, "warnings": warn, "verdict": verdict},
+            indent=2,
+        )
     )
     drew = render_figure(stats, order, out_dir / "comparison.png")
 
