@@ -431,6 +431,52 @@ Absolute frame deviations, for the record: editor `rel_dev` 2.10, base velocity 
 Both far above 1, i.e. **neither is equivariant** — which is the honest statement about this
 architecture. Only the ratio is meaningful.
 
+#### All five arms smoked (jobs 69366–69370), with the addon magnitudes
+
+| arm | `g_updates` / `global_step` | `grad_norm_preclip_g` | `loss_d` | peak GiB | addon term / its denominator |
+|---|---|---|---|---|---|
+| `onepass_contactonly` | 6 / 6 (**1:1**) | 17.2 | — | 7.3 | — |
+| `onepass_gan` | 3 / 6 (**1:2**) | 13.6 | 3.97 | 7.2 | — |
+| `onepass_gan_ar1` | 4 / 6 | 11.2 | 4.03 | 8.5 | **2.6e-08** of `loss_d` |
+| `onepass_gan_noise` | 4 / 6 | 17.5 | 3.93 | 7.0 | `p` 0.0008 and rising |
+| `onepass_gan_nce` | 4 / 7 | 6.06 | 4.07 | 8.0 | **0.709** of `loss_g_total` |
+
+The `g_updates` / `global_step` columns are the cleanest possible demonstration of the
+counting problem: **1:1 in the single-optimizer control, 1:2 in the adversarial arms.**
+
+**THE CLIP IS ACTIVE FROM STEP ONE HERE TOO — the editor does not escape v1's
+gradient-budget problem.** `grad_norm_preclip_g` is **6–17.5 against `grad_clip_val: 1.0`**,
+so every term's effective step is scaled by `clip / norm` and the largest term still decides
+what the smallest gets. That is the mechanism that pinned v1's contact retention at 0.158,
+and it carries over unchanged. `grad_clip_val` is shared config, so raising it keeps the
+comparison single-variable — it is the first lever to reach for if retention stalls in every
+arm at once.
+
+**aR1 is 2.6e-08 of the hinge at initialisation. Do NOT read that as a verdict on
+`lambda: 10`.** The penalty is QUADRATIC in D's logit shift, and a freshly initialised D is
+nearly constant in its inputs — a 1%-of-std feature perturbation moves its logit by 1.0e-4,
+so the penalty is 1.0e-08 before any weight is applied. There is nothing for an R1-type
+term to penalise until D sharpens, and v1's D reached logits of ±1.5–1.8 within a few
+thousand steps. **Re-read `loss_d_ar1_weighted / loss_d` at the `g=1300` milestone:** if it
+is still below ~1e-3 there, arm A is inert and its result would be a statement about the
+weight rather than about approximate R1. The paper's own weight is 100, not 10.
+
+**`loss_g_total` is NOT comparable across arms, and arm C is why.** The contrastive term is
+0.709 of that total at initialisation — partly because the *other* terms are near zero at
+the identity edit, and partly because `nce_loss` has an irreducible floor of ~1.2–1.4 (a
+random projection leaves the descriptors nearly collinear). A constant offset contributes no
+gradient, but it does sit in `loss_g_total` forever, so compare `loss_contact`,
+`loss_geometry` and the export metrics across arms — never the total.
+
+`d_match_frac` reads 0.5 in every adversarial arm here. That is the 6-step smoke starting
+with an EMPTY length-matched reservoir, not a problem: v1 reached 0.9999 once the reservoir
+filled (~760 entries). Check it again after a few hundred updates.
+
+Peak memory is **7.0–8.5 GiB** across all five and is **not monotone in receptor size** —
+the 203- and 233-residue batches used less than the 154-residue one. The standing assumption
+that peak is dominated by O(n_target^2) pair features held for the rollout arm, which
+retained a trajectory; it is not the binding constraint for the editor.
+
 ### What decides
 
 An addon is kept only if it improves valid LP quality **and** retention at **useful yield**

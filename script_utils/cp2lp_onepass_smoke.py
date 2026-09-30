@@ -185,14 +185,27 @@ def _report_addon(addon: str, captured: dict[str, float]) -> None:
             print(f"     ratio {num}/{den}: not computable from this run")
         else:
             r = abs(a) / abs(b)
-            verdict = (
-                "DOMINATES -- it is the objective now" if r > 10
-                else "INERT -- the arm would measure nothing" if r < 0.001
-                else "commensurate"
-            )
-            print(f"     |{num}| / |{den}|  = {r:.4g}   <- {verdict}")
-            print("     (a PILOT weight; this ratio is the number to retune on, and it must")
-            print("      be changed for the addon arm only, before that arm starts)")
+            label = "DOMINATES" if r > 10 else "very small" if r < 1e-3 else "commensurate"
+            print(f"     |{num}| / |{den}|  = {r:.4g}   <- {label} AT INITIALISATION")
+            if addon == "ar1":
+                # Do not let a step-6 number be read as a verdict on the addon. An R1-type
+                # penalty measures how SHARP the discriminator is, and a freshly
+                # initialised D is nearly constant in its inputs -- there is nothing for it
+                # to penalise yet, so a tiny value here is the expected reading and not
+                # evidence the weight is wrong. It should grow by orders of magnitude as D
+                # sharpens (v1's D reached logits of +-1.5-1.8 within a few thousand steps).
+                print("     aR1 is QUADRATIC in D's logit shift, and D is barely trained here,")
+                print("     so a tiny ratio at step 6 is EXPECTED and is not a verdict on lambda.")
+                print("     RE-READ `loss_d_ar1_weighted / loss_d` at the g=1300 milestone: if it")
+                print("     is still below ~1e-3 there, arm A is inert and its result would be a")
+                print("     statement about the weight, not about approximate R1.")
+            elif r > 10:
+                print("     A term this large IS the objective now; the arm would measure the")
+                print("     weight rather than the addon.")
+            elif r < 1e-3:
+                print("     Check this again at the g=1300 milestone before trusting the arm.")
+            print("     (a PILOT weight -- if it must change, change it for this arm only and")
+            print("      before that arm starts, or the comparison stops being matched)")
 
 
 def _largest_receptor_index(batch: dict) -> int:

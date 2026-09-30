@@ -757,3 +757,43 @@ def test_the_module_gates_the_onepass_warmup_on_generator_updates():
     }
     for what, pattern in required.items():
         assert re.search(pattern, src), f"module.py no longer has {what} ({pattern})"
+
+
+def test_milestone_checkpoints_cannot_be_mistaken_for_the_resume_checkpoint():
+    """The retained G-update milestones live in the same directory as `last.ckpt`.
+
+    `fetch_last_ckpt` scans that directory, and an arm that resumed from `g010300.ckpt`
+    would silently restart from a milestone instead of from where it left off -- or, worse,
+    from an `-EMA` file, which would resume optimisation from an average of the last few
+    hundred updates rather than from the trajectory. Verified rather than assumed, because
+    the naming is mine and the scanner is not.
+    """
+    from proteinfoundation.utils.fetch_last_ckpt import get_version_number
+
+    def considered(name: str) -> bool:
+        return "last" in name and name.endswith(".ckpt") and get_version_number(name) is not None
+
+    for name in ("last.ckpt", "last-v1.ckpt", "last-v12.ckpt"):
+        assert considered(name), f"{name} should be a resume candidate"
+    for name in (
+        "g000300.ckpt",
+        "g001300.ckpt",
+        "g005300-EMA.ckpt",
+        "g010300.ckpt",
+        "g010300-EMA.ckpt",
+        "last-EMA.ckpt",
+        "cp2lp_onepass_fork.ckpt",
+    ):
+        assert not considered(name), f"{name} must NOT be a resume candidate"
+
+
+def test_the_milestone_writer_names_files_by_generator_updates():
+    """Source-level: the filename has to carry the number the comparison is indexed by, or
+    two arms' milestones are not comparable. Exercising it needs a Trainer and a GPU."""
+    import re
+
+    src = (REPO / "src" / "proteinfoundation" / "cp2lp" / "module.py").read_text()
+    assert re.search(r'f"g\{n:06d\}\.ckpt"', src), "the raw milestone is not named by g_updates"
+    assert re.search(r'f"g\{n:06d\}-EMA\.ckpt"', src), "the EMA milestone is not named by g_updates"
+    # And it must go through the EMA callback's own swap, or the -EMA file holds raw weights.
+    assert "save_ema_model" in src, "the EMA milestone is not written through the EMA swap"
