@@ -15,7 +15,9 @@
 #
 # Stages:
 #   manifest    CPU  build the fixed 64-parent / 8-seed evaluation manifest (once)
-#   smoke       GPU  the compact preflight (trunk-call count, frame check, one G/D update)
+#   smoke       GPU  the compact preflight, ONE PER ARM as siblings (trunk-call count,
+#                    frame check, arm exclusivity, one real G/D update with the addon live)
+#   smoke-one   GPU  the same, for a single arm (--set SMOKE_ARM=onepass_gan_nce)
 #   warmup      GPU  the COMMON FORK: 300 generator updates, adversary off
 #   pin         CPU  snapshot the fork so all five arms start from identical weights
 #   arms        GPU  all five arms as SIBLINGS, so they queue concurrently
@@ -112,9 +114,19 @@ case "$STAGE" in
     echo "manifest: $(submit scripts/cp2lp_onepass_manifest.sbatch)" ;;
 
   smoke)
-    # The smoke runs on ONE arm's config by default. `--set ARM=onepass_gan_noise` points
-    # it at another; the addon-specific paths (the corruption, the aR1 penalty, the
-    # contrastive term) are only exercised by their own arm's config.
+    # ONE SMOKE PER ARM, as siblings. The addon-specific paths -- the corruption, the aR1
+    # penalty, the contrastive term -- are only reachable through their own arm's config, so
+    # smoking `onepass_gan` alone would leave three of the five arms unexercised. Siblings
+    # rather than one looping job so a failure in one arm does not hide the other four.
+    #
+    # It needs no fork: the sbatch falls back to the lpmix init and says so. The smoke is
+    # what gates on whether producing the fork is worth the GPU hours.
+    echo "one smoke per arm (siblings):"
+    for arm in "${ARMS[@]}"; do
+      printf '  %-22s %s\n' "$arm" "$(submit scripts/cp2lp_onepass_smoke.sbatch "ARM=${arm}")"
+    done ;;
+
+  smoke-one)
     echo "smoke: $(submit scripts/cp2lp_onepass_smoke.sbatch "ARM=${SMOKE_ARM:-onepass_gan}")" ;;
 
   warmup)
@@ -140,7 +152,7 @@ case "$STAGE" in
 
   pilot)
     M="$(submit scripts/cp2lp_onepass_manifest.sbatch)"
-    S="$(submit scripts/cp2lp_onepass_smoke.sbatch ARM=onepass_gan)"
+    S="$(submit scripts/cp2lp_onepass_smoke.sbatch ARM=onepass_gan)"   # the reference arm gates the chain
     # The warmup waits on the smoke: there is no point burning GPU hours on a fork whose
     # editor turns out to be miswired.
     W="$(submit scripts/cp2lp_train.sbatch --dep "$S" ARM=onepass_warmup)"

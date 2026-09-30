@@ -67,6 +67,15 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--skip-ckpt", action="store_true", help="Shapes only; do not load the init.")
     p.add_argument(
+        "--init-ckpt",
+        default=None,
+        help="Override `pretrain_ckpt_path`. The smoke runs BEFORE the common fork exists "
+        "-- it is what gates on whether the fork is worth producing -- so it has to be "
+        "able to load the lpmix init instead. Which checkpoint it loads is irrelevant to "
+        "every check here, as long as the AE/flow pairing is valid, because these are "
+        "wiring checks and not quality checks.",
+    )
+    p.add_argument(
         "--frame-tol",
         type=float,
         default=1.5,
@@ -93,6 +102,8 @@ def main() -> int:  # noqa: C901 -- a preflight is a checklist; splitting it hid
     with initialize_config_dir(config_dir=str(repo / "configs"), version_base=None):
         cfg = compose(config_name=args.config)
     OmegaConf.set_struct(cfg, False)
+    if args.init_ckpt:
+        cfg.pretrain_ckpt_path = args.init_ckpt
 
     print("=" * 78)
     print("1. CONFIG AND CHECKPOINTS")
@@ -101,7 +112,8 @@ def main() -> int:  # noqa: C901 -- a preflight is a checklist; splitting it hid
     print(f"   addon           : {cfg.cp2lp.addon}")
     print(f"   adversarial     : {cfg.cp2lp.adversarial.enabled}")
     print(f"   AE (defines z)  : {cfg.autoencoder_ckpt_path}")
-    print(f"   init (the fork) : {cfg.pretrain_ckpt_path}")
+    print(f"   init            : {cfg.pretrain_ckpt_path}"
+          f"{'  (OVERRIDDEN -- the fork does not exist yet)' if args.init_ckpt else '  (the common fork)'}")
     print(f"   residual heads  : {cfg.nn.get('enable_editor_residual')}")
     print(f"   feats_seq[-1]   : {cfg.nn.feats_seq[-1]}")
     print(f"   real_lp_flow_w  : {cfg.cp2lp.real_lp_flow_weight}")
