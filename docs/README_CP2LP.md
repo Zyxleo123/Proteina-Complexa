@@ -1012,7 +1012,157 @@ The legacy rollout arms:
 - Both are now known not to have been generator-update-matched against each other; see the
   `global_step` section.
 
+## Why the chain is not intact — the CA track, measured
+
+`geom_chain_intact_frac` reads ~0.01 in every adversarial arm against ~0.79 in the control,
+and the 0.02 nm tolerance is **not** the culprit (it sits on a plateau and natives are 6x
+inside it — see [Calibration notes](#calibration-notes-carried-over)). So the backbones are
+genuinely broken. `script_utils/cp2lp_ca_spacing_probe.py` asks which decoder input breaks
+them. Run it with `scripts/submit_cp2lp_ca_probe.sh --submit decisive`; table the JSON with
+`script_utils/cp2lp_ca_probe_report.py`.
+
+### The native yardsticks, measured first
+
+From the 101 complexes in `calibration_native/`, **peptide chains only** (what the editor
+edits), through a direct PDB parse:
+
+| quantity | n | median | sd | min | p1 | p99 | max |
+|---|---|---|---|---|---|---|---|
+| CA(i)-CA(i+1) | 1,233 | **3.838 A** | 0.054 | 3.034 | 3.743 | 3.906 | 3.980 |
+| CA(i-1)-CA(i)-CA(i+1) | 1,132 | **97.3 deg** | 16.2 | 74.5 | 83.3 | 146.7 | 157.5 |
+
+Two hard facts come out of this. **Nothing exceeds 4.00 A** in 1,233 native bonds, and with
+ideal bond lengths and angles the CA-CA span is a function of omega alone whose ceiling is
+**3.804 A** at omega=180 — so CA-CA is a rigid rod, not a range. And **nothing is below
+74.5 deg** in 1,132 native bend angles. A CA trace outside those two windows is not a
+peptide backbone, whatever a decoder then does with it.
+
+### The mechanism
+
+The frozen decoder's only inputs are `z_latent`, `ca_coors_nm` and `mask` (`module._decode`)
+— topology never reaches it — so CA track plus latents is an *exhaustive* decomposition of
+what can break a decoded backbone. The editor adds a free per-residue Cartesian residual to
+the CA track (`editor.apply_residuals`: `edited[bb_ca] = src[bb_ca] + delta`), and
+**nothing in the loss set constrains CA-CA spacing**: `open_chain_geometry_loss` scores
+C(i)-N(i+1) and intra-residue N-CA / CA-C on the DECODED atom37, i.e. downstream of the
+frozen decoder, so the cause is reachable only through the decoder's Jacobian.
+
+`delta_ca_rms_nm` cannot see the problem, because it is the RMS of one Cartesian component
+and so cannot tell the edit the task wants from the edit that breaks the chain. Translating
+or smoothly bending the peptide moves every CA and changes no CA-CA distance; only the
+**incoherent** part of the residual stretches the virtual bond. The probe therefore reports
+`incoherence = RMS(|edited bond| - |source bond|) / (sqrt(2) * sigma_component)`, which is
+0 for a rigid motion and 1 for an iid residual (both anchored in
+`script_utils/test_cp2lp_ca_spacing_probe.py`).
+
+### Dose response (eval64 manifest, g=1300)
+
+| run | sigma_c nm | incoherence | dCA-CA nm | in native sd | CA-CA sd nm | outside window | chain_intact |
+|---|---|---|---|---|---|---|---|
+| real LP reference | 0.0000 | n/a | 0.0000 | 0.0 | 0.0065 | 3.1% | **0.9609** |
+| onepass_contactonly | 0.0332 | **0.414** | 0.0194 | 4.0 | 0.0191 | 50.0% | 0.5156 |
+| onepass_gan | 0.1094 | **0.392** | 0.0607 | 12.6 | 0.0547 | 87.7% | **0.0000** |
+
+**The incoherence fraction is the same in both arms — 0.414 against 0.392 — while sigma_c
+differs 3.3x.** That is the finding. The adversary does not teach the editor worse geometry;
+it makes the edit *bigger*, and because the chain-breaking share is a constant of the
+parameterisation, damage scales with edit size. The gan arm's CA trace carries bonds from
+**1.0 A to 7.2 A** and bend angles down to **25.6 deg**.
+
+Put the other way: holding CA-CA inside one native sd needs incoherence under **2.0%** at
+the gan arm's sigma_c, and under the export tolerance needs **8.3%**. The editor delivers
+39%. The control is viable only because its edit is small enough that 41% incoherence still
+lands within 4 native sd.
+
+### Apportionment: which input carries the damage
+
+The same shape as the run's own `val/decode_*` ablation, but varying the EDITOR's residual
+rather than the flow model's prediction. Scored by the export gate's all-bonds test:
+
+| decode | contactonly | gan |
+|---|---|---|
+| source CA + source z (AE round trip = **ceiling**) | 0.9844 | 0.9844 |
+| source CA + EDITED z (latents alone) | 0.7031 | 0.6250 |
+| **EDITED CA + source z (CA alone)** | **0.2812** | **0.0469** |
+| EDITED CA + EDITED z (the actual output) | 0.5156 | 0.0000 |
+| projected CA + EDITED z (bond lengths repaired) | 0.6719 | 0.1406 |
+
+**The CA track is the dominant damage channel**: swapping it alone takes 0.9844 to 0.0469
+(gan) or 0.2812 (contactonly), while swapping the latents alone costs far less. Each row is
+a valid causal intervention.
+
+**The 2x2 does NOT decompose additively, and must not be read as if it did.** In the control,
+`EDITED CA + source z` (0.2812) is *worse* than the real output (0.5156): the edited latents
+**partially compensate** for the damage the edited CA track does, so breaking the pairing by
+substituting a source latent reads worse than either channel's own contribution. The
+compensation is arm-dependent — it is +0.234 in the control and -0.047 in the gan arm, i.e.
+absent once the edit is large. Quote the single-channel rows as interventions, never as
+shares of a total.
+
+### Repairing bond lengths alone is not enough, and why
+
+Projecting the edited CA track back onto CA-CA = 0.3809 nm (damped relaxation, converged to
+5e-7 nm) and re-decoding with the same latents recovers only **0.000 -> 0.141** (gan) and
+**0.516 -> 0.672** (control) — 15% and 36% of the deficit. Two reasons, both measured:
+
+* **it leaves the second constraint violated, and nudges it worse.** gan bend-angle minimum:
+  source 74.5 deg, edited 25.6, projected **21.8**; p99 148.0 / 161.7 / **170.0**. Enforcing
+  bond lengths while the angles are free moves the angles. The control's edited angles are
+  still native (min 74.9, median 97.2), which is why its lengths-only repair buys more.
+* **`chain_intact` is an all-bonds test**, so it is the per-bond pass rate raised to the bond
+  count (~9.25 here). Per-bond 0.52 -> 0.002 of peptides; 0.70 -> 0.037; **reaching 0.95 of
+  peptides needs a per-bond pass rate of 0.9945.** Halving the mean bond error is worth
+  almost nothing if a tail survives.
+
+Read the counterfactual against its own ceiling, not against 1.0: projecting the **real** LPs
+costs 0.9609 -> 0.9453, so a hard projection to a constant has an intrinsic 1.6-point price
+(natives have CA-CA sd 0.0065 nm and a projection to one value removes that spread). A
+flat-bottomed projection to the native window would not pay it. The projection target 0.3809
+also sits 0.0029 nm below the peptide-only native median of 0.3838 — inside the tolerance,
+but it is an offset, not a match.
+
+### What this rules out, and what it implies
+
+**Not a loss-weight problem.** The geometry term acts downstream of the frozen decoder while
+the cause is an unconstrained CA trace upstream of it, and the incoherent share is
+architecture-determined rather than pressure-determined. Within this parameterisation the
+only way to cut damage is to shrink the edit — which is exactly the control "passing the gate
+by not moving". No setting of `geometry_weight` escapes that line; it only slides along it.
+
+**Not a tolerance problem**, and not a repeat of the clash-threshold story: the gate is
+calibrated and the trace is genuinely non-physical.
+
+**It is a parameterisation problem.** The editor's action space contains almost no
+chain-preserving directions, yet the task needs a large edit (source terminal gap 0.35 nm,
+real bound LPs 2.14 nm). The fix has to make a valid CA trace the only reachable output:
+
+1. **Internal-coordinate residual (preferred).** Emit per-residue deltas on the CA-trace bend
+   angles and virtual torsions, pin CA-CA at native, rebuild by NeRF. Zero-init still gives
+   exactly the identity edit, so the pretrained splice and the "first output is the AE round
+   trip" property both survive. Every reachable point satisfies both constraints by
+   construction, there is no new loss weight competing for the clipped gradient budget, and
+   ring opening *is* a torsional move so the action space matches the task. The known cost is
+   conditioning: a torsion change swings the whole downstream chain.
+2. **Differentiable projection layer (fallback).** Keep the Cartesian residual and pass the
+   edited CA through a projection enforcing **both** constraints before decoding, flat-bottomed
+   to the native windows so it does not pay the 1.6-point idealisation price. The projection's
+   Jacobian annihilates the chain-breaking directions, so the adversary can only push in
+   chain-preserving ones. Cheaper to build; costs forward-pass iterations.
+
+A CA-CA penalty term is **not** on this list as a primary fix: it would be a seventh term in
+the budget that already retires the sequence term to make room, and it addresses only the
+constraint whose repair was measured to be insufficient on its own.
+
 ## Traps found the hard way
+
+- **A second-resolution timestamp is not a unique env-file name.** Two
+  `submit_cp2lp_ca_probe.sh --submit one` invocations issued in the same second produced ONE
+  env file: the second overwrote the first, and because a job reads its env file at RUN time
+  rather than at submit time, *both* jobs then read the survivor. They probed the same arm
+  and raced on one output path. Caught before the results were read, but nothing in the logs
+  would have said so — both jobs succeed, and the two "different" runs simply agree. The
+  submitter now puts `$$` in the name. Any submitter that writes a per-submission file needs
+  more than a timestamp.
 
 - **`trainer.global_step` is not the generator-update count.** Under manual optimization it
   sums `optimizer.step()` calls across optimizers, so an adversarial arm advances it twice
@@ -1084,6 +1234,11 @@ The legacy rollout arms:
 | `script_utils/cp2lp_generate.py` | triplet generation / reference measurement |
 | `script_utils/cp2lp_report.py` | real-vs-generated table + figure (CPU) |
 | `script_utils/test_cp2lp.py` | unit tests for the pure pieces (rollout mode) |
+| `script_utils/cp2lp_ca_spacing_probe.py` | CA-track probe: residual decomposition, 2x2, projection counterfactual |
+| `script_utils/cp2lp_ca_probe_report.py` | tables the probe JSONs (CPU, redrawable from disk) |
+| `script_utils/test_cp2lp_ca_spacing_probe.py` | anchors the incoherence metric at its 0 and 1 limits |
+| `scripts/cp2lp_ca_probe.sbatch` | one arm's probe |
+| `scripts/submit_cp2lp_ca_probe.sh` | probe submitter (`--submit decisive`) |
 | `src/proteinfoundation/cp2lp/editor.py` | the one-pass editor: batch, residual, frame check |
 | `src/proteinfoundation/cp2lp/addons.py` | feature scales + the three add-ons, one per arm |
 | `configs/example/training_cp2lp_onepass.yaml` | the shared base for all six one-pass runs |
