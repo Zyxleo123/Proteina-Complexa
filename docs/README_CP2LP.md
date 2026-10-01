@@ -987,10 +987,13 @@ returns `n_real` and never populates the acceptance counter that `cp2lp_generate
 
 ### Current state
 
-**The one-pass editor is GPU-verified; the five arms have not been trained.** The smoke
-passed on the real model (job 69354) — see [Smoke, measured](#smoke-measured). 42 new unit
-tests pass alongside the 51 existing ones, and the evaluation manifest is built and
-reproducible. No quality number exists yet.
+**SUPERSEDED 2026-10-01 — see [The g=10300 verdict](#the-g10300-verdict-the-fix-works-and-what-it-does-not-fix).**
+Three arms trained to the full budget (`onepass_contactonly`, `onepass_gan`,
+`onepass_internal`); the three addon arms (`ar1`, `noise`, `nce`) were CANCELLED at g~3000
+because all four adversarial arms were failing upstream of any addon, two of the addon signals
+had already saturated, and the arms' `chain_intact` ranking was the inverse of their edit-size
+ranking — so the table would have measured edit magnitude, not addons. They retain `last.ckpt`
+and resume if wanted. The text below is the pre-training plan, kept for the record.
 
 Next actions, in order:
 
@@ -1325,6 +1328,150 @@ by keeping it small.
   carries the same un-negated form.** Harmless there, because the discriminator sees the same
   relabelling on real and generated peptides alike, but those values are NOT Ramachandran
   phi/psi and must not be read as such.
+
+## The g=10300 verdict: the fix works, and what it does not fix
+
+All three arms completed the full 10,300 generator-update budget (2026-10-01). Quote the
+**g-banded averages**, not tail means: the batch is 4 samples, so a 200-point tail is noisy
+(it put the gan arm's terminal gap anywhere from 1.64 to 1.82 depending on window). The last
+band has n=15,111.
+
+### Final band (g 8500-10400)
+
+| arm | chain_intact | bond MAE nm | delta_ca_rms | terminal gap | d_acc | export accepted |
+|---|---|---|---|---|---|---|
+| onepass_contactonly | **0.9313** | 0.0048 | 0.029 | 0.481 | n/a | **438/512 = 85.5%** |
+| onepass_gan | 0.0151 | 0.0242 | **0.1711** | 1.245 | 0.967 | 19/512 = 3.7% |
+| **onepass_internal** | **0.1677** | 0.0123 | **0.1704** | 1.176 | 0.964 | (job 70238) |
+
+**The headline needs no binning.** At the final band the gan and internal arms sit at
+*essentially identical* edit magnitude -- `delta_ca_rms` 0.1711 vs 0.1704 -- and similar
+terminal gap, yet `chain_intact` differs **11x**. The "it just edited less" objection is
+answered by the raw numbers.
+
+Binning the whole trajectory confirms it and gives the shape: internal wins at **every**
+matched bin, 9-10x on `chain_intact` at matched `delta_ca_rms` and 5.8-10.7x at matched
+terminal gap, with the margin GROWING as the edit grows -- the signature expected if Cartesian
+damage scales with the edit and the internal space's does not. The pre-training matched-size
+probe predicted 4-8x; training delivered 9-11x.
+
+### The frontier genuinely moves out — this is not identity drift
+
+The obvious worry is that `chain_intact` rose because travel fell. It did not. `chain_intact`
+**within a fixed terminal-gap bin**, by training band:
+
+| g band | gap 0.6-0.9 | 0.9-1.2 | 1.2-1.5 | 1.5-2.0 |
+|---|---|---|---|---|
+| 1000-4000 | 0.027 | 0.013 | 0.012 | 0.011 |
+| 4000-7000 | 0.073 | 0.039 | 0.020 | 0.011 |
+| 7000-8500 | 0.193 | 0.100 | 0.057 | 0.028 |
+| 8500-10400 | **0.312** | **0.175** | **0.111** | **0.067** |
+
+At a *fixed* 1.2-1.5 nm gap, 0.012 -> 0.111: **9x from training alone, travel held constant.**
+Same at fixed edit size (~10x). Still accelerating at budget end, which is why the arm was
+extended to 20,300 rather than re-tuned.
+
+### But the adversarial game is being LOST, monotonically
+
+| g band | d_acc |
+|---|---|
+| 1000-4000 | 0.899 |
+| 4000-7000 | 0.930 |
+| 7000-8500 | 0.953 |
+| 8500-10400 | **0.964** |
+
+`d_match_frac` is 1.0, so length is not the crack it was in the rollout arms. The discriminator
+is finding a real tell and pulling away. **More budget buys the geometry gate, not realism** --
+the backbones get cleaner while the peptides become MORE identifiable as generated. Any
+extrapolation of `chain_intact` must be read against this.
+
+### The export gate selects FOR non-edits
+
+From the eval triplet rows (`ca_rmsd_from_source_nm` is logged per sample):
+
+| | contactonly | gan (all 512) | gan (**accepted 19**) | real LPs |
+|---|---|---|---|---|
+| CA RMSD from source CP | **0.051 nm** | 0.276 | **0.184** | — |
+| terminal gap nm | 0.485 | 1.092 | **0.839** | **2.14** |
+| clash_min_inter nm | 0.252 | 0.184 | 0.214 | **0.262** |
+
+Two things follow, and they are the most important results in this section.
+
+**The gan arm's accepted subset moved LESS than its population** -- 1.84 A vs 2.76 A, gap 0.84
+vs 1.09. The backbone gate preferentially passes the edits that barely happened. So raising the
+seed count does not give N unbiased draws; it gives a sample **enriched in near-identity edits**.
+
+**The control's 85.5% acceptance is an identity map.** Median CA RMSD from the source CP is
+**0.051 nm = 0.5 A**, with a terminal-gap delta of +0.14 nm. These are cyclic peptides with the
+ring bond deleted, not linear peptides. They are dead as transport data for exactly the reason
+the provenance-pair route died (see `cpsea-precyclization-gap-measured`): if the input equals
+the output, an LP->CP model learns the identity.
+
+So **integrity and travel are anticorrelated under this objective.** The internal
+parameterisation moved that frontier out ~10x, which is real; it did not break the correlation.
+Chasing yield with more seeds rides the frontier toward the identity corner.
+
+### Where the objective's mass actually is, and the clash normalisation bug
+
+Weighted contributions to the generator loss, internal arm at g 8500-10400 (`loss_adv_g`
+1.148 x weight 0.3 = 0.335 against `loss_g_total` 0.354):
+
+| term | weighted | share |
+|---|---|---|
+| **adversarial** | 0.335 | **95%** |
+| contact | 0.0164 | 4.6% |
+| geometry | 0.0017 | 0.5% |
+| sequence | 0.0002 | 0.06% |
+| **clash** | **0.0002** | **0.06%** |
+| open | 0.0000 | 0% (satisfied; flat-bottomed, so this is correct) |
+
+Good news first: **geometry's share of the shaping terms fell from 39% (gan) to 9% (internal)**,
+so the reparameterisation did free the budget it was wasting on an impossible constraint.
+
+But "reweight clash and adversarial upward" is NOT available: the adversarial term is already
+95% of the objective. And `grad_norm_preclip_g` is 7.5 against `grad_clip_val` 1.0, so
+everything is scaled down ~7.5x and the step direction is set almost entirely by that one term.
+
+**THE BUG.** Clash is 0.06% of the objective *while being violated*. `clash_inter_sum_nm` is
+0.435 -- 0.435 nm of total overlap depth against the receptor -- and the worst pair sits at
+`clash_min_inter` **0.114 nm, i.e. 1.14 A between two heavy atoms**, which is physically
+impossible. Yet `loss_clash` reads 0.0003. The cause is the normalisation in
+`losses.clash_loss`:
+
+```python
+inter = (F.relu(threshold_nm - d_t) * t_pair.float()).sum()
+n_inter_pairs = t_pair.float().sum()        # EVERY peptide x target pair
+total = total + inter / n_inter_pairs
+```
+
+The summed violation is divided by *all* pairs. For a 16-mer against a 245-residue receptor
+that is ~3,900 pairs, of which a handful clash, so a real steric overlap is diluted ~1000x into
+numerical invisibility. **Same mean-vs-max pathology as `chain_intact`**, and it matters more
+here because interface packing is one of the two named tells the discriminator has
+(0.15-0.21 nm against natives' 0.262).
+
+Recommended next move, and the reason it beats more training or more seeds: normalise clash
+per *violating* pair (or take a max / soft-max) so a real overlap has a voice, then watch
+whether `d_acc` finally comes off 0.96. It is cheap, and it targets a measured tell rather than
+a guess. More budget cannot fix a term that is numerically absent from the objective.
+
+### How to read `chain_intact`
+
+It is `(bond_dev <= tol).all(dim=1).float().mean()` -- `.all()` over bonds, THEN the mean over
+peptides. So it is **the fraction of peptides whose every bond passes, not the fraction of
+bonds**. Backing out the per-bond rate at ~9.25 bonds per peptide:
+
+| arm | chain_intact | implied per-bond | bad bonds/peptide |
+|---|---|---|---|
+| contactonly | 0.9313 | 0.992 | 0.07 |
+| internal | 0.1677 | ~0.82 | ~1.6 |
+| gan | 0.0151 | 0.638 | 3.3 |
+
+Those are UPPER bounds -- failures cluster (measured: observed 0.141 vs 0.042 predicted by
+independence). So the internal arm gets ~4 bonds in 5 right and typically misses one or two;
+mean bond MAE 0.0123 is *inside* the 0.02 tolerance, i.e. the failure is a tail, not a broken
+backbone. This is also why the metric is **length-biased**: a 16-mer needs 15 consecutive
+passes, an 8-mer only 7, so it penalises long peptides independently of geometry quality.
 
 ## Traps found the hard way
 
