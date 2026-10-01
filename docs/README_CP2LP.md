@@ -1182,6 +1182,96 @@ A CA-CA penalty term is **not** on this list as a primary fix: it would be a sev
 the budget that already retires the sequence term to make room, and it addresses only the
 constraint whose repair was measured to be insufficient on its own.
 
+## The fix: a CA edit space with no invalid points
+
+`src/proteinfoundation/cp2lp/ca_internal.py`. A CA trace becomes (seed frame, bond lengths,
+bend angles, virtual torsions); an edit moves the bend angles, the torsions, and a rigid
+transform of the whole trace. Bond lengths are not in the edit space by default and bend angles
+are clamped to the measured native window, so **no reachable output is an invalid trace**. The
+coherent/incoherent split the probe had to measure becomes structural: rigid motion is the
+seed-frame delta, shape is theta/tau, and no parameter stretches the chain.
+
+Zero deltas reproduce the input to 1e-5 nm, so the zero-initialised heads still make the
+editor's first output exactly the AE round trip of the source CP — the property the pretrained
+splice depends on.
+
+### Measured at matched edit size (random edit, SOURCE latents, g=1300 AE)
+
+`scripts/cp2lp_internal_probe.sbatch`. Both arms at identical RMS CA displacement, same frozen
+decoder, same latents. `chain_intact`:
+
+| sigma_c nm | RMS disp nm | cartesian | **internal** | cart CA-CA sd | int CA-CA sd | cart bend min | int bend min |
+|---|---|---|---|---|---|---|---|
+| 0.005 | 0.005 | 0.9375 | **0.9688** | 0.00905 | 0.00589 | 75.9 | 73.9 |
+| 0.010 | 0.010 | 0.4219 | **0.9844** | 0.01514 | 0.00589 | 71.6 | 74.3 |
+| 0.020 | 0.020 | 0.0625 | **0.9688** | 0.02923 | 0.00589 | 70.6 | 73.5 |
+| 0.040 | 0.040 | 0.0000 | **0.7812** | 0.05300 | 0.00589 | 56.6 | 73.8 |
+| 0.070 | 0.070 | 0.0000 | **0.4375** | 0.09226 | 0.00589 | 50.8 | 73.0 |
+| 0.110 | 0.107 | 0.0000 | **0.3906** | 0.13780 | 0.00589 | 12.6 | 73.0 |
+| 0.1705 | 0.167 | 0.0000 | 0.0469 | 0.19775 | 0.00589 | 5.2 | 73.0 |
+
+Controls behave: `source` and `rigid_only` both read 0.9844 at every sigma, so a rigid motion of
+the matched size costs exactly nothing and the harness is measuring what it claims.
+
+**The internal space supports a 4-8x larger edit at matched `chain_intact`** — 0.020 vs 0.005
+to hold ~0.95, 0.070 vs 0.010 to hold ~0.43, ~0.16 vs 0.020 to hold ~0.06. And the CA trace is
+*exactly* native at every size: CA-CA sd pinned at the source's own 0.00589 nm and the bend
+floor never below 73 deg, against the Cartesian arm's sd rising to 0.198 and its bend floor
+collapsing to 5.2 deg.
+
+For scale: the control arm trains at sigma_c 0.031-0.033 and scores 0.52-0.72. The internal
+space at sigma_c 0.040 — a *larger* edit — scores 0.78.
+
+### What it does NOT fix, and this is the important part
+
+**A valid CA trace is necessary but not sufficient.** At the gan arm's own sigma_c of 0.1705 the
+internal edit still only reaches 0.0469, with a perfectly native trace. So the damage at large
+edit size is not CA invalidity — it is **CA-latent inconsistency**. The decoder places C(i) in
+residue i's local frame and N(i+1) in residue i+1's, so the peptide bond spans two frames and
+is intact only if the latents agree with the actual inter-frame geometry, which *is* the
+torsion. Move tau without updating the latents and the bond opens, however native the trace.
+
+This re-reads the earlier 2x2 honestly: the `edit_ca + src_z` cell (0.0469) was attributed to
+the trace being invalid, and it is mostly not — making the trace perfectly valid moved it only
+to 0.0781. Most of that cell is staleness between the two channels.
+
+Two consequences:
+
+* every number in the table above is a **FLOOR** for the parameterisation, not a prediction. It
+  uses SOURCE latents, i.e. deliberately stale ones. A trained editor co-edits the latents, and
+  the control arm is already measured doing exactly that — its edited latents recover +0.234 of
+  `chain_intact` over a source-latent substitution.
+* the remaining work is on the latent channel, not the CA channel. The CA channel is now
+  constraint-exact and costs nothing to keep that way.
+
+A `latent_oracle` column would settle how much of the residue is staleness, by re-encoding the
+decoded structure. **Deliberately not implemented**: a faithful re-encode must rebuild the
+encoder's whole input batch, and `coords` and `coords_nm` are different rigid frames ~19 A apart
+that different feature factories read independently, so overriding only the nm coordinates
+returns latents that mean nothing. The column would look authoritative and be wrong.
+
+### Caveat on the random edit
+
+A random torsional edit barely extends a peptide: at sigma_c 0.1705 the internal arm moved the
+terminal gap only 0.352 -> 0.544 nm. The task needs a COORDINATED edit — driving the virtual
+torsions toward trans takes a 16-mer to ~5 nm end to end. So the matched-size table understates
+the parameterisation, and `script_utils/cp2lp_extension_tradeoff_probe.py` measures the curve
+that matters instead: `chain_intact` against terminal gap along a coordinated walk toward the
+extended corner, against real bound LPs' 2.14 nm median.
+
+### Convention traps found while building it
+
+* **The NeRF normal's sign disagreed with the extracted dihedral's.** Three of the four
+  guarantee tests passed while the round trip was out by **3.6 nm** — the rebuild produced
+  valid-LOOKING traces that were not the input. Pinned now by `test_round_trip_is_exact`.
+* **`_dihedral` omitted the `-(p1 - p0)` negation**, so it was offset by exactly pi from IUPAC:
+  anti read 0 instead of 180, and an extended trace came out at tau=0. Now pinned by physics
+  rather than by convention — theta 91 deg / tau 50 reproduces the alpha-helix rise at 1.52 A
+  per residue, theta 120 / tau 180 the beta-strand at 3.33 A. **`geometry.backbone_dihedrals`
+  carries the same un-negated form.** Harmless there, because the discriminator sees the same
+  relabelling on real and generated peptides alike, but those values are NOT Ramachandran
+  phi/psi and must not be read as such.
+
 ## Traps found the hard way
 
 - **A second-resolution timestamp is not a unique env-file name.** Two
