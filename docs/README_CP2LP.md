@@ -1055,24 +1055,51 @@ or smoothly bending the peptide moves every CA and changes no CA-CA distance; on
 0 for a rigid motion and 1 for an iid residual (both anchored in
 `script_utils/test_cp2lp_ca_spacing_probe.py`).
 
-### Dose response (eval64 manifest, g=1300)
+### Dose response (eval64 manifest)
 
-| run | sigma_c nm | incoherence | dCA-CA nm | in native sd | CA-CA sd nm | outside window | chain_intact |
-|---|---|---|---|---|---|---|---|
-| real LP reference | 0.0000 | n/a | 0.0000 | 0.0 | 0.0065 | 3.1% | **0.9609** |
-| onepass_contactonly | 0.0332 | **0.414** | 0.0194 | 4.0 | 0.0191 | 50.0% | 0.5156 |
-| onepass_gan | 0.1094 | **0.392** | 0.0607 | 12.6 | 0.0547 | 87.7% | **0.0000** |
+| run | g | sigma_c nm | incoherence | dCA-CA nm | in native sd | CA-CA sd nm | outside window | chain_intact |
+|---|---|---|---|---|---|---|---|---|
+| real LP reference | — | 0.0000 | n/a | 0.0000 | 0.0 | 0.0065 | 3.1% | **0.9609** |
+| onepass_contactonly | 1300 | 0.0332 | 0.414 | 0.0194 | 4.0 | 0.0191 | 50.0% | 0.5156 |
+| onepass_contactonly | 5300 | 0.0313 | 0.332 | 0.0147 | 3.1 | 0.0150 | 43.4% | 0.7188 |
+| onepass_gan | 1300 | 0.1094 | 0.392 | 0.0607 | 12.6 | 0.0547 | 87.7% | **0.0000** |
+| onepass_gan | 5300 | 0.1705 | 0.296 | 0.0713 | 14.9 | 0.0704 | 80.6% | **0.0156** |
 
-**The incoherence fraction is the same in both arms — 0.414 against 0.392 — while sigma_c
-differs 3.3x.** That is the finding. The adversary does not teach the editor worse geometry;
-it makes the edit *bigger*, and because the chain-breaking share is a constant of the
-parameterisation, damage scales with edit size. The gan arm's CA trace carries bonds from
-**1.0 A to 7.2 A** and bend angles down to **25.6 deg**.
+**At matched g the two arms sit at the same incoherence** — 0.414 vs 0.392 at g=1300, 0.332
+vs 0.296 at g=5300 — while sigma_c differs by 3.3x and then 5.4x. So the adversary is not
+teaching the editor worse geometry; it is making the edit *bigger*. The gan arm hands the
+decoder bonds from **1.0 A to 7.2 A** and bend angles down to **25.6 deg**.
 
-Put the other way: holding CA-CA inside one native sd needs incoherence under **2.0%** at
-the gan arm's sigma_c, and under the export tolerance needs **8.3%**. The editor delivers
-39%. The control is viable only because its edit is small enough that 41% incoherence still
-lands within 4 native sd.
+Holding CA-CA inside one native sd needs incoherence under **2.0%** at the gan arm's sigma_c,
+and under the export tolerance **8.3%**. The editor is at 30-39%. The control is viable only
+because its edit is small enough that ~40% incoherence still lands within 4 native sd.
+
+### The race, and why the adversarial arm loses it
+
+Incoherence is **not** a fixed constant — the editor is slowly learning to be more coherent.
+It is losing to the growth in edit size:
+
+| arm | quantity | g=1300 | g=5300 | change |
+|---|---|---|---|---|
+| contactonly | edit size sigma_c | 0.0332 | 0.0313 | −5.8% |
+| contactonly | incoherence | 0.414 | 0.332 | −19.7% |
+| contactonly | **CA-CA damage** | 0.0194 | 0.0147 | **−24.4%** |
+| contactonly | chain_intact | 0.5156 | 0.7188 | — |
+| gan | edit size sigma_c | 0.1094 | 0.1705 | **+55.8%** |
+| gan | incoherence | 0.392 | 0.296 | −24.6% |
+| gan | **CA-CA damage** | 0.0607 | 0.0713 | **+17.5%** |
+| gan | chain_intact | 0.0000 | 0.0156 | — |
+
+Both arms clean up their residual at the same rate (−0.020 and −0.024 incoherence per 1,000 g
+updates). The control holds its edit size flat, so its damage falls and `chain_intact` climbs
+0.52 -> 0.72. The gan arm's edit grows 56%, which outruns the cleanup, so **its net CA-CA
+damage rises 17.5% and `chain_intact` stays pinned near zero.**
+
+Extrapolating the gan arm's cleanup rate linearly — **unsafe, and stated as such** — reaching
+8.3% incoherence needs ~8,900 more generator updates and 2.0% needs ~11,500, against the
+**5,000 remaining** in the `max_g_updates: 10300` budget. And that extrapolation is optimistic
+twice over: it assumes the cleanup rate holds all the way down, and it ignores that sigma_c is
+still growing. Do not read "incoherence is falling" as "this fixes itself".
 
 ### Apportionment: which input carries the damage
 
@@ -1124,10 +1151,12 @@ but it is an offset, not a match.
 ### What this rules out, and what it implies
 
 **Not a loss-weight problem.** The geometry term acts downstream of the frozen decoder while
-the cause is an unconstrained CA trace upstream of it, and the incoherent share is
-architecture-determined rather than pressure-determined. Within this parameterisation the
-only way to cut damage is to shrink the edit — which is exactly the control "passing the gate
-by not moving". No setting of `geometry_weight` escapes that line; it only slides along it.
+the cause is an unconstrained CA trace upstream of it, and incoherence is the same in both
+arms at matched g — it tracks training, not adversarial pressure. Within this parameterisation
+the only lever on damage is edit size, and the control's 0.72 is bought by holding its edit
+flat, i.e. by very nearly not moving. No setting of `geometry_weight` escapes that trade; it
+only slides along it. The editor *is* learning to edit more cleanly, just far too slowly to
+matter inside the budget, and more slowly than the adversary grows the edit.
 
 **Not a tolerance problem**, and not a repeat of the clash-threshold story: the gate is
 calibrated and the trace is genuinely non-physical.
