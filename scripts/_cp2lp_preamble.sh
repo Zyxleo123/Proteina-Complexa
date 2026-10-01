@@ -114,6 +114,13 @@ _cp2lp_defaults() {
   REPORT_DIR="${REPORT_DIR:-${TRIPLET_ROOT}/report}"
 
   PY="${PY:-${REPO}/.venv/bin/python}"
+  # THE WORKTREE TRAP. `proteinfoundation` is installed editable, and the .pth file hardcodes
+  # the MAIN checkout's src -- so `python -m proteinfoundation.train` run from a git worktree
+  # imports the MAIN tree's code regardless of cwd, and `@hydra.main(config_path="../../configs")`
+  # is relative to THAT file, so it reads the main tree's configs too. PYTHONPATH takes
+  # precedence over the .pth, so pointing it at $REPO/src makes a worktree run its own code.
+  # Harmless in the main checkout, where it names the path already in use.
+  export PYTHONPATH="${REPO}/src${PYTHONPATH:+:${PYTHONPATH}}"
   SMOKE="${SMOKE:-0}"
   export PYTHONUNBUFFERED=1
 }
@@ -148,6 +155,25 @@ _cp2lp_preflight() {
   [[ -f "${AE_CKPT}" ]]      || { echo "ERROR: missing AE checkpoint: ${AE_CKPT}" >&2; ok=1; }
   [[ -f "${TRAIN_META}" ]]   || { echo "ERROR: missing train metadata: ${TRAIN_META}" >&2
                                   echo "       build it: ${PY} script_utils/cp2lp_build_splits.py --mixed ${LPDATA}/mixed_train.parquet --out-dir ${LPDATA}" >&2; ok=1; }
+  # WHICH TREE'S CODE IS THIS? Asked out loud, because the failure mode is silent: run from a
+  # worktree without PYTHONPATH, the editable install resolves `proteinfoundation` to the MAIN
+  # checkout and the job trains the main tree's code under this arm's run_name. Two "different"
+  # runs then agree and nothing in the log says why. Measured on job 69678, which only failed
+  # loudly because the config it wanted existed in the worktree alone.
+  local resolved
+  resolved="$("${PY}" -c 'import proteinfoundation,inspect,os; print(os.path.realpath(inspect.getfile(proteinfoundation)))' 2>/dev/null || true)"
+  if [[ -z "${resolved}" ]]; then
+    echo "ERROR: could not import proteinfoundation with ${PY}" >&2; ok=1
+  elif [[ "${resolved}" != "$(realpath "${REPO}")"/* ]]; then
+    echo "ERROR: proteinfoundation resolves OUTSIDE this checkout." >&2
+    echo "       REPO     : $(realpath "${REPO}")" >&2
+    echo "       resolved : ${resolved}" >&2
+    echo "       This job would train a DIFFERENT tree's code under run_name=${RUN_NAME}." >&2
+    echo "       PYTHONPATH is ${PYTHONPATH:-<unset>}; it must start with \${REPO}/src." >&2
+    ok=1
+  else
+    echo "[preflight] code tree: ${resolved}"
+  fi
   return "${ok}"
 }
 
