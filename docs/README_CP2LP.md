@@ -566,6 +566,58 @@ drives the noise. No intervention was made on arm B.
 resolves the reference arm to whichever addon arm sorts last, which made `gan` and `noise`
 come out identical to four decimal places. Anchor on `-{run_name}-[0-9a-f]+/`.
 
+### Mid-training, matched band g=3800-4200 (of 10,300)
+
+| arm | retention | gap nm | dCA nm | bond MAE | **chain_intact** | min pocket nm | d_acc | probe | \|g\| |
+|---|---|---|---|---|---|---|---|---|---|
+| `contactonly` | 0.9982 | 0.492 | 0.0297 | **0.0059** | **0.772** | 0.2410 | — | — | 0.51 |
+| `gan` | 0.9615 | 1.252 | 0.1675 | 0.0356 | 0.010 | 0.1369 | 0.908 | 0.576 | 5.65 |
+| `gan_ar1` | 0.9560 | 1.334 | 0.1886 | 0.0412 | 0.005 | 0.1196 | 0.901 | 0.581 | 5.87 |
+| `gan_noise` | 0.9526 | 1.385 | 0.1881 | 0.0422 | 0.006 | 0.1314 | 0.900 | 0.579 | 6.66 |
+| `gan_nce` | **0.9643** | 1.142 | **0.1432** | **0.0334** | 0.016 | **0.1530** | 0.903 | 0.573 | 6.63 |
+
+**`chain_intact` IS NOW AN EXPORT FORECAST, and this is the decisive column.** In rollout mode
+it was not — it was measured on a 24-step trajectory while export used a 200-step sampler,
+so it read 0 by construction. One-pass training and export call the *same* function, so this
+number predicts the export gate directly. It says: **the control will export triplets at
+~77% and the adversarial arms at ~1%.**
+
+**So the tension is now crisp, and neither side is yet a usable triplet source.** The control
+produces chemically-valid-but-conformationally-ring-like LPs: gap 0.492 against a 0.45 hinge
+and a real-LP median of 2.14, CA drift 0.0297 nm. It passes the gate by *not moving*. The
+adversarial arms produce LP-like conformations — gap 1.14–1.39, drift 0.14–0.19 — with
+backbones that fail the 0.02 nm bond tolerance. One is valid and uninteresting; the other is
+interesting and invalid.
+
+**The trend is in the adversarial arms' favour.** Against the g=700–1000 band, `gan` bond MAE
+fell 0.0506 → 0.0356 (−30%) while retention rose 0.9219 → 0.9615 and the gap kept opening.
+Whether 0.0356 reaches 0.02 by g=10,300 is the open question, and the gate needs *every* bond
+inside tolerance, not the mean — so this does not extrapolate safely.
+
+The shortcut probe rose 0.505 → ~0.576 against `d_acc` 0.90. Read the **gap** (0.32), which
+is the same healthy regime as v1 (probe 0.645–0.738 under `d_acc` 0.96–0.996).
+
+#### Both noise and nce addons have now saturated, for opposite reasons
+
+**`dgan_p` = 0.999 — the controller hit its ceiling**, ahead of the g≈4500 projection. But
+`d_acc` on corrupted features is 0.900 against 0.910 clean: **even at maximum configured
+corruption D is barely affected.** So the binding constraint is `max_std: 0.2`, not the
+adaptation rate that first looked suspect. If arm B lands on top of the plain GAN, the honest
+conclusion is "corruption up to 0.2x per-channel std does not change the outcome" — *not*
+"Diffusion-GAN does not help".
+
+**`nce_loss` = 0.096, far BELOW the ~1.2–1.4 floor measured at initialisation.** The
+contrastive task is now nearly solved, so with weight 0.1 the term contributes ~0.01 and is
+close to inert — after having shaped the trajectory (this arm has the best retention, the
+lowest drift and the best geometry of the four adversarial arms).
+
+**CAVEAT, and it matters for how arm C is reported: `nce_loss` → 0 does not prove retention.**
+The projection head is trainable and sits on the generator's optimizer, so it can minimise
+the loss by finding descriptors that identify position `i` easily rather than by the
+generator preserving content — and the pocket-distance block is largely source-determined, so
+it is identifiable almost for free. The honest instrument for arm C is its **retention**
+column, not its loss.
+
 ### What decides
 
 An addon is kept only if it improves valid LP quality **and** retention at **useful yield**
