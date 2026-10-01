@@ -78,6 +78,16 @@ ENV_FILE="${REPO}/env_files/cp2lp_onepass_${STAGE}_${STAMP}.env"
 echo "env file: $ENV_FILE"
 sed 's/^/  /' "$ENV_FILE"
 
+# `--set` values must also be visible to THIS script, not only to the job. Several stages read
+# an override to decide what to submit -- `smoke-one` reads SMOKE_ARM -- and without this the
+# documented `--submit smoke-one --set SMOKE_ARM=onepass_gan_nce` silently submitted the
+# DEFAULT arm: the value reached the env file, the job then had ARM= passed positionally by
+# this script, and a positional argument beats the env file. Both jobs succeed and the two
+# "different" smokes simply agree, so nothing in the logs says it happened.
+for kv in "${OVERRIDES[@]:-}"; do
+  [[ -n "$kv" && "$kv" == *=* ]] && export "${kv?}"
+done
+
 # Submitting from inside an allocation leaks SLURM_* into the child job, where it confuses
 # the new job's own bookkeeping. Scrub before calling sbatch.
 scrub_env() {
