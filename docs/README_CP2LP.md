@@ -1259,6 +1259,60 @@ the parameterisation, and `script_utils/cp2lp_extension_tradeoff_probe.py` measu
 that matters instead: `chain_intact` against terminal gap along a coordinated walk toward the
 extended corner, against real bound LPs' 2.14 nm median.
 
+### The binding constraint is CA-latent consistency, not CA validity
+
+`script_utils/cp2lp_extension_tradeoff_probe.py` walks the source CP toward the extended
+corner of internal-coordinate space (theta 120 deg, tau 180) by a fraction `f`, decoding at
+each step with the SOURCE latents. The CA trace is perfectly native at **every** point —
+CA-CA sd pinned at 0.00589 nm, bend angles 74.5-160.4 deg throughout — and `chain_intact`
+still collapses:
+
+| f | terminal gap nm | chain_intact | RMS disp nm | cn_dev median | cn_dev p99 |
+|---|---|---|---|---|---|
+| 0.00 | 0.352 | **0.9844** | 0.000 | 0.0029 | 0.0140 |
+| 0.05 | 0.478 | 0.3594 | 0.087 | 0.0073 | 0.0458 |
+| 0.10 | 0.657 | 0.0781 | 0.182 | 0.0125 | 0.1050 |
+| 0.15 | 0.866 | 0.0312 | 0.282 | 0.0183 | 0.1567 |
+| 0.20 | 1.091 | 0.0156 | 0.386 | 0.0230 | 0.2245 |
+| 0.30 | 1.552 | **0.0000** | 0.591 | 0.0358 | 0.2854 |
+| 0.40 | 1.977 | 0.0000 | 0.774 | 0.0562 | 0.3489 |
+| 1.00 | 3.021 | 0.0000 | 1.202 | 0.1239 | 0.3776 |
+
+Real bound LPs sit at a 2.14 nm median terminal gap, which needs f ~= 0.45. **`chain_intact`
+is 0.0000 there, from a flawless CA trace.** Integrity is already gone by f=0.05, a gap of
+0.478 nm against the source's 0.352.
+
+So the ordering of the two injuries is settled, and it is not the one the first diagnosis
+implied:
+
+1. **CA-latent consistency is the binding constraint.** The decoder places C(i) in residue
+   i's local frame and N(i+1) in residue i+1's, so the peptide bond spans two frames and is
+   intact only if the latents agree with the actual inter-frame geometry — which *is* the
+   virtual torsion. Move tau without updating the latents and the bond opens, however native
+   the trace. The usable edit budget with stale latents is ~0.05-0.09 nm RMS displacement; the
+   task needs ~0.77 nm, i.e. **10-15x more**.
+2. **CA validity is the secondary constraint**, and it is now free: the internal space removes
+   it at no cost and buys a 4-8x larger edit at matched integrity.
+
+### What this means for the fix
+
+The internal parameterisation is **necessary but not sufficient**, and its value is sharper
+than "it helps": it removes the part of the constraint that was *unachievable*. In Cartesian
+space the geometry loss was being asked to make a free per-residue residual preserve a rigid
+rod — something no amount of weight could buy, which is why reweighting only slid along the
+trade-off. In internal space the CA channel is exact by construction, so the geometry term's
+only remaining job is to teach latent consistency, and that **is** learnable: the editor
+co-edits both channels, and the control arm is already measured doing it (its edited latents
+recover +0.234 of `chain_intact` over a source-latent substitution).
+
+That is the claim the arm tests, and the reason every probe number here is a FLOOR rather than
+a prediction — all of them use deliberately stale source latents, which the trained editor does
+not.
+
+Read the arm on `geom_chain_intact_frac` **against** `delta_ca_rms_nm`, never either alone: the
+Cartesian arms' failure was invisible in the second column and the control's success was bought
+by keeping it small.
+
 ### Convention traps found while building it
 
 * **The NeRF normal's sign disagreed with the extracted dihedral's.** Three of the four
