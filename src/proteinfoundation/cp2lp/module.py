@@ -227,6 +227,17 @@ class CP2LPGenerator(Proteina):
         # one-way ratchet under any pressure that pushes the peptide off the receptor.
         self.contact_sharpness_nm = float(lw.get("contact_sharpness_nm", 0.1))
         self.clash_threshold_nm = float(lw.get("clash_threshold_nm", 0.20))
+        # Denominator of the interfacial clash term. `all_pairs` is the legacy behaviour and
+        # stays the default so every existing arm is bit-identical; `peptide_length` is the
+        # fix measured at g=10300, where the legacy normalisation left a 1.14 A heavy-atom
+        # contact contributing 0.06% of the objective. See `losses.clash_loss` for why the
+        # denominator is NOT the violating-pair count.
+        self.clash_inter_norm = str(lw.get("clash_inter_norm", "all_pairs"))
+        if self.clash_inter_norm not in ("all_pairs", "peptide_length"):
+            raise ValueError(
+                "losses.clash_inter_norm must be 'all_pairs' or 'peptide_length', got "
+                f"{self.clash_inter_norm!r}"
+            )
         self.min_open_gap_nm = float(lw.get("min_open_gap_nm", 0.45))
         self.w_real_lp_flow = float(cfg.get("real_lp_flow_weight", 1.0))
 
@@ -727,7 +738,7 @@ class CP2LPGenerator(Proteina):
         geom, _ = open_chain_geometry_loss(decoded["coors_nm"], decoded["atom_mask_eff"], mask)
         clash, _ = clash_loss(
             atom37=decoded["coors_nm"], atom_mask=decoded["atom_mask_eff"], pep_mask=mask,
-            threshold_nm=self.clash_threshold_nm, **target,
+            threshold_nm=self.clash_threshold_nm, inter_norm=self.clash_inter_norm, **target,
         )
         opening, _ = terminal_opening_reward(decoded["coors_nm"], mask, self.min_open_gap_nm)
         return {"contact": contact, "sequence": seq, "geometry": geom, "clash": clash, "open": opening}
@@ -792,6 +803,7 @@ class CP2LPGenerator(Proteina):
             target_atom_mask=gen_batch["target_mask"],
             target_mask=gen_batch["seq_target_mask"].bool(),
             threshold_nm=self.clash_threshold_nm,
+            inter_norm=self.clash_inter_norm,
         )
         total = total + self.w_clash * clash
         metrics["loss_clash"] = clash.detach()

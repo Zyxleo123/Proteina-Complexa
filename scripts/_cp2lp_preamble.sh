@@ -72,6 +72,9 @@ _cp2lp_defaults() {
     onepass_gan_noise)   CONFIG_NAME="${CONFIG_NAME:-example/training_cp2lp_onepass_gan_noise}";   RUN_NAME="${RUN_NAME:-cp2lp_onepass_gan_noise}" ;;
     onepass_gan_nce)     CONFIG_NAME="${CONFIG_NAME:-example/training_cp2lp_onepass_gan_nce}";     RUN_NAME="${RUN_NAME:-cp2lp_onepass_gan_nce}" ;;
     onepass_internal)    CONFIG_NAME="${CONFIG_NAME:-example/training_cp2lp_onepass_internal}";    RUN_NAME="${RUN_NAME:-cp2lp_onepass_internal}" ;;
+    # Forks from onepass_internal's g=10300 RESUME state, not from the common warmup fork --
+    # see the INIT_CKPT case below and scripts/pin_cp2lp_resume.sh.
+    onepass_internal_clashnorm) CONFIG_NAME="${CONFIG_NAME:-example/training_cp2lp_onepass_internal_clashnorm}"; RUN_NAME="${RUN_NAME:-cp2lp_onepass_internal_clashnorm}" ;;
     *)           CONFIG_NAME="${CONFIG_NAME:-example/training_cp2lp_gan}";          RUN_NAME="${RUN_NAME:-cp2lp_${ARM}}" ;;
   esac
 
@@ -85,6 +88,22 @@ _cp2lp_defaults() {
     onepass_*)      INIT_CKPT="${INIT_CKPT:-${FORK_CKPT}}" ;;
     *)              INIT_CKPT="${INIT_CKPT:-${FLOW_CKPT}}" ;;
   esac
+
+  # Arms that FORK MID-RUN rather than from the common warmup. These must resume from a
+  # `last.ckpt` seeded into their own checkpoint directory, because `pretrain_ckpt_path`
+  # loads weights WITHOUT optimizer states (train.py says so explicitly) and a mid-run A/B
+  # cannot afford to reset Adam moments on one side only.
+  #
+  # THE SILENT FAILURE THIS GUARDS. `INIT_CKPT` above resolves to the g=300 warmup fork for
+  # every `onepass_*` arm. If the resume seed is missing, Lightning finds no `last.ckpt`,
+  # falls through to that pretrain path, and trains happily from g=300 under a run_name that
+  # claims to be a g=10300 continuation -- a completely different experiment with nothing in
+  # the log to say so. Checked rather than documented.
+  case "${ARM}" in
+    onepass_internal_clashnorm) RESUME_SEED_REQUIRED="${RESUME_SEED_REQUIRED:-1}" ;;
+    *)                          RESUME_SEED_REQUIRED="${RESUME_SEED_REQUIRED:-0}" ;;
+  esac
+  RESUME_SEED_SRC="${RESUME_SEED_SRC:-cp2lp_onepass_internal}"
 
   WANDB_PROJECT="${WANDB_PROJECT:-cpsea_cp2lp}"
   WANDB_ENTITY="${WANDB_ENTITY:-zyxleo}"
@@ -218,6 +237,31 @@ _cp2lp_preflight_flow_ckpt() {
   echo "[preflight] init: ${INIT_CKPT}"
   echo "[preflight] AE  : ${AE_CKPT}"
   [[ -f "${INIT_CKPT}.source" ]] && sed 's/^/[preflight]   /' "${INIT_CKPT}.source"
+  return 0
+}
+
+# An arm that forks mid-run must find its seeded `last.ckpt`. Returns non-zero so the caller
+# can exit 1: this is a hard requirement, and the whole point is that it must NOT degrade
+# gracefully into a run from the warmup fork.
+_cp2lp_preflight_resume_seed() {
+  [[ "${RESUME_SEED_REQUIRED:-0}" == "1" ]] || return 0
+  local seed="${STORE}/${RUN_NAME}/checkpoints/last.ckpt"
+  if [[ ! -f "${seed}" ]]; then
+    echo "ERROR: ${ARM} forks mid-run and its resume seed is missing:" >&2
+    echo "       ${seed}" >&2
+    echo "       Without it this job would silently train from the g=300 warmup fork" >&2
+    echo "       (${INIT_CKPT}) under run_name=${RUN_NAME}." >&2
+    echo "       Seed it: bash scripts/pin_cp2lp_resume.sh ${RESUME_SEED_SRC} ${RUN_NAME}" >&2
+    return 1
+  fi
+  echo "[preflight] resume seed: ${seed}"
+  # Provenance, so the log of THIS run records which state it forked from and at what md5 --
+  # the only durable evidence that it and its control started from the same weights.
+  if [[ -f "${STORE}/${RUN_NAME}/checkpoints/resume.source" ]]; then
+    sed 's/^/[preflight]   /' "${STORE}/${RUN_NAME}/checkpoints/resume.source"
+  else
+    echo "[preflight]   WARNING: no resume.source beside it -- provenance unrecorded." >&2
+  fi
   return 0
 }
 

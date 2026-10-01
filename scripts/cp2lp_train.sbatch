@@ -39,6 +39,7 @@ _cp2lp_defaults
 _cp2lp_banner "train"
 _cp2lp_preflight || { echo "FATAL: preflight failed" >&2; exit 1; }
 _cp2lp_preflight_flow_ckpt || { echo "FATAL: flow init missing" >&2; exit 1; }
+_cp2lp_preflight_resume_seed || { echo "FATAL: mid-run fork has no resume seed" >&2; exit 1; }
 
 cd "$REPO"
 mkdir -p slurm_logs

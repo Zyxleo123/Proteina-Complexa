@@ -10,6 +10,7 @@ Run: .venv/bin/python -m pytest script_utils/test_cp2lp.py -q
 
 from __future__ import annotations
 
+import pytest
 import torch
 
 from proteinfoundation.cp2lp.conditioning import (
@@ -39,6 +40,7 @@ from proteinfoundation.cp2lp.geometry import (
     C_IDX,
     N_IDX,
     backbone_dihedrals,
+    heavy_atom_distances,
     open_chain_bond_pair_mask,
     peptide_bond_deviation_nm,
     terminal_gap_nm,
@@ -879,3 +881,230 @@ def test_preamble_run_names_track_the_configs():
             assert m, f"no RUN_NAME default found for arm {arm}"
             assert m.group(1) == want, \
                 f"arm {arm}: preamble default {m.group(1)!r} != config run_name {want!r}"
+
+
+# ------------------------------------------------------- clash interfacial normalisation
+
+
+def _pep_and_target(n_pep=6, n_tgt=40, gap_nm=0.5, seed=0):
+    """A peptide beside a slab of target residues, `gap_nm` away along y.
+
+    The target is big on purpose: the defect being fixed is dilution by the receptor's
+    size, so a test with a 3-residue target could not show it.
+    """
+    x, m = _atom37(b=1, n=n_pep, seed=seed)
+    pm = torch.ones(1, n_pep, dtype=torch.bool)
+    g = torch.Generator().manual_seed(seed + 77)
+    t = torch.zeros(1, n_tgt, 37, 3)
+    tm = torch.zeros(1, n_tgt, 37, dtype=torch.bool)
+    for j in range(n_tgt):
+        # Spread along x so most target residues are FAR from the peptide in 3D, which is
+        # what a real pocket looks like: thousands of pairs, a handful of them close.
+        t[:, j, CA_IDX] = torch.tensor([0.4 * j, gap_nm, 0.0])
+        tm[:, j, CA_IDX] = True
+    t = t + 0.001 * torch.randn(t.shape, generator=g) * tm[..., None].float()
+    return x, m, pm, t, tm, torch.ones(1, n_tgt, dtype=torch.bool)
+
+
+def test_clash_inter_norm_rejects_an_unknown_value():
+    """A typo'd normalisation must not silently fall through to the legacy behaviour: the
+    two arms would then be identical and the comparison would read as 'no effect'."""
+    x, m, pm, t, tm, tsm = _pep_and_target()
+    with pytest.raises(ValueError, match="inter_norm"):
+        clash_loss(x, m, pm, target_atom37=t, target_atom_mask=tm, target_mask=tsm,
+                   inter_norm="per_violating_pair")
+
+
+def test_clash_all_pairs_is_unchanged_by_the_new_branch():
+    """The legacy path is what every other arm trains under. If this drifts, five finished
+    runs stop being comparable to anything new."""
+    x, m, pm, t, tm, tsm = _pep_and_target(gap_nm=0.15)
+    kw = dict(target_atom37=t, target_atom_mask=tm, target_mask=tsm, threshold_nm=0.2)
+    got, _ = clash_loss(x, m, pm, inter_norm="all_pairs", **kw)
+    # Recomputed here from the formula the arms were trained with, independently of the
+    # implementation: summed depth over EVERY peptide x target pair.
+    d = heavy_atom_distances(x, m, t, tm)
+    t_pair = pm[:, :, None] & tsm[:, None, :]
+    inter = (torch.relu(0.2 - d) * t_pair.float()).sum()
+    want_inter = inter / t_pair.float().sum().clamp(min=1.0)
+    intra, _ = clash_loss(x, m, pm, threshold_nm=0.2)  # no target -> intra only
+    assert float(got) == pytest.approx(float(intra + want_inter), rel=1e-6)
+
+
+def test_clash_peptide_length_is_monotone_in_overlap_depth():
+    """THE PROPERTY THAT PICKED THIS DENOMINATOR.
+
+    Normalising by the VIOLATING-PAIR count -- the first thing the g=10300 measurement
+    suggested -- is non-monotone: a complex with one deep clash sees its AVERAGE penalty
+    fall when a second, milder clash appears, so the generator could lower the loss by
+    adding a steric violation. Peptide length depends on the mask alone, so the penalty can
+    only rise. Both halves are asserted, because the rejected alternative is the reason the
+    accepted one looks arbitrary.
+    """
+    x, m, pm, t, tm, tsm = _pep_and_target(gap_nm=0.5)
+    kw = dict(target_atom37=t, target_atom_mask=tm, target_mask=tsm, threshold_nm=0.2)
+
+    # One deep clash: drag residue 0 almost onto its nearest target residue.
+    deep = x.clone()
+    deep[0, 0, CA_IDX] = t[0, 0, CA_IDX] + torch.tensor([0.0, 0.05, 0.0])
+    one, m_one = clash_loss(deep, m, pm, inter_norm="peptide_length", **kw)
+
+    # Plus a second, MILDER clash elsewhere, leaving the first untouched.
+    both = deep.clone()
+    both[0, 3, CA_IDX] = t[0, 7, CA_IDX] + torch.tensor([0.0, 0.17, 0.0])
+    two, m_two = clash_loss(both, m, pm, inter_norm="peptide_length", **kw)
+
+    assert float(m_two["clash_inter_n_viol"]) > float(m_one["clash_inter_n_viol"]), \
+        "the fixture did not actually add a violation"
+    assert float(two) > float(one), "adding a clash must never lower the penalty"
+
+    # And the rejected alternative really is non-monotone on this same fixture, which is
+    # what makes the choice evidence rather than taste.
+    def per_violating(xx):
+        d = heavy_atom_distances(xx, m, t, tm)
+        t_pair = pm[:, :, None] & tsm[:, None, :]
+        depth = torch.relu(0.2 - d) * t_pair.float()
+        n_viol = (depth > 0).float().sum().clamp(min=1.0)
+        return float(depth.sum() / n_viol)
+
+    assert per_violating(both) < per_violating(deep), \
+        "fixture no longer demonstrates the non-monotonicity this denominator avoids"
+
+
+def test_clash_peptide_length_raises_the_term_out_of_invisibility():
+    """The defect was one of SCALE, so the fix has to be checked on scale, not just sign.
+
+    At g=10300 the interfacial term was 0.06% of the objective while a pair sat at 1.14 A.
+    With a receptor two orders of magnitude longer than the peptide, dividing by all pairs
+    instead of by peptide length costs ~n_target-fold.
+    """
+    x, m, pm, t, tm, tsm = _pep_and_target(n_pep=6, n_tgt=40, gap_nm=0.5)
+    kw = dict(target_atom37=t, target_atom_mask=tm, target_mask=tsm, threshold_nm=0.2)
+    clashed = x.clone()
+    clashed[0, 0, CA_IDX] = t[0, 0, CA_IDX] + torch.tensor([0.0, 0.05, 0.0])
+    old, _ = clash_loss(clashed, m, pm, inter_norm="all_pairs", **kw)
+    new, _ = clash_loss(clashed, m, pm, inter_norm="peptide_length", **kw)
+    assert float(new) > 10.0 * float(old), (
+        f"expected the new normalisation to be orders of magnitude larger, got "
+        f"{float(new):.3e} vs {float(old):.3e}"
+    )
+
+
+def test_clash_peptide_length_does_not_dilute_across_the_batch():
+    """Per complex, THEN average -- not one pooled sum.
+
+    The legacy term pooled the whole batch into one ratio, so a clean long peptide could
+    mask a clashing short one. Under the fix, adding a clean row must leave the clashing
+    row's own contribution intact (it only averages, it does not rescale it).
+    """
+    x, m, pm, t, tm, tsm = _pep_and_target(n_pep=6, n_tgt=40, gap_nm=0.5)
+    kw = dict(threshold_nm=0.2)
+    clashed = x.clone()
+    clashed[0, 0, CA_IDX] = t[0, 0, CA_IDX] + torch.tensor([0.0, 0.05, 0.0])
+
+    one, _ = clash_loss(clashed, m, pm, target_atom37=t, target_atom_mask=tm,
+                        target_mask=tsm, inter_norm="peptide_length", **kw)
+
+    # Row 2 is the same peptide pushed far away: no overlap at all.
+    clean = x.clone() + torch.tensor([0.0, 5.0, 0.0])
+    x2 = torch.cat([clashed, clean], dim=0)
+    m2, pm2 = torch.cat([m, m], 0), torch.cat([pm, pm], 0)
+    t2, tm2, tsm2 = torch.cat([t, t], 0), torch.cat([tm, tm], 0), torch.cat([tsm, tsm], 0)
+    two, met = clash_loss(x2, m2, pm2, target_atom37=t2, target_atom_mask=tm2,
+                          target_mask=tsm2, inter_norm="peptide_length", **kw)
+    # Mean over two rows, one of which contributes nothing beyond its intra term.
+    assert float(met["clash_inter_any_frac"]) == pytest.approx(0.5)
+    # The interfacial part halves exactly, because it is a mean over complexes.
+    intra_only, _ = clash_loss(clean, m, pm, **kw)
+    inter_one = float(one) - float(clash_loss(clashed, m, pm, **kw)[0])
+    inter_two = float(two) - float(clash_loss(x2, m2, pm2, **kw)[0])
+    assert inter_two == pytest.approx(inter_one / 2.0, rel=1e-5)
+
+
+def test_clash_peptide_length_denominator_carries_no_gradient():
+    """The denominator is a residue COUNT from the mask. If it ever became a differentiable
+    function of the coordinates, the generator could lower the loss by appearing longer --
+    and EVERY residue would pick up gradient, including ones nowhere near the receptor.
+
+    Tested by localisation rather than by magnitude: a single target residue is parked on
+    top of peptide residue 0, and residue 5 (1.9 nm away down the chain) must come back
+    with exactly zero gradient.
+    """
+    x, m = _atom37(b=1, n=6)
+    pm = torch.ones(1, 6, dtype=torch.bool)
+    t = torch.zeros(1, 1, 37, 3)
+    tm = torch.zeros(1, 1, 37, dtype=torch.bool)
+    # 0.12 nm from residue 0's CA: inside the 0.2 nm threshold, so a real overlap.
+    t[0, 0, CA_IDX] = x[0, 0, CA_IDX] + torch.tensor([0.0, 0.12, 0.0])
+    tm[0, 0, CA_IDX] = True
+    tsm = torch.ones(1, 1, dtype=torch.bool)
+
+    xv = x.clone().requires_grad_(True)
+    loss, met = clash_loss(xv, m, pm, target_atom37=t, target_atom_mask=tm, target_mask=tsm,
+                           threshold_nm=0.2, inter_norm="peptide_length")
+    assert float(met["clash_inter_n_viol"]) == pytest.approx(1.0), "fixture made no overlap"
+    loss.backward()
+    assert xv.grad is not None and torch.isfinite(xv.grad).all()
+    assert float(xv.grad[0, 0].abs().sum()) > 0.0, "the overlapping residue got no gradient"
+    assert float(xv.grad[0, 5].abs().sum()) == 0.0, (
+        "a residue far from the receptor picked up gradient -- the denominator is "
+        "differentiating through the mask"
+    )
+
+
+def test_clash_inter_norm_reaches_the_loss_from_config_at_both_call_sites():
+    """Same plumbing check as the contact sharpness, and for the same reason: an unplumbed
+    knob is silently the default, and `_generator_loss_terms` is the gradient-attribution
+    path the clash decision is being made on, so it must score what training scores."""
+    import inspect
+
+    from proteinfoundation.cp2lp.module import CP2LPGenerator
+
+    for fn in (CP2LPGenerator._generator_losses, CP2LPGenerator._generator_loss_terms):
+        src = inspect.getsource(fn)
+        assert "inter_norm=self.clash_inter_norm" in src, f"{fn.__name__} drops inter_norm"
+
+
+def test_clashnorm_arm_differs_from_its_control_in_exactly_the_intended_keys():
+    """The arm's whole claim is that it is single-variable against `onepass_internal`.
+
+    Checked by resolving both configs and diffing them, because the file is a thin child and
+    "it only sets one line" is a statement about inheritance, not about the merged result.
+    """
+    import os
+
+    from hydra import compose, initialize_config_dir
+    from omegaconf import OmegaConf
+
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    with initialize_config_dir(config_dir=os.path.join(repo, "configs"), version_base=None):
+        ctl = OmegaConf.to_container(
+            compose(config_name="example/training_cp2lp_onepass_internal"), resolve=False)
+        arm = OmegaConf.to_container(
+            compose(config_name="example/training_cp2lp_onepass_internal_clashnorm"), resolve=False)
+
+    def flat(d, prefix=""):
+        out = {}
+        for k, v in (d or {}).items():
+            key = f"{prefix}{k}"
+            if isinstance(v, dict):
+                out.update(flat(v, f"{key}."))
+            else:
+                out[key] = v
+        return out
+
+    fc, fa = flat(ctl), flat(arm)
+    diff = {k for k in set(fc) | set(fa) if fc.get(k) != fa.get(k)}
+    expected = {
+        "run_name",
+        "cp2lp.losses.clash_inter_norm",
+        "cp2lp.max_g_updates",
+        "cp2lp.eval_checkpoint_g_updates",
+    }
+    assert diff == expected, f"unexpected config differences: {sorted(diff - expected)}"
+    assert fa["cp2lp.losses.clash_inter_norm"] == "peptide_length"
+    # The things a reweight would have moved, asserted to be identical.
+    for k in ("cp2lp.losses.clash_weight", "cp2lp.losses.clash_threshold_nm",
+              "cp2lp.adversarial.weight", "cp2lp.losses.contact_weight",
+              "cp2lp.losses.geometry_weight"):
+        assert fc[k] == fa[k], f"{k} must not change in this arm: {fc[k]} -> {fa[k]}"

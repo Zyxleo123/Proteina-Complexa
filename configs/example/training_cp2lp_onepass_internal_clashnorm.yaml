@@ -1,0 +1,64 @@
+# @package _global_
+# THE CLASH-NORMALISATION ARM. Identical to `onepass_internal` except for the denominator of
+# the interfacial clash term, and it forks from that arm's g=10300 state rather than from the
+# common warmup fork.
+#
+# WHY (measured; docs/README_CP2LP.md, "Where the objective's mass actually is"):
+#
+# * at g 8500-10400 the internal arm carried `clash_inter_sum_nm` 0.435 -- 0.435 nm of total
+#   overlap depth against the receptor -- with the worst pair at `clash_min_inter` 0.114 nm,
+#   i.e. 1.14 A between two heavy atoms, which is physically impossible.
+# * yet `loss_clash` read 0.0003 and the weighted term was 0.06% of the generator objective.
+#   The cause is the normalisation: the batch's summed overlap depth was divided by EVERY
+#   peptide-residue x target-residue pair, ~3,900 per complex for a 16-mer against a
+#   245-residue receptor, so a handful of real clashes were diluted ~1000x.
+# * interface packing is one of the two named tells the discriminator has: generated
+#   `clash_min_inter` sits at 0.15-0.21 nm against natives' 0.262, and `d_acc` is climbing
+#   monotonically (0.899 -> 0.964 across the run). This targets a MEASURED tell.
+#
+# WHAT IT IS NOT. The denominator is peptide length, not the violating-pair count, even
+# though the measurement first suggested the latter. Normalising by violating pairs is
+# non-monotone -- a complex with one deep clash sees its average penalty FALL when a second,
+# milder clash appears, so the generator could lower the loss by adding a steric violation.
+# Peptide length is a function of the mask alone, so it is constant w.r.t. the coordinates and
+# the term stays monotone in every overlap depth.
+#
+# SINGLE VARIABLE, and the list of things deliberately NOT changed with it is the point:
+# `clash_weight` stays 0.5, `clash_threshold_nm` stays 0.20, the adversarial weight stays 0.3,
+# the intra-peptide clash term keeps its own legacy normalisation, and no term is reweighted.
+# The objective's mass is 95% adversarial and `grad_norm_preclip_g` is 7.5 against a clip of
+# 1.0, so a reweight would move several things at once; this arm asks only whether a term that
+# is numerically absent becomes present when its scale is fixed.
+#
+# ITS CONTROL is the unchanged continuation of `onepass_internal` to the same 20300 budget
+# (job 70232). Both resume from a BIT-IDENTICAL `last.ckpt` -- seeded by
+# scripts/pin_cp2lp_resume.sh, md5 recorded in the destination's `checkpoints/resume.source`
+# -- so they share weights, Adam moments, LR-schedule position, EMA state and the g_updates
+# counter. The fork had to go through Lightning's RESUME path and not `pretrain_ckpt_path`,
+# which train.py explicitly loads WITHOUT optimizer states.
+#
+# Run (the resume seed must exist first):
+#   bash scripts/pin_cp2lp_resume.sh cp2lp_onepass_internal cp2lp_onepass_internal_clashnorm
+#   bash scripts/submit_cp2lp_onepass.sh --submit gradnorm      # the before/after measurement
+#   bash scripts/submit_cp2lp_onepass.sh --submit onepass_internal_clashnorm
+
+defaults:
+  - /example/training_cp2lp_onepass_internal
+  - _self_
+
+run_name: cp2lp_onepass_internal_clashnorm
+
+cp2lp:
+  losses:
+    # THE ONE LINE. `all_pairs` is the legacy denominator every other arm uses;
+    # `peptide_length` sums the overlap depth per complex, divides by that complex's peptide
+    # length, and averages over the batch.
+    clash_inter_norm: peptide_length
+
+  # Matched to the control's extension VERBATIM, including the three milestones this arm has
+  # already passed (the trigger is exact equality on the g_updates counter, so they never
+  # fire -- they are here so the two configs cannot be accused of differing on this line).
+  # Set in the config rather than left to EXTRA_HYDRA so the two runs cannot drift apart
+  # through a forgotten override on one of them.
+  max_g_updates: 20300
+  eval_checkpoint_g_updates: [1300, 5300, 10300, 12300, 15300, 17300, 20300]

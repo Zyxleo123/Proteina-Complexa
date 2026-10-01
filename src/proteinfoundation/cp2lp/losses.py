@@ -228,13 +228,46 @@ def clash_loss(
     target_mask: torch.Tensor | None = None,
     threshold_nm: float = CLASH_THRESHOLD_NM,
     min_seq_sep: int = 2,
+    inter_norm: str = "all_pairs",
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Steric overlap inside the peptide and against the pocket.
 
     Intra-peptide pairs closer than ``min_seq_sep`` in sequence are excluded: residues
     ``i`` and ``i+1`` share a peptide bond and are *supposed* to have atoms at bonding
     distance, so penalising them would fight the geometry term.
+
+    ``inter_norm`` selects the denominator of the interfacial term:
+
+    ``all_pairs``
+        The legacy behaviour. Divides the batch's summed overlap depth by the number of
+        peptide-residue x target-residue pairs in the batch. MEASURED consequence
+        (docs/README_CP2LP.md, "Where the objective's mass actually is"): for a 16-mer
+        against a 245-residue receptor that is ~3,900 pairs per complex, of which a
+        handful ever clash, so a real overlap is diluted ~1000x. At g=10300 the internal
+        arm carried 0.435 nm of summed overlap depth with a worst pair at 0.114 nm --
+        1.14 A between two heavy atoms, physically impossible -- while ``loss_clash`` read
+        0.0003 and the term was 0.06% of the objective. Mean-over-everything is the same
+        pathology that makes ``chain_intact`` unreadable.
+
+    ``peptide_length``
+        Sums the overlap depth within each complex, divides by THAT complex's peptide
+        length, then averages over the batch. The denominator is a function of the mask
+        only, so it is a constant w.r.t. the coordinates and the penalty is **monotone in
+        every overlap depth**: deepening any clash, or adding a new one, can only raise the
+        loss.
+
+        This is deliberately NOT normalisation per *violating* pair, which was the first
+        thing the measurement suggested. That quantity is non-monotone: a complex with one
+        deep clash would see its average penalty FALL when a second, milder clash appeared,
+        so the generator could reduce the loss by adding a steric violation. Peptide length
+        is the natural extensive denominator here -- overlap depth scales with how many
+        residues are available to overlap -- and it keeps the term comparable across the
+        length range in a batch without ever rewarding a new clash.
     """
+    if inter_norm not in ("all_pairs", "peptide_length"):
+        raise ValueError(
+            f"clash_loss: inter_norm must be 'all_pairs' or 'peptide_length', got {inter_norm!r}"
+        )
     pm = pep_mask.bool()
     b, n = pm.shape
 
@@ -251,12 +284,32 @@ def clash_loss(
         tm = target_mask.bool()
         d_t = heavy_atom_distances(atom37, atom_mask, target_atom37, target_atom_mask)
         t_pair = pm[:, :, None] & tm[:, None, :]
-        inter = (F.relu(threshold_nm - d_t) * t_pair.float()).sum()
-        n_inter_pairs = t_pair.float().sum().clamp(min=1.0)
-        total = total + inter / n_inter_pairs
+        depth = F.relu(threshold_nm - d_t) * t_pair.float()  # [b, n_pep, n_tgt], nm
+        inter = depth.sum()
+        if inter_norm == "peptide_length":
+            # Per complex, then average. `pm` is a mask, not a function of the
+            # coordinates, so no gradient flows through this denominator.
+            n_res = pm.float().sum(dim=1).clamp(min=1.0)  # [b]
+            total = total + (depth.sum(dim=(1, 2)) / n_res).mean()
+        else:
+            total = total + inter / t_pair.float().sum().clamp(min=1.0)
         metrics["clash_inter_sum_nm"] = inter.detach()
         with torch.no_grad():
+            # Severity and COUNT, separately. The summed depth alone cannot distinguish one
+            # impossible 1.1 A contact from twenty borderline ones, and those are different
+            # defects: the first is what a discriminator can key on, the second is ordinary
+            # interface packing. `clash_min_inter_nm` is kept unchanged for continuity with
+            # the numbers already in the doc.
+            viol = depth > 0
+            n_pep = pm.float().sum(dim=1).clamp(min=1.0)
             metrics["clash_min_inter_nm"] = torch.where(t_pair, d_t, torch.full_like(d_t, 1e4)).amin()
+            metrics["clash_inter_max_depth_nm"] = depth.amax()
+            metrics["clash_inter_n_viol"] = viol.float().sum(dim=(1, 2)).mean()
+            metrics["clash_inter_viol_per_res"] = (viol.float().sum(dim=(1, 2)) / n_pep).mean()
+            # The quantity the `peptide_length` branch actually optimises, logged in BOTH
+            # normalisations so the two arms are comparable on one column.
+            metrics["clash_inter_depth_per_res_nm"] = (depth.sum(dim=(1, 2)) / n_pep).mean()
+            metrics["clash_inter_any_frac"] = (viol.any(dim=2).any(dim=1)).float().mean()
 
     return total, metrics
 

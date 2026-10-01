@@ -25,6 +25,8 @@
 #                            | onepass_gan_noise | onepass_gan_nce
 #   evaluate    GPU  the fixed manifest through each arm at EVAL_CKPT_TAG
 #   report      CPU  the five-arm comparison table and figure
+#   gradnorm    GPU  weighted per-term generator gradient norms at the clash arm's fork
+#                    point, clash scored under BOTH normalisations on one decoded output
 #   pilot            the whole chain with dependencies wired
 #
 # Usage:
@@ -43,7 +45,7 @@ ARMS=(onepass_contactonly onepass_gan onepass_gan_ar1 onepass_gan_noise onepass_
 # member would change what that table means. `onepass_internal` is a separate question (does
 # the CA edit space matter?) with its own control (`onepass_gan`), so it is submitted on its
 # own and compared pairwise.
-EXTRA_ARMS=(onepass_internal)
+EXTRA_ARMS=(onepass_internal onepass_internal_clashnorm)
 
 STAGE=""
 DRY=0
@@ -165,6 +167,13 @@ case "$STAGE" in
 
   report)
     echo "report: $(submit scripts/cp2lp_onepass_report.sbatch)" ;;
+
+  gradnorm)
+    # The clash-normalisation arm's justification check: weighted per-term generator
+    # gradient norms at the fork point, clash scored under both normalisations on the same
+    # decoded output. Read it BEFORE trusting the arm -- a scalar loss share is not a
+    # gradient share, and this is the only thing that measures the difference.
+    echo "clash gradnorm: $(submit scripts/cp2lp_clash_gradnorm.sbatch)" ;;
 
   pilot)
     M="$(submit scripts/cp2lp_onepass_manifest.sbatch)"
