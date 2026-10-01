@@ -174,6 +174,27 @@ _cp2lp_preflight() {
   else
     echo "[preflight] code tree: ${resolved}"
   fi
+  # WHERE DO CHECKPOINTS LAND? The training config writes to `store/${run_name}`, a path
+  # RELATIVE to the process cwd, and the main checkout makes that work with
+  #   store -> /zfsauton/scratch/.../training_runs/store
+  # which is untracked, so a git worktree does NOT get it. MEASURED on job 69681: Lightning
+  # created a real `store/` inside the worktree and wrote 5.5 GB of checkpoints onto the HOME
+  # filesystem in 19 minutes -- invisible to every downstream stage, which resolves $STORE to
+  # scratch, and on a filesystem with a quota the arm does not deserve to consume.
+  if [[ ! -e "${REPO}/store" ]]; then
+    echo "ERROR: ${REPO}/store does not exist." >&2
+    echo "       Checkpoints would be written into the repo instead of the shared store." >&2
+    echo "       Fix: ln -s ${STORE} ${REPO}/store" >&2
+    ok=1
+  elif [[ ! -L "${REPO}/store" && "$(realpath "${REPO}/store")" != "$(realpath "${STORE}")" ]]; then
+    echo "ERROR: ${REPO}/store is a real directory, not the shared store." >&2
+    echo "       resolves to : $(realpath "${REPO}/store")" >&2
+    echo "       expected    : $(realpath "${STORE}")" >&2
+    echo "       A worktree needs: ln -s ${STORE} ${REPO}/store" >&2
+    ok=1
+  else
+    echo "[preflight] store    : $(realpath "${REPO}/store")"
+  fi
   return "${ok}"
 }
 
