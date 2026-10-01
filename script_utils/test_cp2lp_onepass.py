@@ -829,3 +829,25 @@ def test_the_pin_script_prefers_a_milestone_and_survives_having_none():
     assert "-EMA" not in src.split("SRC=\"$(ls")[1].split(")\"")[0], "the glob would match the -EMA twin"
     glob_line = next(ln for ln in src.splitlines() if "ls -1" in ln and "g[0-9]" in ln)
     assert "|| true" in glob_line, "the glob substitution would abort the script under set -e"
+
+
+def test_the_bond_tolerance_has_one_definition():
+    """The export gate's tolerance is calibrated against 536 native LPs, so it must not
+    exist as two independent literals.
+
+    `geometry.PEPTIDE_BOND_TOL_NM` previously sat unreferenced while `losses.py` carried its
+    own `0.02` -- a named constant that looks authoritative and controls nothing. Anyone
+    editing it would believe they had moved the gate and would not have.
+    """
+    import inspect
+
+    from proteinfoundation.cp2lp.geometry import PEPTIDE_BOND_TOL_NM
+    from proteinfoundation.cp2lp.losses import open_chain_geometry_loss
+
+    default = inspect.signature(open_chain_geometry_loss).parameters["bond_tol_nm"].default
+    assert default == PEPTIDE_BOND_TOL_NM, (
+        f"the gate's tolerance is duplicated: losses default {default} vs "
+        f"geometry.PEPTIDE_BOND_TOL_NM {PEPTIDE_BOND_TOL_NM}"
+    )
+    src = (REPO / "src" / "proteinfoundation" / "cp2lp" / "losses.py").read_text()
+    assert "bond_tol_nm: float = PEPTIDE_BOND_TOL_NM" in src, "the default is not the shared constant"

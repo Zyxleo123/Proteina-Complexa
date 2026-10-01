@@ -752,7 +752,24 @@ Stricter than the training losses. A sample is rejected unless:
 **The backbone criterion is calibrated, and it passes real crystal peptides.** Its tolerance
 is 0.02 nm on *every* `(i, i+1)` bond, which looks punishing until you measure it: real LPs
 through the same code have a median bond deviation of 0.0033 nm and 97% of them (520/536)
-clear the all-bonds test. So a `chain_intact` of 0 is a statement about the sample, not
+clear the all-bonds test.
+
+RE-VERIFIED 2026-09-30 from the reference rows on disk rather than from this note: n=536,
+median 0.0033 nm, **p90 0.0054**, max 0.0205, 520/536 = 97.0% intact. The value also sits on
+a **plateau, not a knife edge** — 0.015 / 0.02 / 0.03 / 0.05 admit 99.6 / 99.8 / 100 / 100%
+of natives by mean deviation — so it is a conservative pick inside a flat region.
+
+**Which means the gate is not what is failing the adversarial arms.** Their mean bond MAE of
+0.0356 nm is **6.5x the 90th percentile of real crystal peptides**, and it exceeds even the
+most permissive tolerance that still admits every native (0.03). Loosening it would not
+rescue them. This is the *opposite* of the clash-threshold story below, where 2.7 Å rejected
+43 of 60 natives and the threshold genuinely was the bug — the discipline is the same, the
+verdict is not.
+
+One definition only: `losses.open_chain_geometry_loss` now defaults to
+`geometry.PEPTIDE_BOND_TOL_NM`. The constant previously sat unreferenced beside a duplicated
+literal, so editing it would have looked like moving the gate without moving it. Guarded by
+`test_the_bond_tolerance_has_one_definition`. So a `chain_intact` of 0 is a statement about the sample, not
 about the gate — unlike the clash threshold, which had to be loosened because it rejected
 43 of 60 natives.
 
