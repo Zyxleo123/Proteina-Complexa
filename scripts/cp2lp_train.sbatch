@@ -59,6 +59,18 @@ else
   EXTRA+=("++run_name=${RUN_NAME}")
 fi
 
+# Arbitrary Hydra overrides, space separated, e.g.
+#   EXTRA_HYDRA="++cp2lp.max_g_updates=20300 ++cp2lp.eval_checkpoint_g_updates=[1300,10300,20300]"
+# Exists so a budget EXTENSION does not need a new config file: the arm resumes from its own
+# last.ckpt (`training.resume_from_last=true`), and raising max_g_updates is the only change.
+# Echoed into the log, because an override that is not recorded is a run whose budget nobody
+# can reconstruct afterwards.
+if [[ -n "${EXTRA_HYDRA:-}" ]]; then
+  # shellcheck disable=SC2206 -- word splitting is the intent here
+  EXTRA+=(${EXTRA_HYDRA})
+  echo "extra hydra overrides: ${EXTRA_HYDRA}"
+fi
+
 set -x
 "$PY" -m proteinfoundation.train \
   --config-name "$CONFIG_NAME" \
