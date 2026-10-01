@@ -1,0 +1,58 @@
+# @package _global_
+# THE INTERNAL-COORDINATE ARM. Identical to the reference `onepass_gan` arm except that the CA
+# edit lives in CA-trace internal coordinates instead of free Cartesian space, so no reachable
+# output is an invalid backbone.
+#
+# WHY (all measured; docs/README_CP2LP.md, "Why the chain is not intact" and "The fix"):
+#
+# * the free Cartesian residual puts 30-40% of its magnitude into stretching the chain, and
+#   that share is the same in the control and the adversarial arm at matched generator updates
+#   -- so the adversary is not teaching bad geometry, it is editing harder. Damage scales with
+#   edit size and `chain_intact` is 0.0000 in every adversarial arm.
+# * at matched edit size the internal space supports a 4-8x LARGER edit at equal
+#   `chain_intact`, with CA-CA spread pinned at the source's own 0.00589 nm and the bend floor
+#   never below 73 deg, against the Cartesian arm's 0.198 and 5.2.
+# * repairing bond lengths alone was measured insufficient (0.000 -> 0.141), which is why this
+#   is a reparameterisation and not a penalty term or a projection.
+#
+# WHAT IT DOES NOT FIX, stated here because the comparison must be read with it in mind: a
+# valid CA trace is necessary but NOT sufficient. With frozen source latents, a coordinated
+# walk to the real-LP terminal gap of 2.14 nm scores `chain_intact` 0.0000 even though the
+# trace stays perfectly native the whole way -- the decoder places C(i) and N(i+1) in adjacent
+# local frames, so the peptide bond is intact only if the latents agree with the inter-residue
+# torsion. The editor must CO-EDIT the latents, and this arm is the test of whether it can now
+# that the CA channel no longer makes the target unreachable. Watch `geom_chain_intact_frac`
+# against `delta_ca_rms_nm`, not either alone.
+#
+# Its control is `training_cp2lp_onepass_gan.yaml`: this file differs from it in `run_name`,
+# the two lines enabling the internal head, and nothing else. Both inherit every loss weight,
+# budget, milestone and manifest from the shared base.
+#
+# Run:
+#   bash scripts/submit_cp2lp_onepass.sh --submit smoke-one --set SMOKE_ARM=onepass_internal
+#   bash scripts/submit_cp2lp_onepass.sh --submit onepass_internal
+
+defaults:
+  - /example/training_cp2lp_onepass
+  - _self_
+
+run_name: cp2lp_onepass_internal
+
+nn:
+  # Adds the bend/torsion + rigid heads, both zero-initialised. The Cartesian head stays
+  # enabled and unused for bb_ca: the base requires it, it still supplies the LATENT residual,
+  # and leaving it in place keeps this file a two-line change rather than a restructure.
+  enable_editor_internal: true
+
+cp2lp:
+  onepass:
+    ca_residual_space: internal
+    # Damping on the shape deltas. 1.0 is the honest starting value -- the heads are zero-init
+    # so the edit grows from nothing anyway, and pre-damping it would confound "the
+    # parameterisation does not help" with "the edit was never allowed to get large enough".
+    # The lever-arm problem this knob exists for is real but unmeasured here: a torsion change
+    # swings the whole chain downstream of it, so gradients through tau are scaled differently
+    # from a Cartesian residual's and the effect grows with peptide length. If training is
+    # unstable early, this is the first knob to cut, and `internal_dtau_deg` is the column
+    # that says whether it is biting.
+    internal_residual_scale: 1.0

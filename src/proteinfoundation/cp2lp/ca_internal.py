@@ -262,8 +262,22 @@ def apply_internal_residual(
     lo = math.radians(bend_min_deg)
     hi = math.radians(bend_max_deg)
 
+    # THE CLAMP IS SOURCE-RELATIVE, and it has to be. A fixed window breaks the exact-identity
+    # property whenever the source itself sits outside it, and the sources DO: encoded source CP
+    # traces reach a bend angle of 160.4 deg against this window's 159 ceiling, so a plain
+    # `clamp` moved the trace at zero delta -- measured as a 0.49 nm "identity" edit before this
+    # was fixed. Widening the window instead would only move the problem to whatever the next
+    # batch's maximum happens to be.
+    #
+    # So the bound is the window OR the source's own angle, whichever is more permissive. Zero
+    # delta is then exactly the identity for every input, while the editor still cannot push an
+    # angle further out than it already was. `internal_bend_clamp_frac` reports how often the
+    # bound binds.
+    lo_i = torch.minimum(internal["theta"], torch.full_like(internal["theta"], lo))
+    hi_i = torch.maximum(internal["theta"], torch.full_like(internal["theta"], hi))
+
     theta_raw = internal["theta"] + scale * delta_theta
-    theta_new = theta_raw.clamp(lo, hi)
+    theta_new = torch.minimum(torch.maximum(theta_raw, lo_i), hi_i)
     tau_new = internal["tau"] + scale * delta_tau
     d_new = internal["d"] if delta_d is None else (internal["d"] + scale * delta_d).clamp(
         CA_CA_MIN_NM, CA_CA_MAX_NM
@@ -298,7 +312,7 @@ def apply_internal_residual(
                 / quad.float().sum().clamp(min=1.0)
             ),
             "internal_bend_clamp_frac": (
-                ((theta_raw < lo) | (theta_raw > hi)) & tri
+                ((theta_raw < lo_i) | (theta_raw > hi_i)) & tri
             ).float().sum() / n_tri,
         }
     return ca, diag

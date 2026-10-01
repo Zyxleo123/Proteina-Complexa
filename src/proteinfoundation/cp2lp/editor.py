@@ -196,6 +196,8 @@ def apply_residuals(
     nn_out: dict[str, dict[str, torch.Tensor]],
     mask: torch.Tensor,
     data_modes: list[str],
+    ca_residual_space: str = "cartesian",
+    internal_scale: float = 1.0,
 ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
     """``X_lp = X_src + delta_X`` per data mode, masked on padding.
 
@@ -203,14 +205,40 @@ def apply_residuals(
     different parameterisation, and consuming it here is the mistake this key separation
     exists to prevent.
 
+    ``ca_residual_space`` chooses what the CA edit is made of, and it is the one knob that
+    decides whether the output can be a broken backbone at all:
+
+    ``cartesian``
+        the original: a free per-residue displacement added to the CA track. MEASURED to put
+        30-40% of its magnitude into stretching the chain, leaving CA-CA spanning 1.0-7.2 A
+        against a native 3.838 +- 0.054 and bend angles down to 25.6 deg against a native
+        floor of 74.5, and `chain_intact` at 0.0000 against an AE ceiling of 0.9844.
+    ``internal``
+        bend-angle and virtual-torsion deltas plus a pooled rigid transform, routed through
+        :func:`proteinfoundation.cp2lp.ca_internal.apply_internal_residual`. Bond lengths
+        cannot move and bend angles are clamped to the native window, so no reachable output
+        is an invalid trace.
+
+    The latent edit is unchanged in both: it is the smaller damage channel (swapping it alone
+    costs 0.9844 -> 0.6250, against 0.0469 for the CA track) and nothing here addresses it.
+
     Returns ``(edited_state, deltas)``. The deltas come back so the caller can log their
     magnitude -- a residual norm pinned at zero is the signature of a head that never left
-    its zero init, which otherwise looks like a generator that simply refuses to edit.
+    its zero init, which otherwise looks like a generator that simply refuses to edit. In
+    ``internal`` mode the reported ``bb_ca`` delta is the REALISED displacement
+    ``edited - source``, not a head output, so ``delta_ca_rms_nm`` stays comparable across the
+    two spaces -- which is the whole point of having it.
     """
+    if ca_residual_space not in ("cartesian", "internal"):
+        raise ValueError(
+            f"ca_residual_space must be 'cartesian' or 'internal', got {ca_residual_space!r}"
+        )
     m = mask.bool()[..., None]
     edited: dict[str, torch.Tensor] = {}
     deltas: dict[str, torch.Tensor] = {}
     for dm in data_modes:
+        if dm == "bb_ca" and ca_residual_space == "internal":
+            continue
         if "delta" not in nn_out.get(dm, {}):
             raise KeyError(
                 f"the network produced no `delta` for data mode '{dm}'. The one-pass editor "
@@ -220,6 +248,37 @@ def apply_residuals(
         d = nn_out[dm]["delta"] * m
         deltas[dm] = d
         edited[dm] = src_state[dm] + d
+
+    if ca_residual_space == "internal":
+        from proteinfoundation.cp2lp.ca_internal import apply_internal_residual
+
+        got = nn_out.get("bb_ca", {})
+        missing = [k for k in ("delta_internal", "delta_rigid") if k not in got]
+        if missing:
+            raise KeyError(
+                f"ca_residual_space='internal' needs {missing} on the bb_ca output. Set "
+                "`nn.enable_editor_internal: true`; the Cartesian `delta` head is a different "
+                "parameterisation and cannot be reinterpreted as angles."
+            )
+        src_ca = src_state["bb_ca"]
+        d_int = got["delta_internal"]
+        # Residue i owns the bend angle AT i and the virtual torsion STARTING at i, which is
+        # the slicing the head was shaped for; see the head's comment.
+        d_theta = d_int[:, 1:-1, 0] if d_int.shape[1] > 2 else d_int[:, :0, 0]
+        d_tau = d_int[:, 1:-2, 1] if d_int.shape[1] > 3 else d_int[:, :0, 1]
+        rig = got["delta_rigid"]
+        ca, idiag = apply_internal_residual(
+            src_ca,
+            mask,
+            delta_theta=d_theta,
+            delta_tau=d_tau,
+            delta_trans=rig[:, :3],
+            delta_rot=rig[:, 3:],
+            scale=internal_scale,
+        )
+        edited["bb_ca"] = ca
+        deltas["bb_ca"] = (ca - src_ca) * m
+        deltas["_internal_diag"] = idiag
     return edited, deltas
 
 

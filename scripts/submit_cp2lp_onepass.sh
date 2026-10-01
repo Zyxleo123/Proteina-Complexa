@@ -39,6 +39,12 @@ cd "$REPO"
 
 ARMS=(onepass_contactonly onepass_gan onepass_gan_ar1 onepass_gan_noise onepass_gan_nce)
 
+# NOT a member of ARMS. The five-arm addon comparison is a closed experiment -- adding a sixth
+# member would change what that table means. `onepass_internal` is a separate question (does
+# the CA edit space matter?) with its own control (`onepass_gan`), so it is submitted on its
+# own and compared pairwise.
+EXTRA_ARMS=(onepass_internal)
+
 STAGE=""
 DRY=0
 declare -a OVERRIDES=()
@@ -105,7 +111,7 @@ submit() {
 
 is_arm() {
   local a
-  for a in "${ARMS[@]}"; do [[ "$1" == "$a" ]] && return 0; done
+  for a in "${ARMS[@]}" "${EXTRA_ARMS[@]}"; do [[ "$1" == "$a" ]] && return 0; done
   return 1
 }
 

@@ -162,6 +162,20 @@ class CP2LPGenerator(Proteina):
         self.onepass_t = float(op.get("t_fixed", DEFAULT_EDITOR_T))
         self.onepass_noise_channels = int(op.get("noise_channels", DEFAULT_NOISE_CHANNELS))
         self.onepass_noise_adapter_std = float(op.get("noise_adapter_std", 0.02))
+        # WHICH SPACE THE CA EDIT LIVES IN. `cartesian` is the original free per-residue
+        # displacement; `internal` routes the edit through CA-trace bend angles and virtual
+        # torsions, so no reachable output is an invalid backbone. MEASURED at matched edit size:
+        # the internal space supports a 4-8x larger edit at equal `chain_intact`, and its CA-CA
+        # spread stays pinned at the source's own 0.00589 nm while the Cartesian one rises to
+        # 0.198 and its bend floor collapses from 74 deg to 5. Default `cartesian`, so every
+        # arm already in flight is bit-identical.
+        self.ca_residual_space = str(op.get("ca_residual_space", "cartesian"))
+        if self.ca_residual_space not in ("cartesian", "internal"):
+            raise ValueError(
+                "cp2lp.onepass.ca_residual_space must be 'cartesian' or 'internal', got "
+                f"{self.ca_residual_space!r}"
+            )
+        self.internal_residual_scale = float(op.get("internal_residual_scale", 1.0))
 
         roll = cfg.get("rollout", None) or {}
         self.cp2lp_nsteps = int(roll.get("nsteps", 24))
@@ -361,6 +375,15 @@ class CP2LPGenerator(Proteina):
                 "the trunk emits only a flow VELOCITY, and reading that as an edit "
                 "displacement would start the editor at x_src + v(x_src, t) -- an arbitrary "
                 "jump, not the identity edit the zero-initialised residual heads give."
+            )
+        if self.ca_residual_space == "internal" and not bool(
+            cfg_exp.nn.get("enable_editor_internal", False)
+        ):
+            raise ValueError(
+                "cp2lp.onepass.ca_residual_space='internal' requires "
+                "`nn.enable_editor_internal: true`. The Cartesian `delta` head emits a "
+                "displacement in nm; it cannot be reinterpreted as angles, and silently "
+                "falling back to it would run the arm this mode exists to replace."
             )
         feats = list(cfg_exp.nn.feats_seq)
         if "editor_noise_seq" not in feats:
@@ -648,19 +671,28 @@ class CP2LPGenerator(Proteina):
         # full forward, and `cp2lp_onepass_smoke.py` counts trunk calls with a forward hook
         # rather than trusting this line.
         nn_out = self.call_nn(gen_batch, n_recycle=0)
-        edited, deltas = apply_residuals(gen_batch["x_t"], nn_out, gen_batch["mask"], self._data_modes)
+        edited, deltas = apply_residuals(
+            gen_batch["x_t"], nn_out, gen_batch["mask"], self._data_modes,
+            ca_residual_space=self.ca_residual_space,
+            internal_scale=self.internal_residual_scale,
+        )
         decoded = self._decode(edited, gen_batch["mask"])
 
         mask = gen_batch["mask"].bool()
         denom = mask.sum().clamp(min=1)
+        idiag = deltas.pop("_internal_diag", None)
         extras = {"edited": edited, "deltas": deltas}
         with torch.no_grad():
             extras["metrics"] = {
+                # In `internal` mode this is the REALISED displacement, not a head output, so
+                # the two spaces stay comparable on the one axis the damage scales with.
                 "delta_ca_rms_nm": torch.sqrt((deltas["bb_ca"] ** 2).sum() / (denom * 3)),
                 "delta_latent_rms": torch.sqrt(
                     (deltas["local_latents"] ** 2).sum() / (denom * deltas["local_latents"].shape[-1])
                 ),
             }
+            if idiag is not None:
+                extras["metrics"].update({k: v for k, v in idiag.items()})
         return gen_batch, decoded, extras
 
     def _generate(self, cp_batch: dict) -> tuple[dict, dict, dict]:

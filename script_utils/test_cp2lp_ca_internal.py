@@ -244,6 +244,38 @@ def test_extended_chain_is_near_trans_not_near_zero():
     assert gap(180.0) > 3.5 * gap(0.0), f"trans {gap(180.0):.2f} vs cis {gap(0.0):.2f} nm"
 
 
+def test_the_clamp_is_source_relative_so_identity_survives_an_out_of_window_source():
+    """Encoded source traces DO sit outside the nominal window -- measured up to 160.4 deg
+    against a 159 ceiling -- so a fixed clamp made a zero-delta edit move the trace by 0.49 nm.
+    The bound must be the window OR the source's own angle, whichever is more permissive."""
+    ca = _native_trace(b=4, n=12, seed=20)
+    i = ca_to_internal(ca)
+    # force one angle well outside the window on both ends
+    bad_theta = i["theta"].clone()
+    bad_theta[:, 2] = math.radians(168.0)
+    bad_theta[:, 4] = math.radians(62.0)
+    ca_bad = internal_to_ca(i["d"], bad_theta, i["tau"], i["seed"])
+    b, n, _ = ca_bad.shape
+    m = torch.ones(b, n, dtype=torch.bool)
+
+    out, _ = apply_internal_residual(
+        ca_bad, m, delta_theta=torch.zeros(b, n - 2), delta_tau=torch.zeros(b, n - 3)
+    )
+    err = float((out - ca_bad).abs().max())
+    assert err < 1e-5, f"zero delta moved an out-of-window source by {err} nm"
+
+    # and the editor still cannot push those angles FURTHER out
+    push = torch.zeros(b, n - 2)
+    push[:, 2] = math.radians(20.0)     # 168 -> would be 188
+    push[:, 4] = math.radians(-20.0)    # 62  -> would be 42
+    out2, _ = apply_internal_residual(
+        ca_bad, m, delta_theta=push, delta_tau=torch.zeros(b, n - 3)
+    )
+    th2 = ca_to_internal(out2)["theta"]
+    assert float(torch.rad2deg(th2[:, 2]).max()) <= 168.1, torch.rad2deg(th2[:, 2]).max()
+    assert float(torch.rad2deg(th2[:, 4]).min()) >= 61.9, torch.rad2deg(th2[:, 4]).min()
+
+
 # --------------------------------------------------------------- plumbing safety
 
 

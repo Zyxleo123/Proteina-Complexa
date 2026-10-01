@@ -393,12 +393,39 @@ def main() -> int:  # noqa: C901 -- a preflight is a checklist; splitting it hid
     print(f"   decoded coors   : {tuple(decoded['coors_nm'].shape)}  requires_grad={decoded['coors_nm'].requires_grad}")
     print(f"   residual        : dCA rms {float(extras['metrics']['delta_ca_rms_nm']):.3e} nm, "
           f"dz rms {float(extras['metrics']['delta_latent_rms']):.3e}")
-    if float(extras["metrics"]["delta_ca_rms_nm"]) != 0.0:
+    # A TOLERANCE, not `!= 0.0`. In `ca_residual_space: internal` the reported delta is the
+    # realised displacement of a trace that was decomposed into internal coordinates and
+    # rebuilt, so float round-off leaves ~1e-7 nm even when every head output is exactly zero.
+    # An exact comparison warns on every internal-mode smoke and would train the reader to
+    # ignore the line.
+    _IDENTITY_TOL_NM = 1e-5
+    if float(extras["metrics"]["delta_ca_rms_nm"]) > _IDENTITY_TOL_NM:
         logger.warning(
-            "The residual is nonzero on the first forward. Expected ONLY if the init is a "
-            "fork that has already trained; from a fresh zero-initialised head it should be "
-            "exactly 0, i.e. the identity edit."
+            "The residual exceeds the identity tolerance on the first forward. Expected ONLY "
+            "if the init is a fork that has already trained; from a fresh zero-initialised "
+            f"head it should be below {_IDENTITY_TOL_NM:g} nm, i.e. the identity edit."
         )
+    space = getattr(model, "ca_residual_space", "cartesian")
+    print(f"   CA edit space   : {space}")
+    for k in ("internal_dtheta_deg", "internal_dtau_deg", "internal_bend_clamp_frac"):
+        if k in extras["metrics"]:
+            print(f"     {k:<26}: {float(extras['metrics'][k]):.4f}")
+    if space == "internal":
+        # The guarantee the mode exists for, checked on the real model rather than assumed:
+        # whatever the heads emitted, the edited trace must still be a valid backbone.
+        from proteinfoundation.cp2lp.ca_internal import CA_CA_MAX_NM, CA_CA_MIN_NM
+        ca_ed = extras["edited"]["bb_ca"]
+        em = gen_batch["mask"].bool()
+        bm = em[:, :-1] & em[:, 1:]
+        bl = (ca_ed[:, 1:] - ca_ed[:, :-1]).norm(dim=-1)[bm]
+        print(f"     edited CA-CA nm           : min {float(bl.min()):.4f} max {float(bl.max()):.4f}")
+        if float(bl.min()) < CA_CA_MIN_NM - 1e-4 or float(bl.max()) > CA_CA_MAX_NM + 1e-4:
+            logger.error(
+                f"internal mode produced CA-CA outside [{CA_CA_MIN_NM}, {CA_CA_MAX_NM}] nm "
+                f"(min {float(bl.min()):.4f}, max {float(bl.max()):.4f}) -- the guarantee this "
+                "parameterisation exists for is broken."
+            )
+            return 1
 
     aux, aux_metrics = model._generator_losses(gen_batch, decoded)
     print(f"   generator aux   : {float(aux):.4f}")

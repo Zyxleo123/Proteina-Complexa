@@ -212,6 +212,36 @@ class LocalLatentsTransformer(torch.nn.Module):
             self.editor_latents_residual = None
             self.editor_ca_residual = None
 
+        # INTERNAL-COORDINATE CA residual. An alternative to `editor_ca_residual`, not an
+        # addition to it: that one emits a free Cartesian displacement, which was MEASURED to
+        # leave the CA trace outside both of its native windows (docs/README_CP2LP.md, "Why
+        # the chain is not intact"). This one emits per-residue bend-angle and virtual-torsion
+        # changes plus a pooled rigid transform, and `cp2lp.ca_internal` turns those into a
+        # trace that satisfies the constraints by construction.
+        #
+        # Two channels per residue: residue i owns the bend angle AT i and the virtual torsion
+        # STARTING at i. Six pooled: 3 translation + 3 axis-angle rotation, which is where the
+        # coherent part of the edit now lives explicitly rather than implicitly.
+        #
+        # Zero-init, same reason and same cost as the Cartesian head: the first output must be
+        # exactly the AE round trip of the source CP, or the pretrained splice is invalidated
+        # on step one.
+        self.enable_editor_internal = bool(kwargs.get("enable_editor_internal", False))
+        if self.enable_editor_internal:
+            self.editor_internal_residual = torch.nn.Sequential(
+                torch.nn.LayerNorm(self.token_dim),
+                torch.nn.Linear(self.token_dim, 2, bias=False),
+            )
+            self.editor_rigid_residual = torch.nn.Sequential(
+                torch.nn.LayerNorm(self.token_dim),
+                torch.nn.Linear(self.token_dim, 6, bias=False),
+            )
+            torch.nn.init.zeros_(self.editor_internal_residual[1].weight)
+            torch.nn.init.zeros_(self.editor_rigid_residual[1].weight)
+        else:
+            self.editor_internal_residual = None
+            self.editor_rigid_residual = None
+
         # Optional oracle peptide-interface surface conditioning. Zero-init gates keep
         # pretrained receptor-only checkpoints bit-identical until the gates open.
         surface_cfg = kwargs.get("surface", {}) or {}
@@ -431,4 +461,16 @@ class LocalLatentsTransformer(torch.nn.Module):
                 d_ca = d_ca[:, :n_orig, :] * orig_mask[:, :, None]
             nn_out["bb_ca"]["delta"] = d_ca
             nn_out["local_latents"]["delta"] = d_lat
+        if self.enable_editor_internal:
+            d_int = self.editor_internal_residual(seqs) * mask[..., None]
+            # The rigid part is pooled over VALID residues only -- a mean over the padded
+            # length would make the transform depend on how much padding the batch happened
+            # to carry, which is not a property of the peptide.
+            denom = mask.sum(dim=1, keepdim=True).clamp(min=1.0)
+            pooled = (seqs * mask[..., None]).sum(dim=1) / denom
+            d_rig = self.editor_rigid_residual(pooled)
+            if n_concat > 0:
+                d_int = d_int[:, :n_orig, :] * orig_mask[:, :, None]
+            nn_out["bb_ca"]["delta_internal"] = d_int
+            nn_out["bb_ca"]["delta_rigid"] = d_rig
         return nn_out

@@ -71,6 +71,7 @@ _cp2lp_defaults() {
     onepass_gan_ar1)     CONFIG_NAME="${CONFIG_NAME:-example/training_cp2lp_onepass_gan_ar1}";     RUN_NAME="${RUN_NAME:-cp2lp_onepass_gan_ar1}" ;;
     onepass_gan_noise)   CONFIG_NAME="${CONFIG_NAME:-example/training_cp2lp_onepass_gan_noise}";   RUN_NAME="${RUN_NAME:-cp2lp_onepass_gan_noise}" ;;
     onepass_gan_nce)     CONFIG_NAME="${CONFIG_NAME:-example/training_cp2lp_onepass_gan_nce}";     RUN_NAME="${RUN_NAME:-cp2lp_onepass_gan_nce}" ;;
+    onepass_internal)    CONFIG_NAME="${CONFIG_NAME:-example/training_cp2lp_onepass_internal}";    RUN_NAME="${RUN_NAME:-cp2lp_onepass_internal}" ;;
     *)           CONFIG_NAME="${CONFIG_NAME:-example/training_cp2lp_gan}";          RUN_NAME="${RUN_NAME:-cp2lp_${ARM}}" ;;
   esac
 
