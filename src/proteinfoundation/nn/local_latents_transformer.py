@@ -212,6 +212,61 @@ class LocalLatentsTransformer(torch.nn.Module):
             self.editor_latents_residual = None
             self.editor_ca_residual = None
 
+        # ---------------- backbone-only output heads: the two representation arms.
+        #
+        # These replace the CA residual + frozen AE decoder output path entirely. The arm
+        # emits N/CA/C/O itself, so nothing downstream reconstructs geometry and the AE round
+        # trip stops being the ceiling on backbone validity.
+        #
+        # NEWLY INITIALISED, never spliced from the pretrained columns. `ca_linear` emits a
+        # 3-vector flow velocity for CA; its weights carry no information about where a
+        # carbonyl oxygen goes or what a phi residual should be, so seeding a 12- or
+        # 9-channel head from it would import a semantically unrelated prior and call it a
+        # warm start. Zero init is the warm start that is actually true here: it makes the
+        # arm's first output exactly the source backbone.
+        #
+        # ZERO INIT COSTS THE FIRST STEP'S TRUNK GRADIENT, as with the CA residual above:
+        # d(out)/d(h) is zero through a zero weight, so the trunk only starts receiving
+        # gradient once the head itself has moved. Checked explicitly in the smoke rather
+        # than assumed.
+        self.editor_backbone_mode = str(kwargs.get("editor_backbone_mode", "none"))
+        self.editor_bb_cartesian = None
+        self.editor_bb_torsion = None
+        self.editor_bb_root = None
+        if self.editor_backbone_mode == "cartesian":
+            # Arm A: a free Cartesian residual per backbone atom. 4 atoms x 3 = 12 channels.
+            # Deliberately the FULL backbone, not CA-only -- a CA-only head followed by the
+            # AE decoder is the arm that already exists and already fails.
+            self.editor_bb_cartesian = torch.nn.Sequential(
+                torch.nn.LayerNorm(self.token_dim),
+                torch.nn.Linear(self.token_dim, 12, bias=False),
+            )
+            torch.nn.init.zeros_(self.editor_bb_cartesian[1].weight)
+        elif self.editor_backbone_mode == "torsion":
+            # Arm B: residual rotations for phi/psi/omega, each as an unnormalised (sin, cos)
+            # pair about the identity -- 6 channels. A plain scalar per angle would regress
+            # across the +-pi seam, where two angles a thousandth of a radian apart differ in
+            # squared error by (2 pi)^2 and the gradient points the wrong way.
+            self.editor_bb_torsion = torch.nn.Sequential(
+                torch.nn.LayerNorm(self.token_dim),
+                torch.nn.Linear(self.token_dim, 6, bias=False),
+            )
+            torch.nn.init.zeros_(self.editor_bb_torsion[1].weight)
+            # Root placement: 3 translation + 3 axis-angle, pooled to one per example. Arm A
+            # can move the whole peptide freely through its per-atom residual, so withholding
+            # this from Arm B would hand Arm A a degree of freedom Arm B does not have and
+            # make "which representation is better" partly "which one could translate".
+            self.editor_bb_root = torch.nn.Sequential(
+                torch.nn.LayerNorm(self.token_dim),
+                torch.nn.Linear(self.token_dim, 6, bias=False),
+            )
+            torch.nn.init.zeros_(self.editor_bb_root[1].weight)
+        elif self.editor_backbone_mode != "none":
+            raise ValueError(
+                f"nn.editor_backbone_mode must be 'none', 'cartesian' or 'torsion'; "
+                f"got {self.editor_backbone_mode!r}"
+            )
+
         # Optional oracle peptide-interface surface conditioning. Zero-init gates keep
         # pretrained receptor-only checkpoints bit-identical until the gates open.
         surface_cfg = kwargs.get("surface", {}) or {}
@@ -431,4 +486,31 @@ class LocalLatentsTransformer(torch.nn.Module):
                 d_ca = d_ca[:, :n_orig, :] * orig_mask[:, :, None]
             nn_out["bb_ca"]["delta"] = d_ca
             nn_out["local_latents"]["delta"] = d_lat
+
+        # Backbone-arm outputs, under their own key. `proteinfoundation.cp2lp.bb_arms` turns
+        # these into a backbone; nothing here interprets them, so the representation and the
+        # readout stay in one file each.
+        if self.editor_backbone_mode != "none":
+            bb_out = {}
+            if self.editor_bb_cartesian is not None:
+                d_bb = self.editor_bb_cartesian(seqs) * mask[..., None]
+                if n_concat > 0:
+                    d_bb = d_bb[:, :n_orig, :] * orig_mask[:, :, None]
+                bb_out["delta_cartesian"] = d_bb.reshape(*d_bb.shape[:2], 4, 3)
+            if self.editor_bb_torsion is not None:
+                d_tor = self.editor_bb_torsion(seqs) * mask[..., None]
+                if n_concat > 0:
+                    d_tor = d_tor[:, :n_orig, :] * orig_mask[:, :, None]
+                bb_out["delta_torsion"] = d_tor
+                # The root is ONE transform for the whole peptide, so the per-residue head
+                # output is masked-mean pooled. A sum would scale with length and make the
+                # same head output mean a 10x larger shift on a 30-mer than on a 3-mer.
+                r = self.editor_bb_root(seqs) * mask[..., None]
+                if n_concat > 0:
+                    r = r[:, :n_orig, :] * orig_mask[:, :, None]
+                    mm = orig_mask[:, :, None].to(r.dtype)
+                else:
+                    mm = mask[..., None].to(r.dtype)
+                bb_out["delta_root"] = r.sum(1) / mm.sum(1).clamp(min=1.0)
+            nn_out["backbone"] = bb_out
         return nn_out

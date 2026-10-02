@@ -98,6 +98,7 @@ class PeptideInterfaceDiscriminator(nn.Module):
         shortcut_probe: bool = True,
         dropout: float = 0.1,
         noise_level_dim: int = 0,
+        backbone_only: bool = False,
     ):
         super().__init__()
         if pocket_identity not in ("chem", "restype", "none"):
@@ -107,10 +108,32 @@ class PeptideInterfaceDiscriminator(nn.Module):
         self.pocket_identity = pocket_identity
         self.register_buffer("chem_table", CHEM_CLASS_TABLE.clone(), persistent=False)
 
+        # BACKBONE-ONLY MODE, for the two representation arms. Three feature groups come out,
+        # each for a stated reason, and the point of all three is that this D tests STRUCTURAL
+        # REALISM and not sequence-distribution matching:
+        #
+        #  * peptide sequence / probabilities. The arms keep the source CP's sequence exactly,
+        #    and real LPs come from a different population (PepBench) than the generated ones
+        #    (CPSea sources). A sequence feature would therefore let D separate the two on
+        #    composition alone without looking at a single coordinate -- the same class of
+        #    shortcut as the receptor-identity one, and a worse one, because the generator
+        #    cannot fix it: it is not allowed to change the sequence.
+        #  * sidechain-derived features. Nothing downstream of the generator produces
+        #    sidechains on this path; the packer does, later, outside the gradient. Showing D
+        #    a sidechain feature would score the packer.
+        #  * exact intra-residue bond deviations. Arm B's bond lengths are the template to
+        #    float precision while a real LP's are a crystal's, so this single column
+        #    separates the two populations perfectly and D would learn nothing else. Arm A
+        #    handles local geometry through its raw validity safeguard instead.
+        self.backbone_only = bool(backbone_only)
+
         # The peptide's own residue identity goes in at full 20-way resolution: it is the
         # generator's output, not a dataset label, and sequence realism is something we
         # want judged. Soft (probability-weighted) so gradient reaches the decoder logits.
-        self.res_emb = nn.Linear(restype_num + 1, hidden_dim // 4, bias=False)
+        # Not built at all in backbone-only mode, so a stray `res` feature cannot be consumed.
+        self.res_emb = (
+            None if self.backbone_only else nn.Linear(restype_num + 1, hidden_dim // 4, bias=False)
+        )
 
         if pocket_identity == "chem":
             pocket_id_dim = N_CHEM_CLASSES
@@ -122,12 +145,14 @@ class PeptideInterfaceDiscriminator(nn.Module):
 
         # Per-residue geometry: 4 dihedral components, 3 near-neighbour CA distances,
         # 2 intra-residue bond lengths, 1 distance to peptide centroid, 2 terminal flags.
-        self.n_geom = 4 + 3 + 2 + 1 + 2
+        # Backbone-only mode drops the 2 bond lengths, see the note in __init__.
+        self.n_geom = 4 + 3 + (0 if self.backbone_only else 2) + 1 + 2
         # Per-residue interface: k distances + k identity vectors + min heavy-atom dist
         # + soft contact count.
         self.n_iface = self.k_pocket * (1 + pocket_id_dim) + 2
 
-        self.in_proj = nn.Linear(hidden_dim // 4 + self.n_geom + self.n_iface, hidden_dim)
+        self.n_res_in = 0 if self.backbone_only else hidden_dim // 4
+        self.in_proj = nn.Linear(self.n_res_in + self.n_geom + self.n_iface, hidden_dim)
         layer = nn.TransformerEncoderLayer(
             d_model=hidden_dim,
             nhead=nheads,
@@ -226,6 +251,18 @@ class PeptideInterfaceDiscriminator(nn.Module):
         pm = pep_mask.bool()
         tm = target_mask.bool()
 
+        # THE REDUCTION IS DONE HERE, FOR EVERY CALLER, so real and generated peptides cannot
+        # differ in which atoms D was shown. A generated backbone has 4 atoms per residue; a
+        # real LP arrives from a crystal or an AE decode with its full sidechains. If the real
+        # side kept them, D would separate the two populations on "does this have a CB" and
+        # the generator's gradient would be pure noise. Reducing at the chokepoint rather than
+        # asking every call site to remember is the difference between a property and a hope.
+        if self.backbone_only:
+            from proteinfoundation.cp2lp.backbone import backbone_to_atom37, extract_backbone
+
+            bb, bb_mask = extract_backbone(pep_atom37, pep_atom_mask)
+            pep_atom37, pep_atom_mask = backbone_to_atom37(bb, pm, bb_mask)
+
         # ---- peptide-internal geometry
         dihed = backbone_dihedrals(pep_atom37, pm)  # [b, n, 4]
         ca = ca_coords(pep_atom37)  # [b, n, 3]
@@ -241,9 +278,12 @@ class PeptideInterfaceDiscriminator(nn.Module):
             neigh.append(padded * valid)
         neigh = torch.stack(neigh, dim=-1)  # [b, n, 3]
 
-        from proteinfoundation.cp2lp.geometry import intra_residue_bond_deviation_nm
+        if self.backbone_only:
+            bond_dev = torch.zeros(b, n, 0, device=device, dtype=pep_atom37.dtype)
+        else:
+            from proteinfoundation.cp2lp.geometry import intra_residue_bond_deviation_nm
 
-        bond_dev, _ = intra_residue_bond_deviation_nm(pep_atom37, pm)  # [b, n, 2]
+            bond_dev, _ = intra_residue_bond_deviation_nm(pep_atom37, pm)  # [b, n, 2]
 
         mf = pm.float()[..., None]
         centroid = (ca * mf).sum(dim=1, keepdim=True) / mf.sum(dim=1, keepdim=True).clamp(min=1.0)
@@ -302,13 +342,18 @@ class PeptideInterfaceDiscriminator(nn.Module):
             dim=-1,
         )
 
-        return {
-            "res": pep_seq_probs,
+        out = {
             "geom": geom * mf,
             "iface": iface * mf,
             "glob": glob,
             "mask": pm,
         }
+        # `res` is absent in backbone-only mode rather than present-and-zeroed: a zero block
+        # would still be a column `forward` could consume, and the reservoir/addon code keys
+        # off presence. Absent means a sequence feature cannot come back by accident.
+        if not self.backbone_only:
+            out["res"] = pep_seq_probs
+        return out
 
     # ------------------------------------------------------------------ forward
 
@@ -374,7 +419,19 @@ class PeptideInterfaceDiscriminator(nn.Module):
         uninformative instead of merely noisy.
         """
         mask = feats["mask"]
-        h = torch.cat([self.res_emb(feats["res"]), feats["geom"], feats["iface"]], dim=-1)
+        blocks = [feats["geom"], feats["iface"]]
+        if self.res_emb is not None:
+            blocks.insert(0, self.res_emb(feats["res"]))
+        elif "res" in feats:
+            # A backbone-only D handed a sequence block means a call site built features with
+            # a different discriminator than the one consuming them. Loud, because silently
+            # ignoring it would make the "D never sees the sequence" claim unverifiable.
+            raise ValueError(
+                "backbone-only discriminator received a `res` feature block. The features "
+                "were built by a different discriminator instance -- pass this module's own "
+                "`build_features` output."
+            )
+        h = torch.cat(blocks, dim=-1)
         h = self.in_proj(h)
         h = self.trunk(h, src_key_padding_mask=~mask)
         h = torch.nan_to_num(h)
