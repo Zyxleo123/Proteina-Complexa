@@ -48,6 +48,19 @@ defaults:
 
 run_name: cp2lp_onepass_internal_clashnorm
 
+log:
+  # REQUIRED for a mid-run fork, and the reason is not cosmetic. This arm resumes from a
+  # `last.ckpt` seeded out of the control's run, and train.py refuses to resume without a
+  # wandb run id -- precisely so a resume cannot silently fork another run's history. The
+  # control's id must NOT be reused (two experiments would interleave in one set of curves),
+  # and an id cannot be invented by hand either: the resume path passes resume="must" and
+  # wandb rejects an id that was never initialized. MEASURED, job 71180.
+  #
+  # This flag takes the new-run branch, which creates the run with resume="never" and
+  # persists the real id. It self-disarms once that id exists, so a requeue resumes the same
+  # run rather than minting another.
+  wandb_force_new_run: true
+
 cp2lp:
   losses:
     # THE ONE LINE. `all_pairs` is the legacy denominator every other arm uses;
@@ -55,10 +68,18 @@ cp2lp:
     # length, and averages over the batch.
     clash_inter_norm: peptide_length
 
-  # Matched to the control's extension VERBATIM, including the three milestones this arm has
-  # already passed (the trigger is exact equality on the g_updates counter, so they never
-  # fire -- they are here so the two configs cannot be accused of differing on this line).
-  # Set in the config rather than left to EXTRA_HYDRA so the two runs cannot drift apart
-  # through a forgotten override on one of them.
+  # THE BUDGET MUST MATCH THE CONTROL; the milestone list need not, and deliberately does
+  # not. A milestone is a saved artefact, not a training event -- the trigger is exact
+  # equality on the g_updates counter and nothing else reads it -- so trimming the list
+  # changes which points can be evaluated, never what the arm learns.
+  #
+  # Each milestone costs ~6.5 GB (a 3.6 GB raw checkpoint plus its 2.9 GB EMA sidecar). The
+  # control keeps four; this arm keeps the matched ENDPOINT only, which is where the
+  # headline comparison is made, and saves ~20 GB. Disk is not free here: the two
+  # backbone-only arms (cp2lp_bb_cartesian / cp2lp_bb_torsion) were both killed mid-write by
+  # `OSError: [Errno 122] Disk quota exceeded` and left 0-byte `last.ckpt` files behind.
+  #
+  # `last.ckpt` is still rewritten every 250 steps regardless, so a requeue loses at most
+  # 250 steps whatever this list says.
   max_g_updates: 20300
-  eval_checkpoint_g_updates: [1300, 5300, 10300, 12300, 15300, 17300, 20300]
+  eval_checkpoint_g_updates: [20300]

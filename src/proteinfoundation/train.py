@@ -536,10 +536,27 @@ def main(cfg_exp) -> None:
         # but logs into a fresh WandB run instead of re-attaching to the interrupted one. The new
         # id is persisted, so later auto-resumes follow the new run rather than the abandoned one.
         force_new_wandb_run = cfg_exp.log.get("wandb_force_new_run", False)
+        # SELF-DISARMING, and it has to be for a resume that carries `--requeue`. The flag
+        # takes the new-run branch below, which creates the run with resume="never" and
+        # PERSISTS its id. Left armed, the next requeue would take that branch again and mint
+        # yet another run, scattering one arm's curves across several wandb runs for the rest
+        # of the budget. Once an id exists the run is real and resumable, so honour it.
+        #
+        # This is also why a run id must never be WRITTEN BY HAND for a run that was never
+        # started: the resume branch passes resume="must", and wandb rejects it with
+        # "not a valid option for resuming the run ... that has not been initialized".
+        # MEASURED on job 71180, which died exactly there.
+        existing_wandb_id = _load_wandb_run_id(ckpt_path_store, run_name) if resuming_training else None
+        if resuming_training and force_new_wandb_run and existing_wandb_id:
+            log_info(
+                f"log.wandb_force_new_run=true but a run id already exists ({existing_wandb_id}) "
+                "— resuming THAT run instead of minting another"
+            )
+            force_new_wandb_run = False
         if resuming_training and force_new_wandb_run:
             log_info("log.wandb_force_new_run=true — resuming training into a NEW WandB run")
         if resuming_training and not force_new_wandb_run:
-            wandb_id = _load_wandb_run_id(ckpt_path_store, run_name)
+            wandb_id = existing_wandb_id
             if not wandb_id:
                 raise RuntimeError(
                     f"Resuming training from last.ckpt but no WandB run id found for {run_name!r}. "

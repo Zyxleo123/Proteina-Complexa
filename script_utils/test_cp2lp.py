@@ -1095,14 +1095,36 @@ def test_clashnorm_arm_differs_from_its_control_in_exactly_the_intended_keys():
 
     fc, fa = flat(ctl), flat(arm)
     diff = {k for k in set(fc) | set(fa) if fc.get(k) != fa.get(k)}
+    # Each permitted difference, and why it is not a scientific variable. The ONLY entry
+    # here that changes what the arm optimises is `clash_inter_norm`.
     expected = {
+        # Bookkeeping: a separate run directory and wandb run.
         "run_name",
+        # THE MANIPULATION.
         "cp2lp.losses.clash_inter_norm",
+        # The control reaches 20300 through EXTRA_HYDRA instead of its config, so the
+        # resolved values differ even though the BUDGET IS THE SAME. Asserted below.
         "cp2lp.max_g_updates",
+        # Which milestones are SAVED. A milestone is an artefact, not a training event --
+        # the trigger is exact equality on the g_updates counter and nothing else reads it.
+        # This arm keeps only the matched endpoint, at ~6.5 GB per milestone saved.
         "cp2lp.eval_checkpoint_g_updates",
+        # Forced because this arm forks mid-run: train.py will not resume without a wandb
+        # identity, the control's must not be reused, and an id cannot be invented by hand.
+        # Affects logging only.
+        "log.wandb_force_new_run",
     }
     assert diff == expected, f"unexpected config differences: {sorted(diff - expected)}"
     assert fa["cp2lp.losses.clash_inter_norm"] == "peptide_length"
+    # The budget must MATCH the control's, which gets there via EXTRA_HYDRA. Hard-coded
+    # rather than read from the control's config, because the control's config still says
+    # 10300 -- the number that matters is the one its job was launched with.
+    assert fa["cp2lp.max_g_updates"] == 20300, (
+        f"this arm must run the control's extended budget, got {fa['cp2lp.max_g_updates']}"
+    )
+    # Trimming the milestones must not drop the matched comparison point.
+    assert 20300 in fa["cp2lp.eval_checkpoint_g_updates"], \
+        "the endpoint the headline comparison is made at is not saved"
     # The things a reweight would have moved, asserted to be identical.
     for k in ("cp2lp.losses.clash_weight", "cp2lp.losses.clash_threshold_nm",
               "cp2lp.adversarial.weight", "cp2lp.losses.contact_weight",

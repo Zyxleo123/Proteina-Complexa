@@ -254,20 +254,38 @@ _cp2lp_preflight_resume_seed() {
     echo "       Seed it: bash scripts/pin_cp2lp_resume.sh ${RESUME_SEED_SRC} ${RUN_NAME}" >&2
     return 1
   fi
-  # train.py REFUSES to resume from a last.ckpt with no wandb run id, so that a resume
-  # cannot silently fork another run's history. Job 71121 hit that after the preamble had
-  # passed and a GPU had been allocated; checking here fails in the first second instead.
+  # A SEEDED RESUME NEEDS A WANDB IDENTITY, one way or the other. train.py refuses to resume
+  # a last.ckpt with no run id, so that a resume cannot silently fork another run's history.
+  # Either is valid here:
+  #   * an id file already exists  -> the run is real and will be resumed, or
+  #   * the config sets log.wandb_force_new_run -> a new run is created and its id persisted.
+  # Neither, and the job dies in train.py AFTER a GPU has been allocated (job 71121). A
+  # hand-written id for a run that was never started is worse than neither, because the
+  # resume path then passes resume="must" and wandb rejects it (job 71180) -- so this does
+  # NOT offer to write one.
   local wid="${STORE}/${RUN_NAME}/checkpoints/wandb_run_id.txt"
-  if [[ ! -f "${wid}" ]]; then
-    echo "ERROR: ${ARM} resumes from a seeded last.ckpt but has no wandb run id:" >&2
-    echo "       ${wid}" >&2
-    echo "       train.py will refuse to resume without it. Write one (the pin script does" >&2
-    echo "       this automatically now):" >&2
-    echo "         bash scripts/pin_cp2lp_resume.sh ${RESUME_SEED_SRC} ${RUN_NAME}" >&2
+  local cfg="${REPO}/configs/${CONFIG_NAME}.yaml"
+  if [[ -f "${wid}" ]]; then
+    echo "[preflight] wandb id   : $(cat "${wid}") (will resume this run)"
+  elif [[ ! -r "${cfg}" ]]; then
+    # Cannot read the arm's config, so cannot tell. WARN rather than block: a false refusal
+    # here would strand a valid launch, and train.py raises a clear error if the identity is
+    # genuinely missing. Reachable when REPO points at a tree without this config -- e.g.
+    # a worktree arm checked with REPO left at its default.
+    echo "[preflight] wandb      : cannot read ${cfg} -- not checking the identity." >&2
+  elif grep -qE '^[[:space:]]*wandb_force_new_run:[[:space:]]*true' "${cfg}"; then
+    echo "[preflight] wandb      : no id yet; config sets wandb_force_new_run -> a new run"
+  else
+    echo "ERROR: ${ARM} resumes from a seeded last.ckpt but has no wandb identity." >&2
+    echo "       No ${wid}, and ${CONFIG_NAME}.yaml does not set log.wandb_force_new_run." >&2
+    echo "       train.py will refuse to resume. Add to the arm's config:" >&2
+    echo "         log:" >&2
+    echo "           wandb_force_new_run: true" >&2
+    echo "       Do NOT hand-write a run id: wandb rejects resume=\"must\" on a run that was" >&2
+    echo "       never initialized." >&2
     return 1
   fi
   echo "[preflight] resume seed: ${seed}"
-  echo "[preflight] wandb id   : $(cat "${wid}")"
   # Provenance, so the log of THIS run records which state it forked from and at what md5 --
   # the only durable evidence that it and its control started from the same weights.
   if [[ -f "${STORE}/${RUN_NAME}/checkpoints/resume.source" ]]; then
