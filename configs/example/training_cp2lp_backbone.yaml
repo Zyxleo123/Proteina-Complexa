@@ -69,6 +69,25 @@ nn:
 cp2lp:
   mode: backbone
 
+  # FEWER SAVED MILESTONES than the one-pass base's [1300, 5300, 10300], overridden HERE and
+  # not there: `training_cp2lp_onepass.yaml` is shared with the five one-pass arms and its
+  # own header says editing it moves all six together.
+  #
+  # WHY. Both backbone arms were killed mid-checkpoint-write on 2026-10-02 by
+  # `OSError: [Errno 122] Disk quota exceeded`, at 01:43 (cartesian) and 01:51 (torsion),
+  # leaving 0-byte `last.ckpt` files and no milestone at all -- neither arm reached even the
+  # first one at g=1300. A milestone costs ~6.5 GB (3.6 GB raw + a 2.9 GB EMA sidecar), so
+  # three of them across two arms is ~39 GB.
+  #
+  # 1300 is dropped rather than one of the others: this tranche's question is whether the
+  # torsion arm's construction guarantee SURVIVES TRAINING, and `chain_intact` is already
+  # measured at 1.000 at initialisation with a random head -- so the earliest point is the
+  # least informative one. The endpoint and one mid-point are kept.
+  #
+  # `last.ckpt` is still rewritten every 250 steps, so a requeue loses at most 250 steps
+  # whatever this list says.
+  eval_checkpoint_g_updates: [5300, 10300]
+
   backbone:
     # SET BY EACH ARM: cartesian | torsion. No default -- the arm IS the experiment.
     arm: ???
