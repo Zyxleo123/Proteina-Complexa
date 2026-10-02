@@ -1108,3 +1108,79 @@ def test_clashnorm_arm_differs_from_its_control_in_exactly_the_intended_keys():
               "cp2lp.adversarial.weight", "cp2lp.losses.contact_weight",
               "cp2lp.losses.geometry_weight"):
         assert fc[k] == fa[k], f"{k} must not change in this arm: {fc[k]} -> {fa[k]}"
+
+
+def test_submitter_quotes_env_file_values():
+    """A `--set` value with spaces must survive sourcing, and MUST NOT be executed.
+
+    MEASURED: this killed both halves of the clash comparison before either reached
+    python. The preamble SOURCES the env file, so a bare `VAR=a b` assigns `VAR=a` and then
+    runs `b`. Job 70232 (the control) died on
+    `EXTRA_HYDRA=++cp2lp.max_g_updates=20300 ++cp2lp.eval_checkpoint_g_updates=[...]` with
+    "command not found" on the second override; job 70265 died on a NOTE= containing spaces
+    and a semicolon. Both produced a ~350 byte log with no banner, so the log did not even
+    identify the arm.
+
+    The round trip is asserted on the two exact values that failed, and the list-valued one
+    is additionally checked to still WORD-SPLIT into separate Hydra overrides -- quoting it
+    so hard that it arrives as one token would break the consumer instead.
+    """
+    import os
+    import subprocess
+    import tempfile
+
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    note = "clash inter_norm=peptide_length; forked from internal last.ckpt"
+    hydra = ("++cp2lp.max_g_updates=20300 "
+             "++cp2lp.eval_checkpoint_g_updates=[1300,5300,10300,12300,15300,17300,20300]")
+
+    with tempfile.TemporaryDirectory() as td:
+        env = dict(os.environ, HOME=td)
+        r = subprocess.run(
+            ["bash", os.path.join(repo, "scripts", "submit_cp2lp_onepass.sh"),
+             "--dry-run", "onepass_internal_clashnorm",
+             "--set", f"NOTE={note}", "--set", f"EXTRA_HYDRA={hydra}"],
+            cwd=repo, env=env, capture_output=True, text=True, timeout=180,
+        )
+        assert r.returncode == 0, f"submitter failed: {r.stdout}\n{r.stderr}"
+        path = None
+        for line in r.stdout.splitlines():
+            if line.startswith("env file: "):
+                path = line.split("env file: ", 1)[1].strip()
+        assert path and os.path.exists(path), f"no env file in output:\n{r.stdout}"
+
+        # Sourced in an EMPTY environment, exactly as the job's preamble does it.
+        probe = (
+            f"set -a; source {path!r}; set +a; "
+            'printf "NOTE=[%s]\\n" "$NOTE"; '
+            "E=(); E+=(${EXTRA_HYDRA}); "
+            'printf "NTOK=%s\\n" "${#E[@]}"; '
+            'for e in "${E[@]}"; do printf "TOK=[%s]\\n" "$e"; done'
+        )
+        s = subprocess.run(["env", "-i", "bash", "-c", probe],
+                           capture_output=True, text=True, timeout=60)
+        assert "command not found" not in (s.stdout + s.stderr), \
+            f"the env file EXECUTED part of a value:\n{s.stdout}\n{s.stderr}"
+        assert s.returncode == 0, f"env file not sourceable: {s.stderr}"
+        assert f"NOTE=[{note}]" in s.stdout, f"NOTE did not round-trip:\n{s.stdout}"
+        assert "NTOK=2" in s.stdout, f"EXTRA_HYDRA must split into 2 overrides:\n{s.stdout}"
+        assert "TOK=[++cp2lp.max_g_updates=20300]" in s.stdout
+        assert ("TOK=[++cp2lp.eval_checkpoint_g_updates="
+                "[1300,5300,10300,12300,15300,17300,20300]]") in s.stdout
+
+
+def test_submitter_refuses_a_malformed_set():
+    """A `--set` without `=`, or with a key that is not a shell identifier, cannot become a
+    valid env-file line -- so it is refused at submission, where the error names the cause,
+    rather than at `source` time inside the job."""
+    import os
+    import subprocess
+
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    for bad in ("JUSTAKEY", "not-an-identifier=1", "2START=1"):
+        r = subprocess.run(
+            ["bash", os.path.join(repo, "scripts", "submit_cp2lp_onepass.sh"),
+             "--dry-run", "onepass_internal_clashnorm", "--set", bad],
+            cwd=repo, capture_output=True, text=True, timeout=180,
+        )
+        assert r.returncode != 0, f"--set {bad!r} was accepted: {r.stdout}"

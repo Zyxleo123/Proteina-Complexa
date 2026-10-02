@@ -70,15 +70,52 @@ mkdir -p slurm_logs env_files
 # wearing the same run_name.
 STAMP="$(date +%Y%m%d_%H%M%S)"
 ENV_FILE="${REPO}/env_files/cp2lp_onepass_${STAGE}_${STAMP}.env"
+
+# VALUES ARE SHELL-QUOTED, and this is not cosmetic. The preamble SOURCES this file, so a
+# bare `VAR=a b` makes bash assign `VAR=a` and then try to RUN `b`. MEASURED -- it killed
+# both halves of the clash comparison before either reached python:
+#
+#   job 70232 (the control): `EXTRA_HYDRA=++cp2lp.max_g_updates=20300 ++cp2lp.eval_...=[...]`
+#     -> "++cp2lp.eval_checkpoint_g_updates=[1300,...]: command not found"
+#   job 70265 (the clash arm): a NOTE= with spaces and a semicolon
+#     -> "forked: command not found"
+#
+# Both died in the first second with a ~350 byte log, and because the failure is in the
+# preamble the banner never printed -- so the log does not even say which arm it was. The
+# note in CLAUDE.md that "a file also handles spaces" is true only of a file whose values
+# are QUOTED; this writer was not quoting them.
+#
+# `%q` output re-parses to exactly the original string under `source`, and word-splitting a
+# list-valued variable still works because the CONSUMER expands it unquoted (see
+# cp2lp_train.sbatch's `EXTRA+=(${EXTRA_HYDRA})`).
 {
   echo "# CP->LP one-pass submission ${STAMP}, stage=${STAGE}"
-  echo "REPO=${REPO}"
+  printf 'REPO=%q\n' "${REPO}"
   for kv in "${OVERRIDES[@]:-}"; do
-    [[ -n "$kv" ]] && echo "$kv"
+    [[ -n "$kv" ]] || continue
+    if [[ "$kv" != *=* ]]; then
+      echo "ERROR: --set needs VAR=value, got: ${kv}" >&2
+      exit 2
+    fi
+    k="${kv%%=*}"
+    if [[ ! "$k" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+      echo "ERROR: --set key is not a shell identifier: ${k}" >&2
+      exit 2
+    fi
+    printf '%s=%q\n' "$k" "${kv#*=}"
   done
 } > "$ENV_FILE"
 echo "env file: $ENV_FILE"
 sed 's/^/  /' "$ENV_FILE"
+
+# A file that cannot be sourced is a job that dies before its banner. Check it HERE, where
+# the error is attributable, rather than discovering it in a 350-byte job log. `env -i`
+# because the preamble is required to be self-sufficient anyway.
+if ! env -i bash -c "set -a; source '$ENV_FILE'" 2>/dev/null; then
+  echo "ERROR: ${ENV_FILE} is not sourceable. Refusing to submit." >&2
+  env -i bash -c "set -a; source '$ENV_FILE'" || true
+  exit 2
+fi
 
 # `--set` values must also be visible to THIS script, not only to the job. Several stages read
 # an override to decide what to submit -- `smoke-one` reads SMOKE_ARM -- and without this the
