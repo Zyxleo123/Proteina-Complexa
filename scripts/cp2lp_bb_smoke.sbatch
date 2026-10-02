@@ -30,6 +30,10 @@ _cp2lp_consume_args "$@"
 ARM="${ARM:-bb_torsion}"
 _cp2lp_defaults
 _cp2lp_banner "bb-smoke"
+# The smoke runs the real model, the real dataloader and a real training_step, so its peak
+# host RAM is a usable lower bound on what the pilots need -- and it is measurable in minutes
+# instead of waiting out a 16-hour queue behind a request nobody has checked.
+trap '_cp2lp_mem_peak' EXIT
 
 cd "$REPO"
 

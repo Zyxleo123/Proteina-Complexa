@@ -180,6 +180,34 @@ _cp2lp_preflight_flow_ckpt() {
   return 0
 }
 
+# ------------------------------------------------------------------ memory footprint
+# PEAK HOST RAM FROM THE JOB'S OWN CGROUP. There is no usable accounting database here --
+# slurmdbd is unreachable and `sacct` exits 0 with EMPTY output -- so MaxRSS is not recoverable
+# after a job ends and every --mem request is otherwise a guess. A guess has a cost: the two
+# backbone arms queued behind a 64G request on nodes with 4-16G free, with an estimated start
+# 16 hours out.
+#
+# `memory.peak` (cgroup v2) is the TRUE high-water mark, which is what slurmd enforces against.
+# Two things it is not: not a sample, so a spike between polls cannot be missed; and it counts
+# only THIS job, where summing VmRSS across /proc/*/status on a shared node would silently
+# include every other user's processes.
+#
+# Install with:  trap '_cp2lp_mem_peak' EXIT
+_cp2lp_mem_peak() {
+  local cg f
+  cg="$(awk -F: '{print $3}' /proc/self/cgroup 2>/dev/null | head -1)"
+  while [[ -n "${cg}" && "${cg}" != "/" ]]; do
+    for f in memory.peak memory.max_usage_in_bytes; do
+      if [[ -r "/sys/fs/cgroup${cg}/${f}" ]]; then
+        echo "[rss] peak host RAM for this job: $(( $(cat "/sys/fs/cgroup${cg}/${f}") / 1048576 )) MiB (requested ${SLURM_MEM_PER_NODE:-?} MiB) from ${cg}/${f}"
+        return 0
+      fi
+    done
+    cg="${cg%/*}"
+  done
+  echo "[rss] peak host RAM unavailable (no readable cgroup memory.peak). sacct is dead here, so this job's footprint is NOT recoverable afterwards."
+}
+
 # ----------------------------------------------------------------------- gates
 # A stage whose UPSTREAM produced nothing must print why and exit 0. A non-zero exit
 # strands every afterok dependent in DependencyNeverSatisfied with no explanation, which

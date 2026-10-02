@@ -59,6 +59,9 @@ else
   EXTRA+=("++run_name=${RUN_NAME}")
 fi
 
+# Report this job's peak host RAM on the way out; see `_cp2lp_mem_peak`.
+trap '_cp2lp_mem_peak' EXIT
+
 set -x
 "$PY" -m proteinfoundation.train \
   --config-name "$CONFIG_NAME" \

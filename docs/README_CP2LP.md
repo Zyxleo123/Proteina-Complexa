@@ -1473,6 +1473,171 @@ mean bond MAE 0.0123 is *inside* the 0.02 tolerance, i.e. the failure is a tail,
 backbone. This is also why the metric is **length-biased**: a 16-mer needs 15 consecutive
 passes, an 8-mer only 7, so it penalises long peptides independently of geometry quality.
 
+## The two backbone arms: deleting the decoder from the output path
+
+The CA editor's measured ceiling was the AE round trip. `chain_intact` sat at 0.0000 against a
+round-trip ceiling of 0.9844, and the binding constraint was CA-latent consistency — a perfect
+CA trace still decodes badly unless the latents agree with it. The decoder sat between the edit
+and the metric.
+
+These two arms remove it from the **output** path. The generator emits N/CA/C/O itself, the
+sequence is the source's and is never predicted, and no latent is decoded. Backbone validity
+becomes a property of the generator, and the CA-latent constraint cannot bind because nothing
+decodes a latent. The AE is still used for two *inputs* — decoding the source CP so the arm has
+a reference backbone, and decoding real LPs for the discriminator's real class.
+
+| | Arm A `cp2lp_bb_cartesian` | Arm B `cp2lp_bb_torsion` |
+|---|---|---|
+| output | free Cartesian residual on all 4 atoms | residual phi/psi/omega + rigid root transform |
+| local geometry | must be LEARNED | correct by construction |
+| `chain_intact`, random head, real natives | **0.000** | **1.000** |
+| head | 12 channels, zero-init | 6 angular + 6 root, zero-init |
+| gradient scaling | direct | torsion lever arm, damped by `residual_scale` 0.3 |
+
+They differ in that and nothing else: same trunk, same fork checkpoint, same discriminator and
+its initialisation, same losses, same movement budget, same packer, same optimizer-step budget.
+
+### The template library, and where its floor lives
+
+Arm B builds from a measured library (`script_utils/cp2lp_bb_calibrate.py`, job 70313, the same
+101 natives the CA-CA window came from). Two of its constants are far from textbook: C-N is
+0.1348 nm against `geometry.IDEAL_PEPTIDE_BOND_NM`'s 0.1329, and N-CA-C is 113.03° against the
+usual 111.2 — the textbook values describe a relaxed protein, these describe short
+receptor-bound peptides.
+
+Fixing lengths and angles to that library guarantees them, at the cost of a reconstruction
+floor. Decomposed leave-one-out — extract a native's torsions, rebuild, measure the gap:
+
+| mode | bb RMSD | share of the floor |
+|---|---|---|
+| all template | 0.1180 nm | — |
+| + PRO/GLY angles | 0.1172 nm | 0.7%, i.e. nothing |
+| source `ang_N_CA_C` | 0.0812 nm | 31.2% |
+| source `ang_C_N_CA` | 0.0874 nm | 25.9% |
+| source `ang_CA_C_N` | 0.0919 nm | 22.1% |
+| source `len_C_N` | 0.1181 nm | −0.1% |
+| source `len_CA_C` | 0.1181 nm | −0.1% |
+| source `len_N_CA` | 0.1186 nm | −0.5% |
+| all source | 0.0000 nm | — |
+
+**The floor is entirely bond angles.** So the arms carry the source's own angles, clamped
+source-relatively the way `ca_internal` clamps its bend angle. A 1.18 Å floor is larger than the
+0.5 Å identity-map edit the export gate was measured to select for, so under a templated angle
+every edit bin below 1.18 Å would be empty for Arm B *by construction* — and edit-binned
+comparison is exactly how this experiment avoids rewarding a generator for doing nothing. Arm A
+starts from the same AE-decoded source, so templating only Arm B's angles would make the arms
+less comparable, not more.
+
+**And "lengths are free" was conditional.** Every length row above was measured with the angles
+*still templated*, so the 1.18 Å angle error swamped them. Once angles are carried, the lengths
+are all that remains: 0.21 Å RMSD, 2.04 Å worst atom, from per-bond deviations of only
+0.004–0.008 Å compounding along the chain. Two factors each measured at ~0% of a total accounted
+between them for everything left when the dominant one was removed. Carrying lengths, the
+carbonyl geometry and the per-residue O-dihedral offset takes both arms to 0.00001 Å at zero head
+output. **Never read a leave-one-out share without asking what the other factors were held at.**
+
+### The steric term was numerically absent, and now is not
+
+`losses.clash_loss` divides the receptor overlap sum by the peptide-by-receptor PAIR count, which
+scales with receptor size — the dilution behind "clash is 0.06% of the objective while violated".
+`bb_losses.backbone_steric_loss` normalises per peptide residue per example. Measured on one
+fixed clash with the receptor padded by distant residues that add pairs but no overlap:
+
+| receptor residues | `bb_losses` | `losses.clash_loss` |
+|---|---|---|
+| 20 | 0.514052 | 0.026932 |
+| 100 | 0.514052 | 0.006586 |
+| 400 | 0.514052 | 0.002771 |
+| 1000 | 0.514052 | 0.002008 |
+
+Exactly constant against 13.4× of drift, and 19–256× larger in absolute terms. Also *not*
+averaged over violating pairs only: that denominator shrinks as the generator improves, so the
+value can sit flat while violations collapse.
+
+### Scalar loss shares are not gradient shares
+
+`cp2lp.backbone.grad_probe_every_n_steps` differentiates each weighted term on its own and logs
+the norm arriving at the arm's head. It immediately caught a defect no loss table could show:
+from **bit-identical** loss values, the preservation term carried 0.0% of Arm A's head gradient
+and 61.4% of Arm B's. A plain norm has a kink at its minimum — the Cartesian residual is *exactly*
+zero in float so the derivative is exactly zero, while the NeRF rebuild leaves 1.7e-06 nm of float
+residue, above `sqrt(eps)`, which the torsion lever arm then multiplies. Large magnitude,
+numerical-noise direction, and an init asymmetry that is not the representation. A pseudo-Huber
+with a 0.1 Å knee (`PRESERVE_HUBER_NM`) takes it from 0.3752 to 5.0e-05 while leaving a real
+edit's gradient at 1.047 against 1.093.
+
+### The real-LP anchor is not the flow loss
+
+A legacy flow term supervises a velocity readout that is not on this output path, so it would
+train a head nothing reads. `_real_lp_backbone_anchor` instead corrupts a real bound LP with the
+same interpolant, decodes to get a starting backbone, and asks the arm to put it back — same
+corruption draws and the same Cartesian criterion in both arms, Arm B through its builder, with
+the source-CP condition explicitly dropped. `anchor_template_floor_nm` is logged beside it: an
+anchor loss at its floor means the head is contributing nothing.
+
+### The packer, and what "holistic" requires
+
+`cp2lp/packing.py` completes every candidate at every scheduled evaluation, not only at export.
+Build on the generated N/CA/C/O with the source sequence → **strip cyclic chemistry explicitly**
+→ terminal variants including OXT → seed from the source's own rotamers → repack against the
+fixed receptor over 3 identical seeds → score → select by the predeclared `SELECTION_ORDER`.
+
+Stripping is not optional: the sources are macrocycles whose sequences are full of cysteines, and
+Rosetta re-bonds two nearby ones on its own — silently, in the scorer, after every linear-topology
+gate upstream has passed. `assert_linear_topology` re-checks the pose rather than trusting it.
+
+Measured on natives: 18/18 packings succeeded, fixed-atom shift exactly **0.00e+00**, 2–6 s per
+pack. `dG_separated` is computed **without relax** (the plan forbids backbone relaxation, which
+would move the backbone being measured), so it is a bound-state score that demonstrably tracks
+clash — 35 REU on the one valid candidate against 1452–10880 on the clashing ones. A tie-break
+and a reported number, never a binding free energy.
+
+### Reading the comparison
+
+Every quality column is reported inside **edit** bins and inside **gap** bins, and a headline
+claim is only made where both agree. The report earned this on its first run: pooled, Arm B looked
+33% against Arm A's 0% — but the binning showed the arms were not at matched edit size at all
+(Arm A in the ≥0.6 nm bin, Arm B in [0.15,0.3)). It also separates the failure causes a single
+number merges: `raw_backbone_broken` for one arm, `clash` for the other.
+
+Panel: 24 receptor families, exactly two per peptide length from 5 to 16, four paired seeds — 96
+attempts per arm per milestone. Built by reusing `cp2lp_eval_manifest.py`.
+
+```bash
+# the fixed panel (once)
+bash scripts/submit_cp2lp_backbone.sh --submit panel
+# CPU: template library + a complete packing example per arm
+bash scripts/submit_cp2lp_backbone.sh --submit calibrate
+bash scripts/submit_cp2lp_backbone.sh --submit pack-smoke
+# GPU: both arms on the real trunk, one job, shared seed
+bash scripts/submit_cp2lp_backbone.sh --submit smoke
+# both pilots as siblings
+bash scripts/submit_cp2lp_backbone.sh --submit arms
+# a milestone, all-atom: generate -> pack -> report
+bash scripts/submit_cp2lp_backbone.sh --submit evaluate --set EVAL_CKPT_TAG=g001300-EMA
+```
+
+### Four defects only the GPU run found
+
+Each silent, and none visible to review or CPU tests:
+
+- **`_featurize` crashed on a backbone-only discriminator** — no `res_emb` to read a class count
+  from. It surfaced in the *real-LP* branch, the one call site a generator-only test never reaches.
+- **The noise adapter returned early for any mode but `onepass`**, so both arms would have trained
+  with zero noise input weights: deterministic, with within-source diversity structurally zero
+  over the whole phase before the heads moved.
+- **An if/else split left `onepass` logging "LEGACY ROLLOUT"** and `backbone` logging "ONE-PASS
+  editor". A run mislabelled in its own log is unattributable later.
+- **The preservation gradient artifact** above.
+
+Plus one correction to a claim made too strongly: the smoke originally asserted Arm B reaches
+`chain_intact` 1.0. Carrying source angles means its guarantee is *"the edit cannot make local
+geometry worse than its input"*, not *"the output is ideal"* — so the smoke now prints the
+**source's own validity as the ceiling** beside the arm's. The first run showed why that matters:
+0.5000 for one arm and 1.0000 for the other at identical zero edit, entirely because the two
+processes drew different batches. The dataloader is now seeded.
+
+
 ## Traps found the hard way
 
 - **A second-resolution timestamp is not a unique env-file name.** Two
@@ -1515,6 +1680,28 @@ passes, an 8-mer only 7, so it penalises long peptides independently of geometry
 - **`nce_loss` has a floor of ~1.2–1.4, not 0**, because a random projection leaves the
   descriptors nearly collinear. Only changes in it are readable; the level is not "how much
   content was lost".
+- **A leave-one-out share is conditional on what the other factors were held at.** Each bond
+  LENGTH measured as ~0% of the template floor — but with the ANGLES still templated, so the
+  1.18 Å angle error swamped them. With angles carried, the lengths were the entire remaining
+  0.21 Å. Two factors each at ~0% of a total accounted between them for all of what was left.
+- **`bb[:, -1]` is the last PADDED column, not each row's last real residue.** Reading terminal
+  psi there put the C-terminal O 2.007 Å off on padded rows while N, CA and C were exact to
+  0.000. Gather at `(mask.sum(1) - 1)` per row.
+- **`mask[..., None, None]` on a `[b,n,4,3]` tensor sums to `n_valid`, not `4*n_valid`.** The
+  centroid came out 4× too far and a "pure rotation" translated the peptide 7 nm. A broadcast
+  that agrees on rank while disagreeing on count is invisible to a shape check.
+- **An angular statistic near ±180° wraps into two clusters.** Measuring the O-dihedral offset in
+  (−180,180] reported sd = 166° for a quantity whose real spread is 2.34°. Measure the residual
+  about 180 and add it back.
+- **`safe_norm` returns 1e-6, not 0, for identical points** — and its derivative is live once the
+  input exceeds `sqrt(eps)`. That is enough to make a plain-norm loss carry 61% of one arm's head
+  gradient at its own minimum, in a numerically arbitrary direction.
+- **Two processes are two batches.** The first backbone smoke ran each arm separately and reported
+  `chain_intact` 0.5000 against 1.0000 at identical zero edit — entirely the AE decode of two
+  different draws. Seed the dataloader, and print the SOURCE's own validity as the ceiling.
+- **Rosetta re-bonds nearby cysteines on its own.** The source peptides are macrocycles full of
+  them, so a linear candidate can be scored as a cycle after every upstream gate has passed it.
+  Strip the variants and then RE-CHECK the pose.
 
 - **`cp2lp_train.sbatch` passes `++run_name=${RUN_NAME}`, a Hydra override that beats the
   yaml.** Bumping `run_name` in a config is therefore not enough — the preamble's own
@@ -1569,3 +1756,23 @@ passes, an 8-mer only 7, so it penalises long peptides independently of geometry
 | `script_utils/cp2lp_eval_manifest.py` | the fixed 64-parent / 8-seed evaluation manifest |
 | `script_utils/cp2lp_onepass_report.py` | the five-arm comparison table + figure (CPU) |
 | `script_utils/test_cp2lp_onepass.py` | unit tests for the editor and the three add-ons |
+| `src/proteinfoundation/cp2lp/ca_internal.py` | CA-trace internal coordinates (the CA-editor fix) |
+| `src/proteinfoundation/cp2lp/backbone.py` | the backbone container, the measured template library, the torsion builder, raw validity |
+| `src/proteinfoundation/cp2lp/bb_arms.py` | the two arms behind one signature, and the shared movement budget |
+| `src/proteinfoundation/cp2lp/bb_losses.py` | preservation / sterics / raw geometry / the real-LP anchor criterion |
+| `src/proteinfoundation/cp2lp/packing.py` | the shared Rosetta sidechain completion and the all-atom scorer |
+| `configs/example/training_cp2lp_backbone.yaml` | the shared base for both backbone arms |
+| `configs/example/training_cp2lp_bb_cartesian.yaml` | Arm A — three lines from the base |
+| `configs/example/training_cp2lp_bb_torsion.yaml` | Arm B — three lines from the base |
+| `scripts/submit_cp2lp_backbone.sh` | the backbone submitter (panel/calibrate/pack-smoke/smoke/arms/evaluate/report) |
+| `script_utils/cp2lp_bb_calibrate.py` | measures the template library and decomposes its floor |
+| `script_utils/cp2lp_bb_pack_smoke.py` | both arms + a complete packing example each, on real natives (CPU) |
+| `script_utils/cp2lp_bb_smoke.py` | both arms on the REAL trunk: trunk-call count, zero-output identity, per-term gradients, the anchor, a full step |
+| `script_utils/cp2lp_bb_evaluate.py` | GPU half of a milestone evaluation — dumps each backbone WITH its receptor |
+| `script_utils/cp2lp_bb_pack_eval.py` | CPU half — packs and scores every attempt, resumably, one file per job |
+| `script_utils/cp2lp_bb_report.py` | the arm comparison, binned by edit size AND terminal gap |
+| `script_utils/test_cp2lp_backbone.py` | round-trip exactness, the construction guarantee, NaN discipline |
+| `script_utils/test_cp2lp_bb_arms.py` | the fairness invariants: shared budget, no rigid-motion monopoly, zero-output identity |
+| `script_utils/test_cp2lp_bb_losses.py` | the steric normalisation, the preservation kink, the bonded exclusions |
+| `script_utils/test_cp2lp_bb_discriminator.py` | the three shortcuts: sidechains, sequence, exact local geometry |
+| `script_utils/test_cp2lp_bb_eval.py` | the gates that decide the reported numbers |
