@@ -752,7 +752,13 @@ def test_the_module_gates_the_onepass_warmup_on_generator_updates():
     required = {
         "a persistent G-update counter": r'register_buffer\(\s*"g_updates"',
         "incremented on the G step": r"self\.g_updates\s*\+=\s*1",
-        "warmup gated on it in onepass mode": r'progress\s*=\s*int\(self\.g_updates\)\s*if\s*self\.cp2lp_mode\s*==\s*"onepass"',
+        # Accepts the modes-tuple form too: the BACKBONE arms also step two optimizers, so
+        # they must count G updates for exactly the reason one-pass does. What has to hold is
+        # that `progress` is g_updates for those modes -- not the precise spelling.
+        "warmup gated on it in the two-optimizer modes": (
+            r'progress\s*=\s*\(?\s*int\(self\.g_updates\)\s*if\s*self\.cp2lp_mode\s*'
+            r'(?:==\s*"onepass"|in\s*\(\s*"onepass",\s*"backbone"\s*\))'
+        ),
         "budget gated on it": r"self\.g_updates\)\s*>=\s*self\.max_g_updates",
     }
     for what, pattern in required.items():

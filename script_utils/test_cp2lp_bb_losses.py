@@ -232,6 +232,52 @@ def test_preservation_weights_actually_discriminate():
     )
 
 
+def test_preservation_gradient_vanishes_at_the_identity_in_both_arms():
+    """Neither arm may receive meaningful preservation gradient when it emits the source.
+
+    THE ASYMMETRY THIS PINS. A plain norm has a kink at its minimum. The Cartesian residual is
+    EXACTLY zero in float so `d/dx sqrt(x^2 + eps)` is exactly 0, but the NeRF rebuild leaves
+    ~1.7e-06 nm of float residue -- above `sqrt(eps)` -- so its derivative was live and then
+    multiplied by the torsion lever arm. MEASURED on a real batch, from bit-identical loss
+    values: `preserve` carried 0.0% of Arm A's head gradient and 61.4% of Arm B's. Large
+    magnitude, numerical-noise direction, and an init asymmetry that is not the representation.
+
+    The pseudo-Huber makes it vanish for both. The test also checks the MEANINGFUL regime is
+    untouched, because a knee large enough to damp a real edit would be a different bug.
+    """
+    from proteinfoundation.cp2lp.bb_arms import (
+        ARM_CARTESIAN,
+        ARM_TORSION,
+        apply_backbone_arm,
+    )
+
+    bb, mask, _ = synthetic_backbone(b=4, n=14, seed=5)
+
+    def grad_norm(arm: str, scale: float) -> float:
+        g = torch.Generator().manual_seed(1)
+        head = (
+            {"delta_cartesian": scale * torch.randn(4, 14, 4, 3, generator=g)}
+            if arm == ARM_CARTESIAN
+            else {
+                "delta_torsion": scale * torch.randn(4, 14, 6, generator=g),
+                "delta_root": scale * torch.randn(4, 6, generator=g),
+            }
+        )
+        head = {k: v.clone().requires_grad_(True) for k, v in head.items()}
+        out, _ = apply_backbone_arm(arm, bb, {"backbone": head}, mask, scale=1.0)
+        backbone_preservation_loss(out, bb, mask)[0].backward()
+        return float(torch.sqrt(sum((t.grad ** 2).sum() for t in head.values())))
+
+    for arm in (ARM_CARTESIAN, ARM_TORSION):
+        at_zero = grad_norm(arm, 0.0)
+        at_real = grad_norm(arm, 0.05)
+        assert at_real > 1e-3, f"{arm}: no preservation gradient at a REAL edit ({at_real:.2e})"
+        assert at_zero < 1e-3 * at_real, (
+            f"{arm}: preservation gradient at the identity is {at_zero:.2e}, not negligible "
+            f"against {at_real:.2e} at a real edit -- the kink at the minimum is still live"
+        )
+
+
 def test_preservation_is_zero_at_the_identity_and_does_not_align():
     """Zero for an unchanged peptide; NONZERO for a rigidly rotated one.
 
@@ -243,9 +289,22 @@ def test_preservation_is_zero_at_the_identity_and_does_not_align():
     loss, met = backbone_preservation_loss(bb, bb, mask)
     assert float(loss) <= 2 * SAFE_NORM_FLOOR_NM
     assert float(met["preserve_ca_rmsd_nm"]) <= 2 * SAFE_NORM_FLOOR_NM
-    moved = bb + torch.tensor([0.4, 0.0, 0.0])
-    loss2, _ = backbone_preservation_loss(moved, bb, mask)
-    assert abs(float(loss2) - 0.4) < 1e-4, "a rigid translation was not billed in full"
+    # A rigid translation is billed in full: the pseudo-Huber is linear with slope 1 far from
+    # its knee, so a 0.4 nm shift costs 0.4 - k (a constant 0.01 nm offset, which cannot
+    # change a gradient) and doubling the shift doubles the cost. Checked as the SLOPE rather
+    # than the absolute value, because the offset is an implementation detail of the knee and
+    # the property under test is that no superposition happened.
+    from proteinfoundation.cp2lp.bb_losses import PRESERVE_HUBER_NM
+
+    l1, _ = backbone_preservation_loss(bb + torch.tensor([0.4, 0.0, 0.0]), bb, mask)
+    l2, _ = backbone_preservation_loss(bb + torch.tensor([0.8, 0.0, 0.0]), bb, mask)
+    assert abs(float(l1) - (0.4 - PRESERVE_HUBER_NM)) < 1e-3, (
+        f"a 0.4 nm rigid translation cost {float(l1):.4f}, not ~0.4 -- it was superposed away"
+    )
+    assert abs((float(l2) + PRESERVE_HUBER_NM) / (float(l1) + PRESERVE_HUBER_NM) - 2.0) < 1e-3, (
+        "doubling the displacement did not double the cost; the term is not linear where it "
+        "matters"
+    )
 
 
 # -------------------------------------------------------------- geometry safeguard

@@ -71,6 +71,12 @@ _cp2lp_defaults() {
     onepass_gan_ar1)     CONFIG_NAME="${CONFIG_NAME:-example/training_cp2lp_onepass_gan_ar1}";     RUN_NAME="${RUN_NAME:-cp2lp_onepass_gan_ar1}" ;;
     onepass_gan_noise)   CONFIG_NAME="${CONFIG_NAME:-example/training_cp2lp_onepass_gan_noise}";   RUN_NAME="${RUN_NAME:-cp2lp_onepass_gan_noise}" ;;
     onepass_gan_nce)     CONFIG_NAME="${CONFIG_NAME:-example/training_cp2lp_onepass_gan_nce}";     RUN_NAME="${RUN_NAME:-cp2lp_onepass_gan_nce}" ;;
+    # --- the two BACKBONE REPRESENTATION arms. Same trunk, same discriminator, same losses,
+    # same packer, same budget; they differ in how a network output becomes a backbone. Both
+    # fork from the one-pass fork checkpoint, whose trunk they share -- the backbone heads are
+    # not in it and are newly zero-initialised.
+    bb_cartesian)        CONFIG_NAME="${CONFIG_NAME:-example/training_cp2lp_bb_cartesian}";        RUN_NAME="${RUN_NAME:-cp2lp_bb_cartesian}" ;;
+    bb_torsion)          CONFIG_NAME="${CONFIG_NAME:-example/training_cp2lp_bb_torsion}";          RUN_NAME="${RUN_NAME:-cp2lp_bb_torsion}" ;;
     *)           CONFIG_NAME="${CONFIG_NAME:-example/training_cp2lp_gan}";          RUN_NAME="${RUN_NAME:-cp2lp_${ARM}}" ;;
   esac
 
@@ -82,6 +88,7 @@ _cp2lp_defaults() {
   case "${ARM}" in
     onepass_warmup) INIT_CKPT="${INIT_CKPT:-${FLOW_CKPT}}" ;;
     onepass_*)      INIT_CKPT="${INIT_CKPT:-${FORK_CKPT}}" ;;
+    bb_*)           INIT_CKPT="${INIT_CKPT:-${FORK_CKPT}}" ;;
     *)              INIT_CKPT="${INIT_CKPT:-${FLOW_CKPT}}" ;;
   esac
 

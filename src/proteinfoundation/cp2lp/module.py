@@ -90,11 +90,37 @@ from proteinfoundation.cp2lp.conditioning import (
 )
 from proteinfoundation.cp2lp.editor import (
     DEFAULT_EDITOR_T,
+    EDITOR_NOISE_KEY,
     DEFAULT_NOISE_CHANNELS,
     apply_residuals,
     build_editor_batch,
     make_noise_generator,
     sample_editor_noise,
+)
+from openfold.np.residue_constants import restype_num
+
+from proteinfoundation.cp2lp.backbone import (
+    DEFAULT_ANGLE_SOURCE,
+    DEFAULT_LENGTH_SOURCE,
+    backbone_to_atom37,
+    backbone_validity,
+    extract_backbone,
+)
+from proteinfoundation.cp2lp.bb_arms import (
+    ARM_CARTESIAN,
+    ARMS,
+    DEFAULT_CARTESIAN_SCALE,
+    DEFAULT_TORSION_SCALE,
+    apply_backbone_arm,
+    init_reconstruction_error,
+)
+from proteinfoundation.cp2lp.bb_losses import (
+    NON_INTERFACE_WEIGHT,
+    backbone_preservation_loss,
+    backbone_reconstruction_loss,
+    backbone_steric_loss,
+    open_backbone_geometry_loss,
+    source_interface_weights,
 )
 from proteinfoundation.cp2lp.data import RealLPFeatureReservoir, slice_batch, split_roles
 from proteinfoundation.cp2lp.discriminator import (
@@ -155,8 +181,40 @@ class CP2LPGenerator(Proteina):
         # edit of the encoded source CP, no sampler anywhere. The two modes share the
         # losses, the discriminator and the export gate and nothing else.
         self.cp2lp_mode = str(cfg.get("mode", "rollout")).lower()
-        if self.cp2lp_mode not in ("rollout", "onepass"):
-            raise ValueError(f"cp2lp.mode must be 'rollout' or 'onepass', got {self.cp2lp_mode!r}")
+        if self.cp2lp_mode not in ("rollout", "onepass", "backbone"):
+            raise ValueError(
+                f"cp2lp.mode must be 'rollout', 'onepass' or 'backbone', got {self.cp2lp_mode!r}"
+            )
+
+        # `backbone` is the two REPRESENTATION ARMS. It shares the one-pass editor's batch
+        # construction, noise and single trunk call, and differs in what the trunk's output
+        # becomes: a full N/CA/C/O backbone emitted by the arm itself, with the frozen AE
+        # decoder OFF the output path entirely. No sequence is predicted (it is the source's),
+        # no sidechain latent is decoded, and backbone validity is therefore a property of the
+        # generator rather than of the AE round trip.
+        bb = cfg.get("backbone", None) or {}
+        self.bb_arm = str(bb.get("arm", "")).lower()
+        if self.cp2lp_mode == "backbone":
+            if self.bb_arm not in ARMS:
+                raise ValueError(
+                    f"cp2lp.mode=backbone requires cp2lp.backbone.arm in {ARMS}, got "
+                    f"{self.bb_arm!r}. The arm IS the experiment; there is no default."
+                )
+            self.bb_angle_source = str(bb.get("angle_source", DEFAULT_ANGLE_SOURCE))
+            self.bb_length_source = str(bb.get("length_source", DEFAULT_LENGTH_SOURCE))
+            # Separate defaults because the two heads emit different QUANTITIES in different
+            # units -- nm of displacement against radians of rotation -- so one shared number
+            # would not be one shared budget. The shared, comparable budget is
+            # `max_atom_shift_nm`, enforced on actual atom movement in both arms.
+            default_scale = (
+                DEFAULT_CARTESIAN_SCALE if self.bb_arm == ARM_CARTESIAN else DEFAULT_TORSION_SCALE
+            )
+            self.bb_residual_scale = float(bb.get("residual_scale", default_scale))
+            shift = bb.get("max_atom_shift_nm", None)
+            self.bb_max_shift_nm = None if shift in (None, "null", "") else float(shift)
+            self.bb_anchor_weight = float(bb.get("anchor_weight", 1.0))
+            self.bb_anchor_t_range = tuple(bb.get("anchor_t_range", (0.2, 0.8)))
+            self.bb_grad_probe_every = int(bb.get("grad_probe_every_n_steps", 0))
 
         op = cfg.get("onepass", None) or {}
         self.onepass_t = float(op.get("t_fixed", DEFAULT_EDITOR_T))
@@ -216,6 +274,16 @@ class CP2LPGenerator(Proteina):
         self.min_open_gap_nm = float(lw.get("min_open_gap_nm", 0.45))
         self.w_real_lp_flow = float(cfg.get("real_lp_flow_weight", 1.0))
 
+        # Backbone-arm weights. Separate keys from the decoded path's, because they act on
+        # different quantities: `preserve_weight` bills nm of backbone displacement where
+        # `contact_weight` billed a soft contact count, and reusing one key for both would
+        # make a config silently mean something else depending on the mode.
+        self.w_bb_preserve = float(lw.get("preserve_weight", 1.0))
+        self.w_bb_steric = float(lw.get("steric_weight", 1.0))
+        self.w_bb_geometry = float(lw.get("bb_geometry_weight", 1.0))
+        self.w_bb_open = float(lw.get("open_weight", 0.2))
+        self.bb_non_interface_weight = float(lw.get("non_interface_weight", NON_INTERFACE_WEIGHT))
+
         # Retire the sequence term once it has converged, so the clipped gradient budget
         # goes to the terms that have not. See `sequence_weight_scale`.
         sdec = lw.get("sequence_decay", None) or {}
@@ -244,6 +312,13 @@ class CP2LPGenerator(Proteina):
             # builds the SAME discriminator as the common fork, bit for bit, which is what
             # makes "fork all five arms from one checkpoint" mean anything.
             noise_level_dim=(self.dgan_noise_level_dim if self.cp2lp_addon == "noise" else 0),
+            # BACKBONE MODE REMOVES THREE FEATURE GROUPS from D, each a shortcut the
+            # generator could not close: the peptide sequence (fixed, and drawn from a
+            # different population than the real LPs), sidechain-derived features (nothing on
+            # this path produces sidechains inside the gradient), and exact intra-residue bond
+            # deviations (Arm B's are template-exact, a crystal's are not, so one column
+            # separates the classes perfectly). See discriminator.py.
+            backbone_only=(self.cp2lp_mode == "backbone"),
         )
 
         # ---- addon state. Built only for the arm that uses it, so a checkpoint carries no
@@ -324,7 +399,24 @@ class CP2LPGenerator(Proteina):
         self.reservoir_slack = int(rcfg.get("max_length_slack", 0))
 
         warn_if_condition_unused(list(cfg_exp.nn.feats_seq), list(cfg_exp.nn.feats_pair_repr))
-        if self.cp2lp_mode == "onepass":
+        # A THREE-WAY branch, each mode naming itself. Written out rather than nested because
+        # the first attempt at adding `backbone` here split the original if/else and left
+        # `onepass` logging "LEGACY ROLLOUT" while `backbone` logged "ONE-PASS editor" -- a
+        # log line is exactly the kind of thing nobody re-reads after a refactor, and a run
+        # mislabelled in its own log is unattributable later.
+        if self.cp2lp_mode == "backbone":
+            self._validate_backbone_wiring(cfg_exp)
+            logger.info(
+                f"CP2LP BACKBONE arm={self.bb_arm}: angles={self.bb_angle_source}, "
+                f"lengths={self.bb_length_source}, residual_scale={self.bb_residual_scale}, "
+                f"max_atom_shift_nm={self.bb_max_shift_nm}, anchor_weight={self.bb_anchor_weight}, "
+                f"t_fixed={self.onepass_t}, noise_channels={self.onepass_noise_channels}, "
+                f"samples_per_cp={self.cp2lp_samples_per_cp}, max_cp_per_step={self.cp2lp_max_cp}, "
+                f"adversarial={self.adv_enabled} (weight={self.adv_weight}, "
+                f"warmup={self.adv_warmup_steps}). The frozen AE decoder is OFF the output "
+                f"path: this arm emits N/CA/C/O itself and predicts no sequence."
+            )
+        elif self.cp2lp_mode == "onepass":
             self._validate_onepass_wiring(cfg_exp)
             logger.info(
                 f"CP2LP ONE-PASS editor: arm={describe_arm(self.cp2lp_addon, self.adv_enabled)}, "
@@ -512,12 +604,15 @@ class CP2LPGenerator(Proteina):
         the generator's gradient reaches its own sequence prediction only through the soft
         path, and a hard one-hot would make the sequence invisible to the adversarial term.
         """
-        probs = torch.softmax(decoded["seq_logits"], dim=-1)
-        n_classes = self.discriminator.res_emb.in_features
-        if probs.shape[-1] < n_classes:
-            probs = torch.nn.functional.pad(probs, (0, n_classes - probs.shape[-1]))
-        elif probs.shape[-1] > n_classes:
-            probs = probs[..., :n_classes]
+        # A BACKBONE-ONLY DISCRIMINATOR HAS NO `res_emb`, so there is no width to pad the
+        # sequence block to and no block to build. Caught by the GPU smoke rather than by
+        # review: the generator path worked, the adversarial path worked, and the crash came
+        # from the REAL-LP branch, which featurizes a decoded crystal peptide and is the one
+        # call site that never runs in a generator-only test.
+        if getattr(self.discriminator, "res_emb", None) is None:
+            probs = None
+        else:
+            probs = self._padded_seq_probs(decoded["seq_logits"])
         return self.discriminator.build_features(
             pep_atom37=decoded["coors_nm"],
             pep_atom_mask=decoded["atom_mask_eff"],
@@ -528,6 +623,16 @@ class CP2LPGenerator(Proteina):
             target_mask=batch["seq_target_mask"].bool(),
             target_aatype=batch.get("seq_target", None),
         )
+
+    def _padded_seq_probs(self, seq_logits: torch.Tensor) -> torch.Tensor:
+        """Softmax of the decoder's logits, widened or trimmed to D's class count."""
+        probs = torch.softmax(seq_logits, dim=-1)
+        n_classes = self.discriminator.res_emb.in_features
+        if probs.shape[-1] < n_classes:
+            probs = torch.nn.functional.pad(probs, (0, n_classes - probs.shape[-1]))
+        elif probs.shape[-1] > n_classes:
+            probs = probs[..., :n_classes]
+        return probs
 
     def _generate_from_cp(self, cp_batch: dict) -> tuple[dict, dict, dict]:
         """Runs the short differentiable rollout on a CP-conditioned batch.
@@ -590,7 +695,15 @@ class CP2LPGenerator(Proteina):
         all -- resuming loads the arm's own full state dict, where the columns already
         carry whatever they learned.
         """
-        if self.cp2lp_mode != "onepass":
+        # BACKBONE MODE NEEDS THIS TOO, for exactly the reason one-pass does: the backbone
+        # heads are zero-initialised as well, so with the noise columns also at zero the
+        # trunk receives no gradient on step one and the noise only becomes readable once
+        # the heads have moved. The arm would learn a deterministic edit first and discover
+        # its random input later -- and `within-source diversity`, which the comparison
+        # reports, would be structurally zero over that whole phase. Found by the GPU smoke,
+        # which printed `columns None re-initialised` where the one-pass smoke treats None
+        # as a hard error.
+        if self.cp2lp_mode not in ("onepass", "backbone"):
             return None
         from proteinfoundation.cp2lp.editor import init_noise_adapter_
 
@@ -663,8 +776,354 @@ class CP2LPGenerator(Proteina):
             }
         return gen_batch, decoded, extras
 
+    # ====================================================================== backbone arms
+
+    def _validate_backbone_wiring(self, cfg_exp) -> None:
+        """Hard checks for the two representation arms. Each failure is otherwise silent.
+
+        * a head/arm mismatch -> `apply_backbone_arm` raises, but on the first batch of a
+          queued GPU job rather than at config time;
+        * no noise feature -> one LP per CP for ever, and the within-source diversity column
+          of the comparison is structurally zero;
+        * a nonzero real-LP FLOW weight -> the velocity objective does not reach the new
+          heads at all. The plan is explicit that a legacy flow loss on a discarded output
+          head is not an effective anchor, so the anchor here is
+          `_real_lp_backbone_anchor`, weighted by `cp2lp.backbone.anchor_weight`.
+        """
+        want = {ARM_CARTESIAN: "cartesian", "torsion": "torsion"}[self.bb_arm]
+        got = str(cfg_exp.nn.get("editor_backbone_mode", "none"))
+        if got != want:
+            raise ValueError(
+                f"cp2lp.backbone.arm={self.bb_arm!r} needs `nn.editor_backbone_mode: {want}`, "
+                f"got {got!r}. The arm's output head has to exist before the arm can run."
+            )
+        feats = list(cfg_exp.nn.feats_seq)
+        if "editor_noise_seq" not in feats:
+            raise ValueError(
+                "cp2lp.mode=backbone requires `editor_noise_seq` in nn.feats_seq (append it "
+                "LAST). One network evaluation with no random input produces one LP per CP."
+            )
+        if feats[-1] != "editor_noise_seq":
+            logger.warning(
+                f"`editor_noise_seq` is at position {feats.index('editor_noise_seq')} of "
+                f"{len(feats)} in nn.feats_seq, not last. Features concatenate in list order "
+                "and `_splice_pretrained_weights` copies LEADING columns, so anything after "
+                "it has its pretrained weights re-bound to the wrong inputs."
+            )
+        if self.w_real_lp_flow != 0.0:
+            raise ValueError(
+                "cp2lp.mode=backbone requires `cp2lp.real_lp_flow_weight: 0.0`. The flow "
+                "objective supervises a velocity head that is not on this output path, so it "
+                "would train a readout nothing reads. The real-LP anchor for these arms is "
+                "cp2lp.backbone.anchor_weight, which supervises the backbone head itself."
+            )
+        if self.w_sequence != 0.0:
+            raise ValueError(
+                "cp2lp.mode=backbone requires `cp2lp.losses.sequence_weight: 0.0`. No sequence "
+                "is predicted on this path -- the source's is copied exactly -- so a sequence "
+                "retention term has nothing to act on."
+            )
+
+    def _source_backbone(self, gen_batch: dict, mask: torch.Tensor) -> torch.Tensor:
+        """The source CP's backbone, `[b, n, 4, 3]` nm, by decoding the source condition.
+
+        DETACHED. It is the arm's reference point and the preservation term's target, not a
+        quantity to optimise: letting gradient into it would let the generator reduce the
+        preservation loss by moving the target instead of by preserving anything.
+        """
+        with torch.no_grad():
+            src_dec = self._decode(gen_batch[SRC_CP_KEY], mask)
+            bb, _ = extract_backbone(src_dec["coors_nm"], src_dec["atom_mask_eff"])
+        return bb.detach()
+
+    def generate_backbone(
+        self,
+        cp_batch: dict,
+        noise: torch.Tensor | None = None,
+        deterministic: bool = False,
+    ) -> tuple[dict, dict, dict]:
+        """ONE network evaluation: encoded source CP in, a full N/CA/C/O backbone out.
+
+        Returns `(gen_batch, decoded, extras)`, where `decoded` is shaped exactly like the
+        frozen AE decoder's output -- `coors_nm`, `atom_mask_eff`, `seq_logits` -- so every
+        downstream consumer (`_featurize`, the export path, the metrics) works unchanged.
+
+        THE AE DECODER IS NOT CALLED FOR THE OUTPUT. `coors_nm` here is the arm's own
+        backbone placed into the shared atom37 container with exactly four slots unmasked;
+        `backbone_to_atom37` is what enforces that, as a mask rather than a convention. The
+        AE is still used to decode the SOURCE (the arm needs a reference backbone) and to
+        decode real LPs for the discriminator's real class -- both inputs, neither output.
+
+        `seq_logits` is a ONE-HOT OF THE SOURCE SEQUENCE, not a prediction. The sequence is
+        copied exactly and is known, so a one-hot is the truth rather than a stand-in; it is
+        provided because `_featurize` reads the key, and a backbone-only discriminator drops
+        it again on the way in.
+        """
+        bs, n = cp_batch["mask"].shape
+        ref = cp_batch["x_1"][self._data_modes[0]]
+        if noise is None and not deterministic:
+            noise = sample_editor_noise(
+                bs, n, self.onepass_noise_channels, ref.device, ref.dtype, self._noise_generator()
+            )
+        gen_batch = build_editor_batch(
+            cp_batch, data_modes=self._data_modes, t_fixed=self.onepass_t, noise=noise
+        )
+        mask = gen_batch["mask"].bool()
+        src_bb = self._source_backbone(gen_batch, mask)
+
+        # ONE call. `n_recycle=0` makes that literally true; the smoke counts trunk calls
+        # with a forward hook rather than trusting this line.
+        nn_out = self.call_nn(gen_batch, n_recycle=0)
+        gen_bb, diag = apply_backbone_arm(
+            self.bb_arm,
+            src_bb,
+            nn_out,
+            mask,
+            aatype=gen_batch.get("residue_type", None),
+            scale=self.bb_residual_scale,
+            max_shift_nm=self.bb_max_shift_nm,
+            **(
+                {"angle_source": self.bb_angle_source, "length_source": self.bb_length_source}
+                if self.bb_arm != ARM_CARTESIAN
+                else {}
+            ),
+        )
+
+        atom37, atom_mask = backbone_to_atom37(gen_bb, mask)
+        decoded = {
+            "coors_nm": atom37,
+            "atom_mask": atom_mask,
+            "atom_mask_eff": atom_mask & mask[..., None],
+            "seq_logits": self._source_seq_logits(gen_batch, mask),
+        }
+        extras = {"gen_bb": gen_bb, "src_bb": src_bb, "metrics": {}}
+        with torch.no_grad():
+            v = backbone_validity(gen_bb, mask)
+            extras["metrics"] = {
+                **dict(diag),
+                **{k: x.mean() for k, x in v.items()},
+            }
+        return gen_batch, decoded, extras
+
+    def _source_seq_logits(self, gen_batch: dict, mask: torch.Tensor) -> torch.Tensor:
+        """`[b, n, 21]` one-hot of the source sequence. The truth, not a prediction."""
+        aatype = gen_batch.get("residue_type", None)
+        b, n = mask.shape
+        if aatype is None:
+            return torch.zeros(b, n, restype_num + 1, device=mask.device)
+        oh = torch.nn.functional.one_hot(
+            aatype.long().clamp(0, restype_num), restype_num + 1
+        ).to(torch.float32)
+        # Large but finite, so a softmax of it is a near-one-hot rather than exactly one --
+        # an exact one-hot would put a hard zero into any log the metrics take.
+        return (oh * 10.0) * mask[..., None].to(oh.dtype)
+
+    def _backbone_loss_terms(
+        self, gen_batch: dict, extras: dict
+    ) -> dict[str, torch.Tensor]:
+        """The backbone arms' non-adversarial terms, UNWEIGHTED and separate.
+
+        Separate because scalar loss shares are NOT gradient shares: a term worth 1% of the
+        summed loss can carry most of the gradient reaching a head, and the only way to know
+        is to differentiate each one on its own. `_log_backbone_grad_shares` does exactly
+        that on a schedule.
+        """
+        mask = gen_batch["mask"].bool()
+        gen_bb, src_bb = extras["gen_bb"], extras["src_bb"]
+        w, _ = source_interface_weights(
+            self._src_atom37(gen_batch, mask), self._src_atom_mask(gen_batch, mask), mask,
+            gen_batch["x_target"], gen_batch["target_mask"], gen_batch["seq_target_mask"].bool(),
+            cutoff_nm=self.contact_cutoff_nm, non_interface=self.bb_non_interface_weight,
+        )
+        atom37, atom_mask = backbone_to_atom37(gen_bb, mask)
+        out = {
+            "preserve": backbone_preservation_loss(gen_bb, src_bb, mask, w)[0],
+            "steric": backbone_steric_loss(
+                gen_bb, mask, gen_batch["x_target"], gen_batch["target_mask"],
+                gen_batch["seq_target_mask"].bool(), threshold_nm=self.clash_threshold_nm,
+            )[0],
+            "open": terminal_opening_reward(atom37, mask, self.min_open_gap_nm)[0],
+        }
+        # ARM A ONLY. Arm B's bond geometry is correct by construction, so for it this term
+        # is a constant whose gradient is numerical noise -- including it would add noise to
+        # one arm's gradient budget and not the other's, which is a difference between the
+        # arms that is not the representation.
+        if self.bb_arm == ARM_CARTESIAN:
+            out["geometry"] = open_backbone_geometry_loss(gen_bb, mask)[0]
+        return out
+
+    def _src_atom37(self, gen_batch: dict, mask: torch.Tensor) -> torch.Tensor:
+        """Source CP ALL-ATOM coordinates, for deriving the interface weights.
+
+        All-atom on purpose: the binding mode lives in the sidechains, and the generated
+        backbone has none to read it from. Cached per batch because the preservation term
+        and the loss-term probe would otherwise decode the source twice.
+        """
+        if getattr(self, "_src_dec_cache", None) is None:
+            with torch.no_grad():
+                self._src_dec_cache = self._decode(gen_batch[SRC_CP_KEY], mask)
+        return self._src_dec_cache["coors_nm"]
+
+    def _src_atom_mask(self, gen_batch: dict, mask: torch.Tensor) -> torch.Tensor:
+        self._src_atom37(gen_batch, mask)
+        return self._src_dec_cache["atom_mask_eff"]
+
+    def _backbone_losses(self, gen_batch: dict, extras: dict) -> tuple[torch.Tensor, dict]:
+        """Weighted sum of the backbone arms' non-adversarial terms, plus diagnostics."""
+        mask = gen_batch["mask"].bool()
+        gen_bb, src_bb = extras["gen_bb"], extras["src_bb"]
+        self._src_dec_cache = None  # one decode per batch, released at the end
+
+        w, iface_met = source_interface_weights(
+            self._src_atom37(gen_batch, mask), self._src_atom_mask(gen_batch, mask), mask,
+            gen_batch["x_target"], gen_batch["target_mask"], gen_batch["seq_target_mask"].bool(),
+            cutoff_nm=self.contact_cutoff_nm, non_interface=self.bb_non_interface_weight,
+        )
+        pres, pres_met = backbone_preservation_loss(gen_bb, src_bb, mask, w)
+        ster, ster_met = backbone_steric_loss(
+            gen_bb, mask, gen_batch["x_target"], gen_batch["target_mask"],
+            gen_batch["seq_target_mask"].bool(), threshold_nm=self.clash_threshold_nm,
+        )
+        atom37, _ = backbone_to_atom37(gen_bb, mask)
+        opening, open_met = terminal_opening_reward(atom37, mask, self.min_open_gap_nm)
+
+        total = (
+            self.w_bb_preserve * pres + self.w_bb_steric * ster + self.w_bb_open * opening
+        )
+        metrics = {
+            "loss_bb_preserve": pres.detach(), "loss_bb_steric": ster.detach(),
+            "loss_bb_open": opening.detach(),
+            **iface_met, **pres_met, **ster_met, **open_met,
+        }
+        if self.bb_arm == ARM_CARTESIAN:
+            geom, geom_met = open_backbone_geometry_loss(gen_bb, mask)
+            total = total + self.w_bb_geometry * geom
+            metrics["loss_bb_geometry"] = geom.detach()
+            metrics.update(geom_met)
+
+        if gen_bb.shape[0] > 1:
+            metrics["seed_diversity_nm"] = pairwise_ca_rmsd_nm(atom37, mask)
+        self._src_dec_cache = None
+        return total, metrics
+
+    def _real_lp_backbone_anchor(self, lp_batch: dict) -> tuple[torch.Tensor, int, dict]:
+        """Denoise a corrupted REAL LP back to its own backbone, THROUGH the arm's head.
+
+        WHY THIS REPLACES THE FLOW LOSS. A legacy flow term supervises a velocity readout
+        that is not on this output path, so it would train a head nothing reads and anchor
+        nothing. This instead corrupts a real bound LP with the SAME interpolant, decodes the
+        corrupted state to get a starting backbone, and asks the arm to put it back -- which
+        reaches the new head and the shared trunk, and does so with clean LP geometry as the
+        target.
+
+        THE SOURCE CP CONDITION IS DROPPED, not left unset, so the network sees the explicit
+        "absent" flag and this stays a trained input mode rather than an out-of-distribution
+        one. Both arms get the same corruption draws and the same Cartesian criterion, Arm B
+        evaluated through its builder -- so the anchor is one requirement reached two ways
+        rather than two different objectives.
+        """
+        drop_source_cp_condition(lp_batch, self._data_modes)
+        mask = lp_batch["mask"].bool()
+        bs = mask.shape[0]
+
+        with torch.no_grad():
+            clean = {
+                dm: lp_batch["x_1"][dm].detach() * mask[..., None].to(lp_batch["x_1"][dm].dtype)
+                for dm in self._data_modes
+            }
+            true_bb, _ = extract_backbone(*(lambda d: (d["coors_nm"], d["atom_mask_eff"]))(
+                self._decode(clean, mask)
+            ))
+
+        lp_batch = self.fm.corrupt_batch(lp_batch)
+        # The interpolant draws t over the whole schedule; the arms only ever run at one
+        # fixed t, so the anchor is restricted to a band around it. Training the head to
+        # denoise from t=0.02 would be fitting a regime the generator never visits.
+        lo, hi = self.bb_anchor_t_range
+        for dm in self._data_modes:
+            lp_batch["t"][dm] = lp_batch["t"][dm].clamp(lo, hi)
+
+        with torch.no_grad():
+            noisy_bb, _ = extract_backbone(*(lambda d: (d["coors_nm"], d["atom_mask_eff"]))(
+                self._decode({dm: lp_batch["x_t"][dm] for dm in self._data_modes}, mask)
+            ))
+
+        if EDITOR_NOISE_KEY not in lp_batch:
+            ref = lp_batch["x_t"][self._data_modes[0]]
+            lp_batch[EDITOR_NOISE_KEY] = sample_editor_noise(
+                bs, mask.shape[1], self.onepass_noise_channels, ref.device, ref.dtype,
+                self._noise_generator(),
+            )
+        request_linear_topology(lp_batch, bs=bs)
+        nn_out = self.call_nn(lp_batch, n_recycle=0)
+        pred_bb, _ = apply_backbone_arm(
+            self.bb_arm, noisy_bb.detach(), nn_out, mask,
+            aatype=lp_batch.get("residue_type", None),
+            scale=self.bb_residual_scale, max_shift_nm=None,
+            **(
+                {"angle_source": self.bb_angle_source, "length_source": self.bb_length_source}
+                if self.bb_arm != ARM_CARTESIAN
+                else {}
+            ),
+        )
+        loss, met = backbone_reconstruction_loss(pred_bb, true_bb.detach(), mask)
+        with torch.no_grad():
+            # The FLOOR: how close the arm could get at zero head output. An anchor loss at
+            # or below it says the head is doing nothing and the number is template drift.
+            floor = init_reconstruction_error(
+                self.bb_arm, true_bb, mask,
+                angle_source=getattr(self, "bb_angle_source", DEFAULT_ANGLE_SOURCE),
+                length_source=getattr(self, "bb_length_source", DEFAULT_LENGTH_SOURCE),
+                aatype=lp_batch.get("residue_type", None),
+            )
+            met["anchor_template_floor_nm"] = torch.tensor(float(floor["init_bb_rmsd_nm"]))
+        return loss, bs, met
+
+    @torch.enable_grad()
+    def _log_backbone_grad_shares(self, gen_batch: dict, extras: dict) -> dict:
+        """Per-term gradient norm at the arm's HEAD, before clipping. Weighted, not raw.
+
+        SCALAR LOSS SHARES ARE NOT GRADIENT SHARES, and this project has already been bitten
+        by exactly that: the clash term was 0.06% of the objective while being violated, and
+        a loss-value table said nothing about it. This differentiates each weighted term on
+        its own and reports the norm that actually arrives, which is the quantity that
+        decides whether a term is doing anything.
+
+        Measured on a schedule rather than every step: it costs one backward per term.
+        """
+        terms = self._backbone_loss_terms(gen_batch, extras)
+        weights = {
+            "preserve": self.w_bb_preserve, "steric": self.w_bb_steric,
+            "open": self.w_bb_open, "geometry": self.w_bb_geometry,
+        }
+        params = [p for p in self._backbone_head_parameters() if p.requires_grad]
+        out: dict[str, torch.Tensor] = {}
+        if not params:
+            return out
+        for name, term in terms.items():
+            if not term.requires_grad:
+                out[f"gradnorm/{name}"] = torch.zeros(())
+                continue
+            g = torch.autograd.grad(
+                weights.get(name, 1.0) * term, params, retain_graph=True, allow_unused=True
+            )
+            out[f"gradnorm/{name}"] = torch.sqrt(
+                sum((x * x).sum() for x in g if x is not None) + 1e-20
+            ).detach()
+        return out
+
+    def _backbone_head_parameters(self):
+        """The arm's own output head. Where the per-term gradient is measured."""
+        nn_mod = getattr(self.nn, "module", self.nn)
+        for attr in ("editor_bb_cartesian", "editor_bb_torsion", "editor_bb_root"):
+            head = getattr(nn_mod, attr, None)
+            if head is not None:
+                yield from head.parameters()
+
     def _generate(self, cp_batch: dict) -> tuple[dict, dict, dict]:
         """Mode dispatch. ``(gen_batch, decoded, extras)``; ``extras`` is mode-specific."""
+        if self.cp2lp_mode == "backbone":
+            return self.generate_backbone(cp_batch)
         if self.cp2lp_mode == "onepass":
             return self.generate_onepass(cp_batch)
         gen_batch, decoded, samples = self._generate_from_cp(cp_batch)
@@ -830,6 +1289,20 @@ class CP2LPGenerator(Proteina):
                 g_loss = g_loss + self.w_real_lp_flow * flow_loss
                 metrics["loss_real_lp_flow"] = flow_loss.detach()
                 metrics["n_real_lp"] = torch.tensor(float(n_lp))
+            elif self.cp2lp_mode == "backbone" and self.bb_anchor_weight != 0.0:
+                # THE ANCHOR THAT ACTUALLY SUPERVISES THE NEW HEAD. The flow branch above
+                # trains a velocity readout that is not on this output path; this denoises a
+                # corrupted real LP back to its own backbone THROUGH the arm, so the gradient
+                # reaches the head and the shared trunk. Same corruption draws and the same
+                # Cartesian criterion in both arms, Arm B through its builder.
+                #
+                # `slice_batch` copies, but `_real_lp_backbone_anchor` calls `corrupt_batch`
+                # and `drop_source_cp_condition`, which mutate -- so it runs AFTER the real
+                # pool below has taken its clean snapshot. Ordering matters here and the
+                # reservoir push is what would silently change.
+                anchor_batch = lp_batch
+                self._pending_bb_anchor = anchor_batch
+                metrics["n_real_lp"] = torch.tensor(float(lp_batch["mask"].shape[0]))
             else:
                 metrics["n_real_lp"] = torch.tensor(float(lp_batch["mask"].shape[0]))
 
@@ -871,6 +1344,15 @@ class CP2LPGenerator(Proteina):
                     self.reservoir.push_batch(real_feats_live, residue_lengths(lp_mask))
                 metrics["reservoir_size"] = torch.tensor(float(len(self.reservoir)))
 
+            # Now that the clean snapshot is in the reservoir, the anchor may corrupt.
+            pending = getattr(self, "_pending_bb_anchor", None)
+            if pending is not None:
+                self._pending_bb_anchor = None
+                anchor_loss, _, anchor_met = self._real_lp_backbone_anchor(pending)
+                g_loss = g_loss + self.bb_anchor_weight * anchor_loss
+                metrics["loss_bb_anchor"] = anchor_loss.detach()
+                metrics.update(anchor_met)
+
         # -------------------------------------------------- CP -> LP generation
         fake_feats = None
         if cyclic_idx.any():
@@ -887,7 +1369,15 @@ class CP2LPGenerator(Proteina):
                 cp_batch = slice_batch(cp_batch, idx, keep)
 
             gen_batch, decoded, extras = self._generate(cp_batch)
-            aux_loss, aux_metrics = self._generator_losses(gen_batch, decoded)
+            if self.cp2lp_mode == "backbone":
+                aux_loss, aux_metrics = self._backbone_losses(gen_batch, extras)
+                if (
+                    self.bb_grad_probe_every > 0
+                    and int(self.g_updates) % self.bb_grad_probe_every == 0
+                ):
+                    aux_metrics.update(self._log_backbone_grad_shares(gen_batch, extras))
+            else:
+                aux_loss, aux_metrics = self._generator_losses(gen_batch, decoded)
             g_loss = g_loss + aux_loss
             metrics.update(aux_metrics)
             metrics.update(extras.get("metrics", {}))
@@ -917,7 +1407,11 @@ class CP2LPGenerator(Proteina):
                 # arms were trained and measured against `global_step`, and silently
                 # doubling their effective warmup would make a rerun differ from the runs
                 # docs/README_CP2LP.md reports. New mode, corrected counter.
-                progress = int(self.g_updates) if self.cp2lp_mode == "onepass" else int(self.global_step)
+                progress = (
+                    int(self.g_updates)
+                    if self.cp2lp_mode in ("onepass", "backbone")
+                    else int(self.global_step)
+                )
                 if progress >= self.adv_warmup_steps:
                     # The discriminator is a FIXED FUNCTION during the generator's step.
                     # Without this the generator's `-D(fake)` term backprops into D's own

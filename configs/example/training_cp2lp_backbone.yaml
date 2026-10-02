@@ -1,0 +1,202 @@
+# @package _global_
+# SHARED BASE for the two BACKBONE REPRESENTATION arms. NOT AN ARM -- nothing launches from
+# this file. Two thin children differ from it by `run_name`, `cp2lp.backbone.arm` and
+# `nn.editor_backbone_mode`, which is the entire difference between the arms:
+#
+#   training_cp2lp_bb_cartesian.yaml   free Cartesian residual on N, CA, C, O
+#   training_cp2lp_bb_torsion.yaml     torsion builder + rigid root transform
+#
+# Editing THIS file moves both together, which is what keeps the comparison single-variable
+# for free. Anything that belongs to one arm only either lives in that arm's branch in
+# `cp2lp/bb_arms.py` or it is a confound.
+#
+# ----------------------------------------------------------------------------------
+# WHAT CHANGED FROM THE ONE-PASS EDITOR, AND WHY.
+#
+# The one-pass editor edits a CA track plus the local latents and hands the sum to the FROZEN
+# AE DECODER, which invents N, C, O and a sequence. MEASURED consequence: `chain_intact` sat
+# at 0.0000 against an AE round-trip ceiling of 0.9844, and the binding constraint was
+# CA-latent consistency -- a perfect CA trace still decodes badly unless the latents agree
+# with it. The decoder sat between the edit and the metric.
+#
+# These arms delete the decoder from the OUTPUT path. The generator emits N/CA/C/O itself, the
+# sequence is the source's and is never predicted, and no latent is decoded. So backbone
+# validity becomes a property of the generator, and the CA-latent constraint cannot bind
+# because nothing decodes a latent. MEASURED on real natives with random head output: Arm A
+# leaves `chain_intact` at 0.000, Arm B at 1.000. That contrast IS the experiment.
+#
+# The AE is still used for two INPUTS -- decoding the source CP so the arm has a reference
+# backbone, and decoding real LPs for the discriminator's real class. Neither is an output.
+#
+# ----------------------------------------------------------------------------------
+# GENERATOR UPDATES, NOT `global_step`: this arm steps two optimizers, so `global_step`
+# counts G+D and would advance twice as fast as a control. Every budget here is in
+# `cp2lp.max_g_updates` / `eval_checkpoint_g_updates`.
+#
+# Run:
+#   bash scripts/submit_cp2lp_backbone.sh --submit smoke
+#   bash scripts/submit_cp2lp_backbone.sh --submit arms
+
+defaults:
+  - /example/training_cp2lp_onepass
+  - _self_
+
+run_name: cp2lp_backbone_base
+
+# The same pinned fork the one-pass arms start from, so the trunk and the discriminator's
+# initialisation are shared. The backbone HEADS are not in that checkpoint and are newly
+# zero-initialised -- deliberately, because `ca_linear` emits a 3-vector CA velocity and its
+# weights carry no information about where a carbonyl oxygen goes or what a phi residual
+# should be. Seeding a 12- or 9-channel head from it would import a semantically unrelated
+# prior and call it a warm start.
+pretrain_ckpt_path: /zfsauton/scratch/yixiz/Proteina-Complexa/training_runs/store/cp2lp_onepass_fork/cp2lp_onepass_fork.ckpt
+
+log:
+  wandb_project: cpsea_cp2lp
+
+nn:
+  # Still needed: `build_editor_batch` and the noise plumbing are shared with the one-pass
+  # editor, and the CA/latent residual heads remain in the checkpoint. They are simply not
+  # read on this path -- `apply_backbone_arm` consumes `nn_out["backbone"]` only.
+  enable_editor_residual: true
+  editor_noise_channels: 16
+  # SET BY EACH ARM. `cartesian` -> a 12-channel residual; `torsion` -> 6 angular channels
+  # plus a 6-channel pooled root transform. The module refuses to start if this disagrees
+  # with `cp2lp.backbone.arm`, because a mismatch otherwise surfaces as a KeyError on the
+  # first batch of a queued GPU job.
+  editor_backbone_mode: ???
+
+cp2lp:
+  mode: backbone
+
+  backbone:
+    # SET BY EACH ARM: cartesian | torsion. No default -- the arm IS the experiment.
+    arm: ???
+
+    # Carry the SOURCE's own bond angles and lengths rather than the measured template
+    # library, clamped source-relatively into the native window the way `ca_internal` clamps
+    # its bend angle. Zero head output is then the EXACT identity (measured 0.00001 A on real
+    # complexes for both arms).
+    #
+    # WHY NOT THE TEMPLATE. Its reconstruction floor was measured leave-one-out on the 101
+    # natives (job 70313) at 0.1180 nm, and that floor is ENTIRELY bond angles -- 22-31% each
+    # for the three of them, while every bond length read as ~0%. A 1.18 A floor is larger
+    # than the 0.5 A "identity map" edit the export gate was measured to select for, so under
+    # a templated angle every edit bin below 1.18 A would be empty for Arm B BY CONSTRUCTION
+    # -- and edit-binned comparison is exactly how this experiment avoids rewarding a
+    # generator for doing nothing. Arm A starts from the same AE-decoded source, so templating
+    # only Arm B's angles would make the arms less comparable, not more.
+    #
+    # AND "LENGTHS ARE FREE" WAS CONDITIONAL. Every length row above was measured with the
+    # ANGLES STILL TEMPLATED, so the 1.18 A angle error swamped them. With angles carried, the
+    # lengths are all that remains: 0.21 A RMSD from per-bond deviations of only 0.004-0.008 A
+    # compounding along the chain. Both are carried, and so are the carbonyl geometry and the
+    # per-residue O-dihedral offset.
+    #
+    # `template` for either is implemented and tested; switching one re-introduces its floor,
+    # which `anchor_template_floor_nm` reports so a run cannot be read wrong.
+    angle_source: source
+    length_source: source
+
+    # Damping on the raw head output. SEPARATE PER ARM because the two heads emit different
+    # QUANTITIES in different units -- nanometres of displacement against radians of rotation
+    # -- so one shared number would not be one shared budget, it would be the same number
+    # applied to two incomparable things. Left unset here so each arm takes its own default
+    # (1.0 Cartesian, 0.3 torsion); the SHARED budget is `max_atom_shift_nm` below.
+    #
+    # Arm B's default is smaller because a torsion at residue i swings the whole chain
+    # downstream of i, so its gradient scaling is poor and gets worse with length. That is the
+    # known cost of a torsion parameterisation and it is damped here, not solved.
+    # residual_scale: (per-arm default)
+
+    # THE SHARED MOVEMENT BUDGET, in nanometres of ACTUAL per-atom displacement, applied
+    # identically in both arms. `null` disables it.
+    #
+    # Defined on the displacement and not on the parameters, which is the only version of
+    # this that is the same constraint in both arms: clipping a Cartesian residual and a
+    # torsion residual to the same number would define two unrelated budgets, and 0.1 rad at
+    # residue 2 of a 20-mer moves the far end by nanometres. The clip is a direction-
+    # preserving radial projection, so it shortens an edit and never rotates it.
+    max_atom_shift_nm: null
+
+    # THE REAL-LP ANCHOR, and it is not the flow loss. A legacy flow term supervises a
+    # velocity readout that is not on this output path, so it would train a head nothing reads
+    # and anchor nothing. This denoises a corrupted real bound LP back to its own backbone
+    # THROUGH the arm, so the gradient reaches the new head and the shared trunk, with clean
+    # LP geometry as the target and the source-CP condition explicitly absent.
+    #
+    # Same corruption draws and the same Cartesian criterion in both arms, Arm B evaluated
+    # through its builder -- one requirement reached two ways, rather than two objectives.
+    anchor_weight: 1.0
+    # The arms only ever run at one fixed t, so the anchor is restricted to a band around it.
+    # Training the head to denoise from t=0.02 would be fitting a regime the generator never
+    # visits.
+    anchor_t_range: [0.2, 0.8]
+
+    # Per-term gradient norms at the arm's head, before clipping, every N generator updates.
+    # SCALAR LOSS SHARES ARE NOT GRADIENT SHARES and this project has already been bitten by
+    # exactly that -- the clash term was 0.06% of the objective while being violated, and a
+    # loss-value table said nothing about it. Costs one backward per term, hence a schedule.
+    grad_probe_every_n_steps: 200
+
+  # OFF, and the module raises if it is not: see `backbone.anchor_weight` above.
+  real_lp_flow_weight: 0.0
+
+  losses:
+    # ---- the backbone path's own weights. Separate keys from the decoded path's, because
+    # they act on different quantities: `preserve_weight` bills nm of backbone displacement
+    # where `contact_weight` billed a soft contact count.
+    #
+    # Interface-weighted backbone displacement from the source, in the FIXED RECEPTOR FRAME
+    # with no superposition -- a peptide that rotated out of the pocket and back has not
+    # preserved its pose however well it superposes onto itself. A training proxy only:
+    # whether sidechain contacts actually survive is decided after packing.
+    preserve_weight: 1.0
+
+    # Normalised PER PEPTIDE RESIDUE per example. This is the fix for a measured defect:
+    # `losses.clash_loss` divides by the peptide-by-receptor PAIR count, which scales with
+    # receptor size and left clash at 0.06% of the objective WHILE BEING VIOLATED. Measured on
+    # one fixed clash with the receptor padded by distant residues, the new term is constant
+    # at 0.514052 for 20/100/400/1000 receptor residues where the old one varies 13.4x and
+    # sits 19-256x lower.
+    steric_weight: 1.0
+
+    # ARM A ONLY in effect. Arm B's bond geometry is correct by construction, so for it the
+    # term is a constant whose gradient is numerical noise -- the module skips it rather than
+    # adding noise to one arm's clipped gradient budget and not the other's. Arm B's geometry
+    # is still MEASURED, by `backbone_validity`, because "by construction" is a claim about
+    # code and needs a number behind it.
+    bb_geometry_weight: 1.0
+
+    # Unchanged flat-bottom terminal opening, threshold included. Not weakened to improve
+    # acceptance.
+    open_weight: 0.2
+
+    # Weight a residue that carries no source contact still gets, so a non-interface residue
+    # is held near the source rather than free to wander into the receptor -- it just costs
+    # less than an interface residue does.
+    non_interface_weight: 0.25
+
+    # NO SEQUENCE TERM. The source's sequence is copied exactly and nothing predicts one, so
+    # a retention loss has nothing to act on. The module raises if this is nonzero.
+    sequence_weight: 0.0
+    # Inert on this path (the decoded contact term is not used); restated as zero so a
+    # config reader does not have to work out whether it applies.
+    contact_weight: 0.0
+    clash_weight: 0.0
+    geometry_weight: 0.0
+
+  discriminator:
+    # `backbone_only` is set by the MODULE from `cp2lp.mode`, not here, so the feature set
+    # and the generator's output can never disagree. It removes three groups, each a shortcut
+    # the generator could not close:
+    #   * peptide sequence/probabilities -- fixed by construction, and real LPs come from a
+    #     different population (PepBench), so D could separate the classes on composition
+    #     alone without reading a coordinate, and G is FORBIDDEN to fix it;
+    #   * sidechain-derived features -- nothing on this path produces sidechains inside the
+    #     gradient; the packer does, later, outside it, so D would be scoring the packer;
+    #   * exact intra-residue bond deviations -- Arm B's lengths are template-exact while a
+    #     crystal's are not, so one column separates the populations perfectly.
+    # Sidechain stripping happens inside `build_features` as a single chokepoint, so the real
+    # and generated paths cannot differ in which atoms D was shown.
+    shortcut_probe: true

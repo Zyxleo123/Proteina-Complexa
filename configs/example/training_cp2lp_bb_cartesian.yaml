@@ -1,0 +1,31 @@
+# @package _global_
+# ARM A: a free Cartesian residual on all four backbone atoms.
+#
+# Differs from `training_cp2lp_backbone.yaml` in THREE lines -- the run name and the two
+# that name the representation. Everything else about the two arms is shared, which is what
+# makes this a representation comparison rather than two unrelated runs.
+#
+# WHAT THIS ARM CAN AND CANNOT DO. It can express ANY backbone, including every invalid one:
+# Cartesian coordinates are not locally valid by construction, so bond lengths, bond angles,
+# chain connectivity and carbonyl chirality are all things the arm has to LEARN.
+# `backbone_validity` is its scoreboard, and MEASURED on real natives with a random head it
+# leaves `chain_intact` at 0.000 while a 0.05 nm free residual left 0 of 6 chains intact.
+#
+# Deliberately the FULL backbone, not CA-only followed by the AE decoder -- that arm already
+# exists (`training_cp2lp_onepass_gan.yaml`) and `chain_intact` there was 0.0000.
+#
+# The raw output is what gets packed and scored. No backbone repair step: packing cannot
+# disguise a disconnected chain, and a repair step would measure the repairer.
+
+defaults:
+  - /example/training_cp2lp_backbone
+  - _self_
+
+run_name: cp2lp_bb_cartesian
+
+nn:
+  editor_backbone_mode: cartesian
+
+cp2lp:
+  backbone:
+    arm: cartesian

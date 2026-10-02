@@ -1,0 +1,36 @@
+# @package _global_
+# ARM B: residual rotations on phi/psi/omega plus a rigid root transform, then rebuild.
+#
+# Differs from `training_cp2lp_backbone.yaml` in THREE lines -- the run name and the two that
+# name the representation.
+#
+# WHAT THIS ARM CAN AND CANNOT DO. It CANNOT express an invalid bond length, bond angle or
+# chain break: those constraints are absent from the edit space rather than penalised in it.
+# MEASURED on real natives with a random head, and again with a head emitting 50x garbage,
+# `chain_intact` is 1.000 and every bond length matches to float precision.
+#
+# It pays for that with a torsion LEVER ARM: a rotation at residue i swings everything
+# downstream of i, so the gradient scaling is poor against a Cartesian residual and gets worse
+# with chain length. `residual_scale` (default 0.3 for this arm) damps it. That is the known
+# cost of a torsion parameterisation and it is NOT solved here.
+#
+# THE ROOT TRANSFORM IS NOT OPTIONAL. Arm A can translate and rotate the whole peptide through
+# its per-atom residual; if this arm could only change torsions, the comparison would partly
+# be "which arm was allowed to move the peptide". The root delta restores that degree of
+# freedom, applied about the peptide's own centroid so a rotation does not also translate.
+#
+# No terminal closing bond is ever constructed: the chain runs 0 -> L-1 and stops, and `omega`
+# is indexed by BOND with L-1 entries, so there is no index at which a closure could be placed.
+
+defaults:
+  - /example/training_cp2lp_backbone
+  - _self_
+
+run_name: cp2lp_bb_torsion
+
+nn:
+  editor_backbone_mode: torsion
+
+cp2lp:
+  backbone:
+    arm: torsion

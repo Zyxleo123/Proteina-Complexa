@@ -86,6 +86,30 @@ INTRA_BOND_TOL_NM = 0.02
 #: receptor -- it just costs less than an interface residue does.
 NON_INTERFACE_WEIGHT = 0.25
 
+#: Pseudo-Huber knee for the preservation term, nm. Below this the term is quadratic and its
+#: gradient vanishes smoothly; above it the term is linear, which is the L1-like behaviour
+#: intended (a displacement twice as large should cost twice as much, not four times).
+#:
+#: THIS EXISTS BECAUSE A PLAIN NORM HAS A KINK AT ITS MINIMUM, and that kink made the two arms
+#: differ at initialisation for a reason that is not the representation. MEASURED at zero head
+#: output, where both arms emit exactly the source and all three loss values are bit-identical:
+#:
+#:                    max|gen - src|      preservation gradient norm
+#:     cartesian        1.000e-06 nm        0.0000       (exactly zero)
+#:     torsion          1.733e-06 nm        0.3752       (nonzero)
+#:
+#: The Cartesian residual is EXACTLY zero in float, so `d/dx sqrt(x^2 + eps)` is exactly 0.
+#: The NeRF rebuild leaves ~1.7e-06 nm of genuine float residue, which is above `sqrt(eps)`,
+#: so the derivative is live -- and it is then multiplied by the torsion lever arm. In the
+#: per-term gradient probe on a real batch that showed up as `preserve` carrying 0.0% of Arm
+#: A's head gradient and 61.4% of Arm B's, from identical outputs: a gradient whose magnitude
+#: was large and whose DIRECTION was numerical noise.
+#:
+#: 0.01 nm is 0.1 angstrom -- below the AE decode's own reproducibility and far below any edit
+#: anyone would call an edit, so nothing meaningful is damped. At 1.7e-06 nm the gradient is
+#: ~1.7e-04 of its asymptote; at 0.1 nm it is 0.995 of it.
+PRESERVE_HUBER_NM = 0.01
+
 
 # ------------------------------------------------------------------ the interface weights
 
@@ -143,6 +167,7 @@ def backbone_preservation_loss(
     src_bb: torch.Tensor,
     pep_mask: torch.Tensor,
     weights: torch.Tensor | None = None,
+    huber_nm: float = PRESERVE_HUBER_NM,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Interface-weighted backbone displacement from the source, in the receptor frame.
 
@@ -164,7 +189,13 @@ def backbone_preservation_loss(
     w = w * pm.to(w.dtype)
 
     d = safe_norm(gen_bb - src_bb, dim=-1)  # [b, n, 4]
-    per_res = d.mean(dim=-1)  # average over the four backbone atoms
+    # PSEUDO-HUBER, not the raw norm: `sqrt(d^2 + k^2) - k`. Linear in d far from zero, so
+    # the term still bills a displacement twice as large at twice the cost, but quadratic
+    # near zero so the gradient VANISHES at the identity instead of being a unit vector of
+    # float noise. See `PRESERVE_HUBER_NM` for the measurement that forced this.
+    k = float(huber_nm)
+    cost = torch.sqrt(d * d + k * k) - k if k > 0 else d
+    per_res = cost.mean(dim=-1)  # average over the four backbone atoms
     denom = w.sum(dim=1).clamp(min=1e-6)
     per_example = (w * per_res).sum(dim=1) / denom
 
