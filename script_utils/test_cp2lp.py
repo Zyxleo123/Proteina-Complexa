@@ -1206,3 +1206,65 @@ def test_submitter_refuses_a_malformed_set():
             cwd=repo, capture_output=True, text=True, timeout=180,
         )
         assert r.returncode != 0, f"--set {bad!r} was accepted: {r.stdout}"
+
+
+def test_clash_inter_ignores_padded_receptor_atoms_and_residues():
+    """Is a 1 A "heavy-atom contact" real, or is it padding at the origin?
+
+    WHY THIS MATTERS. At the clash arm's fork point the measured `clash_min_inter` was
+    0.028-0.071 nm in every batch -- 0.28-0.71 A between two heavy atoms, physically
+    impossible and far below the 0.114 nm already flagged in the docs. The
+    `peptide_length` term's gradient is dominated by the single deepest pair, so if some of
+    those pairs were padding the arm would be optimising an artifact.
+
+    The mechanism to rule out: receptor padding slots sit at coordinate (0,0,0), and
+    `CenteringTransform(center_mode="target")` puts the ORIGIN INSIDE THE RECEPTOR -- so a
+    padded slot left unmasked does not read as far away, it reads as a direct hit on the
+    peptide. Two masks have to be right for that not to happen, and the argument names
+    invite mixing them up: `target_atom_mask` is per-ATOM [b,m,37] while `target_mask` is
+    per-RESIDUE [b,m].
+
+    Asserted as INVARIANCE, which is stronger than checking a number: padding must not move
+    the loss at all.
+    """
+    x, m = _atom37(b=1, n=5)
+    pm = torch.ones(1, 5, dtype=torch.bool)
+
+    # One real receptor residue, overlapping residue 0 at 0.12 nm.
+    t = torch.zeros(1, 1, 37, 3)
+    tm = torch.zeros(1, 1, 37, dtype=torch.bool)
+    t[0, 0, CA_IDX] = x[0, 0, CA_IDX] + torch.tensor([0.0, 0.12, 0.0])
+    tm[0, 0, CA_IDX] = True
+    tsm = torch.ones(1, 1, dtype=torch.bool)
+
+    kw = dict(threshold_nm=0.2, inter_norm="peptide_length")
+    base, mb = clash_loss(x, m, pm, target_atom37=t, target_atom_mask=tm,
+                          target_mask=tsm, **kw)
+
+    # (a) EXTRA ATOM SLOTS on the real residue, left at the origin and masked OFF. The
+    # peptide is built near the origin by `_atom37`, so these are the worst case.
+    t_a, tm_a = t.clone(), tm.clone()
+    t_a[0, 0, CA_IDX + 1] = torch.tensor([0.0, 0.0, 0.0])  # unset coord, mask stays False
+    got_a, m_a = clash_loss(x, m, pm, target_atom37=t_a, target_atom_mask=tm_a,
+                            target_mask=tsm, **kw)
+    assert float(got_a) == pytest.approx(float(base), rel=1e-6), \
+        "a masked-off receptor ATOM at the origin changed the loss"
+
+    # (b) EXTRA RESIDUES, all-zero coords, excluded by the RESIDUE mask only (their atom
+    # mask is deliberately left TRUE, which is exactly the mix-up being guarded against).
+    pad = torch.zeros(1, 40, 37, 3)
+    pad_atom = torch.ones(1, 40, 37, dtype=torch.bool)
+    t_b = torch.cat([t, pad], dim=1)
+    tm_b = torch.cat([tm, pad_atom], dim=1)
+    tsm_b = torch.cat([tsm, torch.zeros(1, 40, dtype=torch.bool)], dim=1)
+    got_b, m_b = clash_loss(x, m, pm, target_atom37=t_b, target_atom_mask=tm_b,
+                            target_mask=tsm_b, **kw)
+    assert float(got_b) == pytest.approx(float(base), rel=1e-6), (
+        "receptor residues excluded by the RESIDUE mask still reached the loss -- the "
+        "per-atom and per-residue target masks are being conflated"
+    )
+    assert float(m_b["clash_inter_n_viol"]) == pytest.approx(float(mb["clash_inter_n_viol"]))
+    assert float(m_b["clash_min_inter_nm"]) == pytest.approx(float(mb["clash_min_inter_nm"]))
+
+    # (c) And the reported minimum is the REAL contact, not something nearer.
+    assert float(mb["clash_min_inter_nm"]) == pytest.approx(0.12, abs=2e-3)
