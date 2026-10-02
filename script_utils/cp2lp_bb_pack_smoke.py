@@ -324,27 +324,42 @@ def run_packing(arm: str, gen_bb: torch.Tensor, batch: dict, args) -> dict:
             out["candidates"].append(cand)
             continue
 
-        for s in range(args.pack_seeds):
-            try:
-                packed, diag = pk.pack_one(pose, s, scorefxn=scorefxn)
-                pk.assert_linear_topology(packed)
-                p = str(work / f"{item['id']}__{arm}__pack{s}.pdb")
-                packed.dump_pdb(p)
-                cand["results"].append(
-                    {"seed": s, "ok": True, "pdb": p, **{k: float(x) for k, x in diag.items()}}
-                )
-            except Exception as e:
-                cand["results"].append({"seed": s, "ok": False, "failure": f"{type(e).__name__}: {e}"})
-
-        ok = [r for r in cand["results"] if r["ok"]]
-        print(f"  packing {item['id']:<28s}: {len(ok)}/{args.pack_seeds} ok   "
-              f"chi_seeded {cand.get('n_chi_seeded', 0)}   "
-              f"S-S removed {cand.get('stripped', {}).get('disulfide_removed', 0)}   "
-              + (f"fixed-atom shift {max(r['fixed_atom_max_shift_ang'] for r in ok):.2e} A   "
-                 f"score {min(r['total_score'] for r in ok):.1f}" if ok else "ALL FAILED"))
-        if not ok:
-            for r in cand["results"][:1]:
-                print(f"      first failure: {r.get('failure')}")
+        # THE FULL DRIVER, not just `pack_one`: this exercises the selection order, the
+        # contact map against the real source complex, the clash report, the interface energy
+        # and the manifest row -- i.e. everything the checkpoint evaluation will call. Smoking
+        # only the packer would leave the scoring untested until the first evaluation job.
+        row = pk.pack_candidate(
+            bb=gen_bb[i],
+            aatype=item["pep_aatype"].numpy(),
+            pep_mask=batch["mask"][i],
+            target_atom37_ang=(item["target_atom37"] * 10.0).numpy(),
+            target_aatype=item["target_aatype"].numpy(),
+            work_dir=work, tag=f"{item['id']}__{arm}",
+            source_pdb=item["src_pdb"], n_seeds=args.pack_seeds,
+        )
+        cand.update(row)
+        ok = [r for r in row["results"] if r["ok"]]
+        if "setup_error" in row:
+            print(f"  packing {item['id']:<28s}: SETUP FAILED {row['setup_error']}")
+        else:
+            print(f"  packing {item['id']:<28s}: {row['n_packed_ok']}/{args.pack_seeds} ok, "
+                  f"{row['n_valid']} valid   chi_seeded {row.get('n_chi_seeded', 0)}   "
+                  f"S-S removed {row.get('stripped', {}).get('disulfide_removed', 0)}   "
+                  f"sel seed {row['selected_seed']} ({row['selection_basis']})")
+            if ok:
+                r = next(x for x in ok if x["seed"] == row["selected_seed"])
+                print(f"      retention {r.get('contact_retention', float('nan')):.3f} "
+                      f"({r.get('contacts_kept')}/{r.get('contacts_source')})   "
+                      f"dG {r.get('dG_separated', float('nan')):.1f}   "
+                      f"pep/res {r.get('peptide_score_per_res', float('nan')):.2f}   "
+                      f"clash rec/self {r.get('clash_receptor_count')}/{r.get('clash_self_count')}   "
+                      f"minD {r.get('min_receptor_dist_ang', -1):.2f} A   "
+                      f"fixed shift {r.get('fixed_atom_max_shift_ang', -1):.1e} A   "
+                      f"{r.get('pack_seconds', 0):.1f}s")
+                if not r.get("valid", False):
+                    print(f"      INVALID: {r.get('invalid_reason')}")
+            else:
+                print(f"      first failure: {row['results'][0].get('failure')}")
         out["candidates"].append(cand)
 
     out["work_dir"] = str(work)

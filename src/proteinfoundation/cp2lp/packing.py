@@ -382,3 +382,381 @@ def pack_one(
         )
     diag["total_score"] = float(scorefxn(work))
     return work, diag
+
+
+# ---------------------------------------------------------------------- scoring a pose
+
+
+#: Heavy-atom distance at which a peptide-receptor residue pair counts as in CONTACT, nm.
+#: 0.8 nm is the project's existing `contact_cutoff_nm`, used by the training contact term and
+#: by the discriminator's interface features. Declared here, before any arm was scored, so the
+#: threshold cannot become "whichever one separated the arms".
+CONTACT_CUTOFF_NM = 0.8
+
+#: A tighter cutoff reported BESIDE the above as a diagnostic, not as the criterion. 0.45 nm is
+#: a conventional heavy-atom contact distance; 0.8 nm is generous and a retention figure
+#: computed at it can look healthy while the close-range packing has changed completely.
+CONTACT_TIGHT_NM = 0.45
+
+#: Clash threshold, nm. The project's calibrated value: 0.27 nm REJECTS 43 of 60 native
+#: crystal complexes, so a generator scored against it is being pushed away from native-like
+#: packing rather than towards it. 0.20 nm passes 59 of 60.
+CLASH_NM = 0.20
+
+
+def _heavy_coords(pose, indices: list[int]) -> tuple[np.ndarray, list[tuple[int, str]]]:
+    """Heavy-atom coordinates of the given pose residues, plus (residue, atom-name) labels."""
+    pts, labels = [], []
+    for i in indices:
+        res = pose.residue(i)
+        for a in range(1, res.natoms() + 1):
+            if res.is_virtual(a) or res.atom_type(a).element() == "H":
+                continue
+            xyz = res.xyz(a)
+            pts.append([xyz.x, xyz.y, xyz.z])
+            labels.append((i, res.atom_name(a).strip()))
+    return np.asarray(pts, dtype=float).reshape(-1, 3), labels
+
+
+def residue_contact_map(pose, peptide_chain: str = PEPTIDE_CHAIN, cutoff_nm: float = CONTACT_CUTOFF_NM) -> set:
+    """`{(peptide_local_index, receptor_pose_index)}` pairs within `cutoff_nm`, all-atom.
+
+    Residue PAIRS rather than atom pairs: the question the plan asks is whether the original
+    residue-pair contacts survived, and an atom-level set would churn with every rotamer the
+    packer chose while the interaction it represents stayed put.
+    """
+    pep = peptide_residue_indices(pose, peptide_chain)
+    rec = [i for i in range(1, pose.total_residue() + 1) if i not in set(pep)]
+    if not pep or not rec:
+        return set()
+    cut_ang = cutoff_nm * 10.0
+    out = set()
+    for local, i in enumerate(pep):
+        p, _ = _heavy_coords(pose, [i])
+        if not len(p):
+            continue
+        for j in rec:
+            q, _ = _heavy_coords(pose, [j])
+            if not len(q):
+                continue
+            # Cheap reject on centroids before the full pairwise block.
+            if np.linalg.norm(p.mean(0) - q.mean(0)) > cut_ang + 20.0:
+                continue
+            d = np.linalg.norm(p[:, None, :] - q[None, :, :], axis=-1)
+            if d.min() <= cut_ang:
+                out.add((local, j))
+    return out
+
+
+def clash_report(pose, peptide_chain: str = PEPTIDE_CHAIN, threshold_nm: float = CLASH_NM) -> dict:
+    """All-atom steric report for the PACKED peptide: counts AND severity, not just a minimum.
+
+    The plan is explicit that a minimum distance is an additional diagnostic rather than the
+    packing metric, and it is right: one atom pair at 0.19 nm and forty at 0.19 nm give the
+    same minimum and are not the same structure. So this returns the count of violating pairs,
+    the summed overlap depth, the worst single overlap AND the minimum distance.
+
+    Bonded exclusions: intra-peptide pairs are only counted at sequence separation >= 2, since
+    residues i and i+1 share a peptide bond and are supposed to have atoms at bonding distance.
+    """
+    pep = peptide_residue_indices(pose, peptide_chain)
+    rec = [i for i in range(1, pose.total_residue() + 1) if i not in set(pep)]
+    thr = threshold_nm * 10.0
+    out = {
+        "clash_receptor_count": 0, "clash_receptor_overlap_ang": 0.0,
+        "clash_receptor_worst_ang": 0.0, "min_receptor_dist_ang": float("inf"),
+        "clash_self_count": 0, "clash_self_overlap_ang": 0.0,
+        "clash_self_worst_ang": 0.0, "min_self_dist_ang": float("inf"),
+        "n_peptide_heavy_atoms": 0,
+    }
+    if not pep:
+        return out
+    pp, plab = _heavy_coords(pose, pep)
+    out["n_peptide_heavy_atoms"] = int(len(pp))
+
+    if rec and len(pp):
+        rp, _ = _heavy_coords(pose, rec)
+        if len(rp):
+            d = np.linalg.norm(pp[:, None, :] - rp[None, :, :], axis=-1)
+            over = np.clip(thr - d, 0.0, None)
+            out["clash_receptor_count"] = int((over > 0).sum())
+            out["clash_receptor_overlap_ang"] = float(over.sum())
+            out["clash_receptor_worst_ang"] = float(over.max())
+            out["min_receptor_dist_ang"] = float(d.min())
+
+    if len(pp) > 1:
+        res_of = np.asarray([pep.index(r) for r, _ in plab])
+        d = np.linalg.norm(pp[:, None, :] - pp[None, :, :], axis=-1)
+        sep = np.abs(res_of[:, None] - res_of[None, :])
+        eligible = sep >= 2
+        if eligible.any():
+            over = np.clip(thr - d, 0.0, None) * eligible
+            out["clash_self_count"] = int(((over > 0) & eligible).sum() // 2)
+            out["clash_self_overlap_ang"] = float(over.sum() / 2.0)
+            out["clash_self_worst_ang"] = float(over.max())
+            masked = np.where(eligible, d, np.inf)
+            out["min_self_dist_ang"] = float(masked.min())
+    for k in ("min_receptor_dist_ang", "min_self_dist_ang"):
+        if not np.isfinite(out[k]):
+            out[k] = -1.0
+    return out
+
+
+def sequence_of(pose, peptide_chain: str = PEPTIDE_CHAIN) -> str:
+    """One-letter sequence of the peptide chain, for the exact-compliance gate."""
+    return "".join(pose.residue(i).name1() for i in peptide_residue_indices(pose, peptide_chain))
+
+
+def interface_energy(pose, peptide_chain: str = PEPTIDE_CHAIN) -> dict:
+    """`dG_separated` and the peptide's own score, WITHOUT relax. In-process, no PDB round trip.
+
+    NO RELAX, deliberately and at a cost. `InterfaceAnalyzerMover`'s `pack_separated` repacks
+    only the unbound reference, so the bound pose is scored as given -- and the plan forbids
+    backbone relaxation in the primary comparison, because relaxing would move the very
+    backbone being measured. The consequence is that `dG_separated` here includes whatever
+    `fa_rep` the generated backbone carries, so it is a BOUND-STATE SCORE and not a binding
+    free energy. It is used as a tie-break and reported as a number, never as a thermodynamic
+    claim -- which is also why the peptide-only score comes back beside it, so strain and
+    interface are separable rather than summed into one unreadable figure.
+    """
+    import pyrosetta
+    from pyrosetta.rosetta.protocols.analysis import InterfaceAnalyzerMover
+
+    pep = peptide_residue_indices(pose, peptide_chain)
+    rec_chains = sorted(
+        {pose.pdb_info().chain(i) for i in range(1, pose.total_residue() + 1)} - {peptide_chain}
+    )
+    out: dict[str, float] = {}
+    try:
+        mover = InterfaceAnalyzerMover(f"{peptide_chain}_{''.join(rec_chains)}")
+        mover.set_pack_separated(True)
+        mover.set_compute_packstat(False)
+        work = pose.clone()
+        mover.apply(work)
+        data = mover.get_all_data()
+        out["dG_separated"] = float(mover.get_separated_interface_energy())
+        out["dSASA_int_ang2"] = float(mover.get_interface_delta_sasa())
+        out["n_interface_residues"] = float(data.int_res_set.size()) if hasattr(data, "int_res_set") else float("nan")
+    except Exception as exc:  # a scorer failure must not be reported as a good score
+        out["dG_separated"] = float("nan")
+        out["dSASA_int_ang2"] = float("nan")
+        out["interface_error"] = f"{type(exc).__name__}: {exc}"
+
+    # PEPTIDE STRAIN, SEPARATELY. The plan asks for interface energy and peptide
+    # strain/geometry as separate numbers: a candidate with a good interface and a tortured
+    # peptide is not the same result as one with both good, and a single total hides which.
+    try:
+        import pyrosetta as _pr
+
+        sf = _pr.create_score_function("ref2015")
+        sub = _pr.rosetta.core.pose.Pose()
+        # `pdbslice` wants a vector1; building it by append is the portable form.
+        keep = _pr.rosetta.utility.vector1_unsigned_long()
+        for i in pep:
+            keep.append(i)
+        _pr.rosetta.core.pose.pdbslice(sub, pose, keep)
+        out["peptide_score"] = float(sf(sub))
+        out["peptide_score_per_res"] = float(sf(sub)) / max(len(pep), 1)
+    except Exception as exc:
+        out["peptide_score"] = float("nan")
+        out["peptide_score_per_res"] = float("nan")
+        out["peptide_score_error"] = f"{type(exc).__name__}: {exc}"
+    return out
+
+
+def score_packed(
+    packed,
+    source_contacts: set | None = None,
+    source_sequence: str | None = None,
+    peptide_chain: str = PEPTIDE_CHAIN,
+) -> dict:
+    """Every COMPLETED-LP measurement the comparison reports, for one packed candidate."""
+    met: dict[str, float | str | bool] = {}
+    met.update(clash_report(packed, peptide_chain))
+    met.update(interface_energy(packed, peptide_chain))
+
+    seq = sequence_of(packed, peptide_chain)
+    met["sequence"] = seq
+    met["n_residues"] = len(seq)
+    if source_sequence is not None:
+        # EXACT compliance, not a similarity: the arms copy the sequence and are not allowed
+        # to change it, so anything but equality is a failed candidate rather than a worse one.
+        met["sequence_exact"] = bool(seq == source_sequence)
+
+    if source_contacts is not None:
+        now = residue_contact_map(packed, peptide_chain, CONTACT_CUTOFF_NM)
+        kept = source_contacts & now
+        met["contacts_source"] = len(source_contacts)
+        met["contacts_kept"] = len(kept)
+        met["contacts_gained"] = len(now - source_contacts)
+        met["contact_retention"] = (
+            len(kept) / len(source_contacts) if source_contacts else float("nan")
+        )
+        tight_now = residue_contact_map(packed, peptide_chain, CONTACT_TIGHT_NM)
+        met["contacts_tight_now"] = len(tight_now)
+
+    try:
+        assert_linear_topology(packed, peptide_chain)
+        met["linear_topology"] = True
+    except RuntimeError as exc:
+        met["linear_topology"] = False
+        met["linear_topology_error"] = str(exc)
+    return met
+
+
+# -------------------------------------------------------------- the candidate driver
+
+
+def is_valid(met: dict, require_sequence: bool = True) -> tuple[bool, str]:
+    """The first key of `SELECTION_ORDER`: does this candidate pass the calibrated gates?
+
+    Returns `(valid, reason)` so a rejection carries its cause into the manifest. The gates
+    are the project's existing calibrated ones, NOT thresholds tuned per arm:
+
+      * linear chemistry -- no re-formed disulfide, no closing bond;
+      * exact source sequence -- the arms copy it and may not change it;
+      * sterics -- no heavy-atom pair inside 0.20 nm, the value that passes 59 of 60 native
+        crystals where the "obvious" 0.27 nm rejects 43 of them.
+
+    RAW BACKBONE VALIDITY IS NOT CHECKED HERE. It is a property of the generator, measured
+    before packing by `backbone.backbone_validity`, and the caller gates on it -- so that a
+    packing failure and a broken backbone stay distinguishable in the manifest instead of
+    collapsing into one "invalid".
+    """
+    if not met.get("linear_topology", False):
+        return False, "cyclic_topology"
+    if require_sequence and not met.get("sequence_exact", True):
+        return False, "sequence_mismatch"
+    if met.get("clash_receptor_count", 0) > 0:
+        return False, "receptor_clash"
+    if met.get("clash_self_count", 0) > 0:
+        return False, "self_clash"
+    return True, ""
+
+
+def select_representative(results: list[PackResult], require_sequence: bool = True) -> tuple[int, str]:
+    """Pick one of the N packing outcomes by the PREDECLARED order. `(index, basis)`.
+
+    The order is fixed in `SELECTION_ORDER` and was written before any arm ran:
+
+      1. valid linear chemistry / backbone / sterics;
+      2. then source-contact retention;
+      3. then interface energy, as a tie-break ONLY.
+
+    IF NONE IS VALID the best diagnostic candidate is still returned, with a basis saying so.
+    Silently dropping it would turn a measurable failure into a missing row, and a comparison
+    whose denominators differ per arm is not a comparison.
+    """
+    if not results:
+        return -1, "no_results"
+    ok = [r for r in results if r.ok]
+    if not ok:
+        return results[0].seed_index, "all_packing_failed"
+    valid = [r for r in ok if is_valid(r.metrics, require_sequence)[0]]
+    pool, basis = (valid, "valid") if valid else (ok, "no_valid_candidate")
+
+    def key(r: PackResult):
+        ret = r.metrics.get("contact_retention", float("nan"))
+        ret = -1.0 if ret != ret else float(ret)  # NaN sorts last
+        dg = r.metrics.get("dG_separated", float("nan"))
+        dg = float("inf") if dg != dg else float(dg)  # NaN sorts last; lower dG is better
+        return (-ret, dg)
+
+    return sorted(pool, key=key)[0].seed_index, basis
+
+
+def pack_candidate(
+    bb: torch.Tensor,
+    aatype: np.ndarray,
+    pep_mask: torch.Tensor,
+    target_atom37_ang: np.ndarray,
+    target_aatype: np.ndarray,
+    work_dir: str | Path,
+    tag: str,
+    source_pdb: str | None = None,
+    n_seeds: int = DEFAULT_PACK_SEEDS,
+    minimize: bool = True,
+    scorefxn=None,
+    keep_pdbs: bool = True,
+) -> dict:
+    """Build, strip, seed, repack and score ONE generated backbone. Returns a manifest row.
+
+    `bb` is a single example's `[n, 4, 3]` backbone in nm (the batch axis is the caller's).
+    All `n_seeds` outcomes are retained, failures included, and the representative is chosen
+    by `select_representative`.
+
+    `source_pdb`, when given, supplies both the source sidechain torsions to seed the packer
+    with and the source contact map to measure retention against -- so "did this keep the
+    binding mode" is answered against the actual source complex rather than against an
+    idealisation of it.
+    """
+    import pyrosetta
+
+    from proteinfoundation.evaluation.rosetta_energy import _ensure_pyrosetta_init
+
+    _ensure_pyrosetta_init()
+    work = Path(work_dir)
+    work.mkdir(parents=True, exist_ok=True)
+    if scorefxn is None:
+        scorefxn = pyrosetta.create_score_function("ref2015")
+
+    n = int(pep_mask.sum())
+    pep_ang, _ = _peptide_atom37_ang(bb[None], pep_mask[None])
+    pdb = str(work / f"{tag}__cand.pdb")
+    write_complex_pdb(pdb, pep_ang[0, :n], aatype[:n], target_atom37_ang, target_aatype)
+
+    row: dict = {"tag": tag, "candidate_pdb": pdb, "n_residues": n, "results": []}
+    try:
+        pose = pyrosetta.pose_from_pdb(pdb)
+        row["stripped"] = strip_cyclic_topology(pose)
+        add_terminal_chemistry(pose)
+        assert_linear_topology(pose)
+        src_contacts = None
+        src_seq = None
+        if source_pdb and os.path.exists(source_pdb):
+            src_pose = pyrosetta.pose_from_pdb(source_pdb)
+            src_contacts = residue_contact_map(src_pose)
+            src_seq = sequence_of(src_pose)
+            row["n_chi_seeded"] = transfer_source_chis(pose, extract_chis(source_pdb))
+            row["source_sequence"] = src_seq
+            row["contacts_source"] = len(src_contacts)
+    except Exception as exc:
+        row["setup_error"] = f"{type(exc).__name__}: {exc}"
+        row["selected_seed"] = -1
+        row["selection_basis"] = "setup_failed"
+        return row
+
+    import time
+
+    results: list[PackResult] = []
+    for s in range(n_seeds):
+        t0 = time.time()
+        try:
+            packed, diag = pack_one(pose, s, minimize=minimize, scorefxn=scorefxn)
+            met = score_packed(packed, src_contacts, src_seq)
+            met.update({k: float(v) for k, v in diag.items()})
+            met["pack_seconds"] = time.time() - t0
+            valid, why = is_valid(met, require_sequence=src_seq is not None)
+            met["valid"] = valid
+            met["invalid_reason"] = why
+            out_pdb = None
+            if keep_pdbs:
+                out_pdb = str(work / f"{tag}__pack{s}.pdb")
+                packed.dump_pdb(out_pdb)
+            results.append(PackResult(s, True, None, out_pdb, met))
+        except Exception as exc:
+            results.append(
+                PackResult(s, False, f"{type(exc).__name__}: {exc}", None,
+                           {"pack_seconds": time.time() - t0})
+            )
+
+    row["results"] = [
+        {"seed": r.seed_index, "ok": r.ok, "failure": r.failure, "pdb": r.pdb_path, **r.metrics}
+        for r in results
+    ]
+    sel, basis = select_representative(results, require_sequence=src_seq is not None)
+    row["selected_seed"] = sel
+    row["selection_basis"] = basis
+    row["n_packed_ok"] = sum(1 for r in results if r.ok)
+    row["n_valid"] = sum(1 for r in results if r.ok and r.metrics.get("valid", False))
+    return row

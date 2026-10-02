@@ -24,6 +24,10 @@
 #                    norms, the real-LP anchor, and a full training_step
 #   arms        GPU  BOTH PILOTS as siblings, so they queue concurrently
 #   <arm name>  GPU  one pilot: bb_cartesian | bb_torsion
+#   panel       CPU  the FIXED 24-source / 4-paired-seed evaluation panel, built once
+#   evaluate    GPU+CPU  per arm: generate the panel -> pack it all-atom; then one report
+#                    over both arms. Set EVAL_CKPT_TAG to pick the milestone.
+#   report      CPU  re-render the tables and the figure from rows already on disk
 #   pilot            calibrate -> pack-smoke -> smoke -> arms, with dependencies wired
 #
 # Usage:
@@ -128,6 +132,28 @@ case "$STAGE" in
   bb_cartesian|bb_torsion)
     echo "$STAGE: $(submit scripts/cp2lp_train.sbatch "ARM=${STAGE}")" ;;
 
+  panel)
+    echo "panel: $(submit scripts/cp2lp_bb_panel.sbatch)" ;;
+
+  evaluate)
+    # One GPU dump per arm, then ONE CPU packing job per arm, then ONE report over both.
+    # The report is a sibling of nothing -- it needs every arm's packed rows, so it waits on
+    # all of them.
+    echo "evaluate at EVAL_CKPT_TAG=${EVAL_CKPT_TAG:-last-EMA}:"
+    declare -a packs=()
+    for arm in "${ARMS[@]}"; do
+      g="$(submit scripts/cp2lp_bb_eval_gpu.sbatch "ARM=${arm}")"
+      k="$(submit scripts/cp2lp_bb_pack_eval.sbatch --dep "$g" "ARM=${arm}")"
+      packs+=("$k")
+      printf '  %-14s gpu=%s pack=%s\n' "$arm" "$g" "$k"
+    done
+    dep=()
+    for k in "${packs[@]}"; do dep+=(--dep "$k"); done
+    echo "  report        $(submit scripts/cp2lp_bb_report.sbatch "${dep[@]}")" ;;
+
+  report)
+    echo "report: $(submit scripts/cp2lp_bb_report.sbatch)" ;;
+
   pilot)
     # The CPU stages first and as SIBLINGS of each other: the calibration and the packing
     # smoke read different things and neither needs the other.
@@ -145,6 +171,7 @@ case "$STAGE" in
 
   *)
     echo "unknown stage: $STAGE" >&2
-    echo "stages: calibrate | pack-smoke | smoke | arms | ${ARMS[*]} | pilot" >&2
+    echo "stages: calibrate | pack-smoke | smoke | arms | ${ARMS[*]} | panel |" >&2
+    echo "        evaluate | report | pilot" >&2
     exit 2 ;;
 esac
