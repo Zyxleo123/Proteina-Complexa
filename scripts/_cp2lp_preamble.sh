@@ -254,7 +254,20 @@ _cp2lp_preflight_resume_seed() {
     echo "       Seed it: bash scripts/pin_cp2lp_resume.sh ${RESUME_SEED_SRC} ${RUN_NAME}" >&2
     return 1
   fi
+  # train.py REFUSES to resume from a last.ckpt with no wandb run id, so that a resume
+  # cannot silently fork another run's history. Job 71121 hit that after the preamble had
+  # passed and a GPU had been allocated; checking here fails in the first second instead.
+  local wid="${STORE}/${RUN_NAME}/checkpoints/wandb_run_id.txt"
+  if [[ ! -f "${wid}" ]]; then
+    echo "ERROR: ${ARM} resumes from a seeded last.ckpt but has no wandb run id:" >&2
+    echo "       ${wid}" >&2
+    echo "       train.py will refuse to resume without it. Write one (the pin script does" >&2
+    echo "       this automatically now):" >&2
+    echo "         bash scripts/pin_cp2lp_resume.sh ${RESUME_SEED_SRC} ${RUN_NAME}" >&2
+    return 1
+  fi
   echo "[preflight] resume seed: ${seed}"
+  echo "[preflight] wandb id   : $(cat "${wid}")"
   # Provenance, so the log of THIS run records which state it forked from and at what md5 --
   # the only durable evidence that it and its control started from the same weights.
   if [[ -f "${STORE}/${RUN_NAME}/checkpoints/resume.source" ]]; then

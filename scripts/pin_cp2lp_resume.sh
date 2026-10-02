@@ -30,10 +30,20 @@
 # run resumes, so this must be run while that run is NOT running. The copy is guarded: if
 # the file changes underneath it the copy is discarded and the script fails loudly.
 #
-# WANDB. `wandb_run_id.txt` is deliberately NOT copied. It lives beside the checkpoints and
-# is how a resumed run re-attaches to its existing wandb run -- copying it would make the
-# new arm log into the CONTROL's wandb history, interleaving two different experiments in
-# one set of curves.
+# WANDB. `wandb_run_id.txt` is deliberately NOT copied -- it is how a resumed run
+# re-attaches to its existing wandb run, and copying it would make the new arm log into the
+# CONTROL's wandb history, interleaving two experiments in one set of curves.
+#
+# But NOT copying it is not sufficient either: train.py REFUSES to resume from a `last.ckpt`
+# with no run id, precisely so that a resume cannot silently fork a run's history. MEASURED
+# -- job 71121 died on exactly this, after the preamble and with the fork verified:
+#   RuntimeError: Resuming training from last.ckpt but no WandB run id found for
+#   'cp2lp_onepass_internal_clashnorm'
+# So a FRESH id is written here instead. `log.wandb_force_new_run=true` would also work on
+# the first launch, but these arms carry --requeue and that flag re-enters the new-run branch
+# on every restart, scattering one arm's curves across several wandb runs. A persisted id is
+# requeue-safe: the normal resume path finds it, first launch and restart alike. Format and
+# suffix width match train.py's own `f"{run_name}-{uuid4().hex[:8]}"`.
 #
 # Usage:
 #   bash scripts/pin_cp2lp_resume.sh <src_run> <dst_run>
@@ -61,10 +71,31 @@ DST_DIR="${STORE}/${DST_RUN}/checkpoints"
 # thousand updates would be an average over a window the control averaged differently.
 FILES=(last.ckpt last-EMA.ckpt)
 
+# Defined before the early exit below, and called on BOTH paths: an already-seeded directory
+# that is missing its run id is exactly the state job 71121 died in, and the repair has to be
+# reachable without re-copying 3 GB (or passing FORCE=1, which would discard real progress).
+ensure_wandb_id() {
+  local f="${DST_DIR}/wandb_run_id.txt"
+  if [[ -f "$f" ]]; then
+    echo "[pin] keeping existing wandb run id: $(cat "$f")"
+    return 0
+  fi
+  local suffix
+  suffix="$(
+    "${PY:-/zfsauton2/home/yixiz/Proteina-Complexa/.venv/bin/python}" -c \
+      'import uuid; print(uuid.uuid4().hex[:8])' 2>/dev/null \
+      || od -An -tx1 -N4 /dev/urandom | tr -d ' \n'
+  )"
+  mkdir -p "$DST_DIR"
+  echo "${DST_RUN}-${suffix}" > "$f"
+  echo "[pin] wrote a FRESH wandb run id: $(cat "$f")"
+}
+
 if [[ -f "${DST_DIR}/last.ckpt" && "${FORCE:-0}" != "1" ]]; then
-  echo "[pin] ${DST_DIR}/last.ckpt already exists -- refusing to overwrite."
+  echo "[pin] ${DST_DIR}/last.ckpt already exists -- not re-copying."
+  ensure_wandb_id
   [[ -f "${DST_DIR}/resume.source" ]] && sed 's/^/[pin]   /' "${DST_DIR}/resume.source"
-  echo "[pin] FORCE=1 overrides. Re-seeding after the arm has started DISCARDS its progress."
+  echo "[pin] FORCE=1 re-copies the checkpoints. After the arm has started that DISCARDS its progress."
   exit 0
 fi
 
@@ -95,9 +126,13 @@ for f in "${FILES[@]}"; do
   mv "${DST_DIR}/${f}.tmp" "${DST_DIR}/${f}"
 done
 
+ensure_wandb_id
+WANDB_ID_FILE="${DST_DIR}/wandb_run_id.txt"
+
 {
   echo "seeded_from=${SRC_DIR}"
   date -u +"pinned_utc=%Y-%m-%dT%H:%M:%SZ"
+  echo "wandb_run_id=$(cat "${WANDB_ID_FILE}")"
   for f in "${FILES[@]}"; do
     echo "${f}_size=$(stat -c '%s' "${DST_DIR}/${f}")"
     echo "${f}_md5=$(md5sum "${DST_DIR}/${f}" | cut -d' ' -f1)"
