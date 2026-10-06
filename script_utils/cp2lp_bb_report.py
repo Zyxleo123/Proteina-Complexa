@@ -44,6 +44,20 @@ import numpy as np
 #: beside one from the SDEdit/de-novo tables without re-binning.
 GAP_BINS = [(0.0, 0.45), (0.45, 0.8), (0.8, 1.2), (1.2, 2.0), (2.0, math.inf)]
 
+#: Terminal gap of REAL bound linear peptides, nm, as percentiles. MEASURED on the 536
+#: peptides of `store/cp2lp_triplets/real_reference` -- the same held-out receptor families,
+#: through the same AE round trip and the same scoring code the generated peptides go
+#: through, so this is a comparison and not a literature number.
+#:
+#: WHY IT IS HERE. Without it the only openness yardstick in this report was the 0.45 nm
+#: `min_open_gap_nm` threshold, and that threshold is the 1.1st PERCENTILE of this
+#: distribution -- it was calibrated as a floor for "not still a ring", never as a target for
+#: "realistic LP". The torsion arm cleared it with `terminal_open_frac` = 1.000 while sitting
+#: at 0.478 nm, i.e. below the 1.3rd percentile of real. A report that only checked the
+#: threshold called that fully open. The median is the number a release arm has to move
+#: toward; the p95 is where to start suspecting the peptide has left the pocket instead.
+REAL_LP_GAP_PCTL_NM = {5: 0.858, 25: 1.575, 50: 2.138, 75: 2.300, 95: 3.324}
+
 #: Edit-size bins, nm of CA RMSD from the source. The lowest bin exists specifically to make a
 #: near-identity visible rather than averaged away: 0.05 nm is the 0.5 A scale the previous
 #: generation's export gate was measured to select for.
@@ -103,19 +117,53 @@ def joint_success(row: dict, sel: dict | None, min_gap_nm: float) -> tuple[bool,
       exact source sequence
       acceptable completed-structure sterics
       interface preservation -- the source's contacts largely survived
+
+    EVERY CONDITION MUST BE MEASURABLE. Two of the five used to default to "pass" when their
+    field was absent -- `sequence_exact` through `.get(..., True)`, and `contact_retention`
+    through a NaN that made `ret == ret` false and skipped the comparison. Neither field was
+    ever produced, because nothing passes `source_contacts`/`source_sequence` into
+    `score_packed`, so the 2026-10-04 release evaluation reported "25% joint success" against
+    three live gates while describing five. A missing gate now RAISES: an unmeasured condition
+    is not a satisfied one, and the failure has to be louder than the number it would inflate.
     """
     if sel is None:
         return False, "packing_failed"
-    if float(row.get("terminal_gap_nm", 0.0)) < min_gap_nm:
+    missing = [
+        name
+        for name, present in (
+            ("terminal_gap_nm", "terminal_gap_nm" in row),
+            ("bb_chain_intact", "bb_chain_intact" in row),
+            ("clash_receptor_count", "clash_receptor_count" in sel),
+            ("sequence_exact", "sequence_exact" in sel),
+            ("contact_retention", "contact_retention" in sel),
+        )
+        if not present
+    ]
+    if missing:
+        raise KeyError(
+            f"joint_success is missing {missing} -- these gates cannot be evaluated, so the "
+            "result would silently count them as passes. `sequence_exact` and "
+            "`contact_retention` come from `score_packed(packed, source_contacts, "
+            "source_sequence)`, which needs the pack stage to be given --source-pdb-root "
+            "(a directory of <example_id>.pdb source complexes). Re-run the pack stage with "
+            "it rather than reporting a joint rate over a subset of the criteria."
+        )
+    if float(row["terminal_gap_nm"]) < min_gap_nm:
         return False, "not_open"
-    if float(row.get("bb_chain_intact", 0.0)) < 1.0:
+    if float(row["bb_chain_intact"]) < 1.0:
         return False, "raw_backbone_broken"
-    if not sel.get("sequence_exact", True):
+    if not sel["sequence_exact"]:
         return False, "sequence_mismatch"
-    if int(sel.get("clash_receptor_count", 0)) > 0 or int(sel.get("clash_self_count", 0)) > 0:
+    if int(sel["clash_receptor_count"]) > 0 or int(sel.get("clash_self_count", 0)) > 0:
         return False, "clash"
-    ret = sel.get("contact_retention", float("nan"))
-    if ret == ret and float(ret) < 0.5:
+    ret = float(sel["contact_retention"])
+    if ret != ret:
+        raise ValueError(
+            "contact_retention is NaN -- the source had no contacts to retain, which means "
+            "the source complex was supplied but is not a bound complex. Refusing to score it "
+            "as a pass; investigate the source PDB for this attempt."
+        )
+    if ret < 0.5:
         return False, "contacts_lost"
     return True, ""
 
@@ -232,6 +280,14 @@ def main() -> int:  # noqa: C901
         print(f"\n=== {label} ===")
         print("A headline claim is only made where BOTH binnings agree -- a pooled gain can "
               "always be explained by one arm editing less.")
+        if key == "terminal_gap_nm":
+            # The real distribution, so "open" is read against real peptides and not against
+            # the 0.45 nm floor. See REAL_LP_GAP_PCTL_NM.
+            pct = "  ".join(f"p{p}={v:.2f}" for p, v in sorted(REAL_LP_GAP_PCTL_NM.items()))
+            real_bin = _bin(REAL_LP_GAP_PCTL_NM[50], bins)
+            print(f"REAL bound LPs (n=536, same AE + same scoring): {pct}")
+            print(f"  -> a realistic peptide lands in bin {real_bin}; the first two bins are "
+                  f"below the 2nd percentile of real openness.")
         names = sorted(by_arm)
         bin_labels = [f"[{lo:g},{hi:g})" if hi != math.inf else f">={lo:g}" for lo, hi in bins]
         print(f"{'bin':<14s}" + "".join(f"{n[:14]:>18s}" for n in names))

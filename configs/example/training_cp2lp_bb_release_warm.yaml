@@ -1,0 +1,84 @@
+# @package _global_
+# RELEASE ARM, WARM. Preservation off, starting from the TRAINED torsion generator.
+#
+# This is the arm that tests the plan's hypothesis as stated -- "the generator has learned
+# conservative edits and STRUGGLES TO ESCAPE THEM while several objectives pull it back". An
+# escape is a claim about a particular converged solution, so the run has to start from that
+# solution and not from a fresh one.
+#
+# `pretrain_ckpt_path` loads WEIGHTS ONLY: `train.py` takes this branch when there is no
+# `last.ckpt`, loads no optimizer state, and the step counter restarts at zero. So the arm
+# keeps the trained generator and discriminator and gets a fresh optimizer and a fresh
+# budget, which is what a warm start should mean.
+#
+# THE RAW CHECKPOINT, NOT THE EMA SIDECAR. The EMA copy is the evaluation weights; resuming
+# optimisation from an averaged shadow would start training from a point no optimizer step
+# ever stood on.
+#
+# WHY A `_cold` SIBLING EXISTS. If this arm does not move, "it cannot escape the basin" and
+# "the objective never wanted it to move" are indistinguishable from one run. The cold arm
+# shares this arm's objective exactly and differs only in where it starts, so the pair
+# separates the two. They queue concurrently, so the pair costs no extra wall-clock.
+#
+# THE DEFECT THIS ARM FORCED, AND WHY THE FIX IS A FLAG AND NOT A BETTER DEFAULT.
+#
+# `train.py` calls `init_editor_noise_adapter()` on EVERY `pretrain_ckpt_path` load, warm
+# starts included, and the draw inside `init_noise_adapter_` was unconditional -- so warm
+# starting here would have overwritten the noise-adapter input columns the torsion arm
+# LEARNED (it reads its noise: `seed_diversity_nm` was 0.241) with a fresh N(0, 0.02) draw,
+# while this file claimed to keep the current generator.
+#
+# The obvious fix -- "only draw when the columns are zero" -- is WRONG HERE, and measuring it
+# is what caught that. The `cp2lp_onepass_fork` checkpoint that every `bb_*` arm starts from
+# ALREADY carries trained noise columns (rms 1.980e-02), and every existing arm re-drew them:
+# jobs 70458 and 71251 both logged `initialised at columns [315, 331) with std=0.02`. So that
+# version of the fix would have silently changed the initialisation of the cold arm AND of the
+# finished torsion arm's successors -- a confound introduced by a bug fix, in exactly the
+# comparison this tranche rests on. `cp2lp.onepass.preserve_loaded_noise_adapter` therefore
+# defaults to FALSE (historical), and only this arm sets it.
+#
+# CHECK THE LOG. This arm must print `LEFT AS LOADED`. The cold arm must print `OVERWRITING
+# trained columns`, which is what the torsion control did. Either line in the wrong job means
+# the pair is not the experiment described here.
+
+defaults:
+  - /example/training_cp2lp_bb_release
+  - _self_
+
+run_name: cp2lp_bb_release_warm
+
+pretrain_ckpt_path: /zfsauton/scratch/yixiz/Proteina-Complexa/training_runs/store/cp2lp_bb_torsion/checkpoints/g010300.ckpt
+
+cp2lp:
+  # THE BUDGET IS CUMULATIVE, AND THIS ARM INHERITS 10300 OF IT. Measured the hard way: the
+  # first launch (job 72084) stopped after ONE step with "reached the budget of 10300
+  # generator updates (global_step=1)".
+  #
+  # WHY. `g_updates` is a `register_buffer(..., persistent=True)` in `module.py`, so it
+  # travels in the state_dict. `pretrain_ckpt_path` is "weights only" with respect to the
+  # OPTIMIZER -- `train.py` skips the optimizer states and the trainer's `global_step`
+  # restarts at zero -- but a persistent buffer is a weight as far as `load_state_dict` is
+  # concerned, so the counter came back at 10300 and `max_g_updates` tripped immediately.
+  # It exited 0, which is the "a job that did no work releases its dependents" trap.
+  #
+  # THE ARITHMETIC, so this arm does the SAME NUMBER OF UPDATES as its control:
+  #
+  #     fork carries         250   (printed as `[preflight] g_updates_in_fork=250`, from the
+  #                                `${INIT_CKPT}.source` sidecar `pin_cp2lp_fork.sh` writes)
+  #     cold/torsion budget  10300 -> they each perform 10300 - 250  = 10050 updates
+  #     this arm carries     10300 (its milestone was written at exactly that count)
+  #     so this arm's budget 20350 -> it performs      20350 - 10300 = 10050 updates
+  #
+  # 20350 and not 20600: matching the control's ACTUAL update count is what makes the arms
+  # comparable, and the control never did a round 10300 of them either.
+  max_g_updates: 20350
+  # Must move with the budget or no milestone is ever written -- it is matched by equality
+  # (`if n not in self.eval_ckpt_g_updates`), not by threshold.
+  eval_checkpoint_g_updates: [20350]
+
+  onepass:
+    # THE ONLY PLACE IN THE REPO THIS IS TRUE. Keeps the trained generator's noise-adapter
+    # columns instead of re-drawing them, which is what makes this a warm start rather than a
+    # partially re-randomised one. Note this is a THIRD difference from the cold arm, on the
+    # init side -- the axis that comparison is already about.
+    preserve_loaded_noise_adapter: true

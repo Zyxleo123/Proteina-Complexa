@@ -39,8 +39,11 @@ from hydra import compose, initialize_config_dir
 from loguru import logger
 from omegaconf import OmegaConf
 
-#: Reported as an arm in the manifest, generated like one, trained like nothing.
-SOURCE_TORSION_ARM = "source_torsion"
+#: Reported as an arm in the manifest, generated like one, trained like nothing. Suffixed onto
+#: the RUN's arm label rather than used bare: a bare `source_torsion` is identical across any
+#: two runs, so it collides in exactly the same way the representation name does -- same
+#: overwritten attempts file, same resume tags treated as already packed. See `arm` in main().
+SOURCE_ARM_SUFFIX = "__source"
 
 
 def parse_args() -> argparse.Namespace:
@@ -49,6 +52,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--ckpt", required=True, help="checkpoint to evaluate")
     p.add_argument("--ckpt-tag", required=True, help="label for this milestone, e.g. g005300-EMA")
     p.add_argument("--manifest", required=True, help="panel parquet from cp2lp_eval_manifest.py")
+    p.add_argument("--arm-label", default=None,
+                   help="grouping label for this run (attempts filename, pack resume tag, "
+                        "report by-arm key). Defaults to run_name, which is unique per run; "
+                        "the representation name is NOT, and two runs sharing it collide.")
     p.add_argument("--out-dir", required=True)
     p.add_argument("--seeds", default="0,1,2,3", help="PAIRED across arms; 4 attempts per source")
     p.add_argument("--batch", type=int, default=4)
@@ -73,7 +80,20 @@ def main() -> int:  # noqa: C901
         logger.error(f"this evaluator is for cp2lp.mode=backbone, got {cfg.cp2lp.mode!r}")
         return 1
 
-    arm = str(cfg.cp2lp.backbone.arm)
+    # THE ARM LABEL MUST BE UNIQUE PER RUN, not per representation. It is the grouping key in
+    # three places at once: the attempts FILENAME, the pack stage's resume `tag`, and the
+    # report's `by_arm` grouping. `cfg.cp2lp.backbone.arm` is the REPRESENTATION ("torsion"),
+    # which is unique across the cartesian-vs-torsion comparison but identical across any two
+    # runs that share a representation.
+    #
+    # MEASURED COST, 2026-10-04: the two preservation-release arms are both `torsion`, so the
+    # warm arm's eval overwrote `attempts__torsion__release_end.jsonl`, and its pack job then
+    # found every `tag` already present and logged "128 attempts already packed; skipping
+    # those" -> a 0-byte packed file. The warm arm's entire evaluation was lost and the report
+    # still printed a confident table, because nothing anywhere compares the label to the run.
+    #
+    # `--arm-label` overrides; the default is the run_name, which IS unique per run.
+    arm = str(args.arm_label or cfg.get("run_name", None) or cfg.cp2lp.backbone.arm)
     seeds = [int(s) for s in str(args.seeds).split(",") if s.strip()]
     out = Path(args.out_dir)
     (out / "dumps").mkdir(parents=True, exist_ok=True)
@@ -82,7 +102,37 @@ def main() -> int:  # noqa: C901
     cfg.dataset.unified.datamodule.val_metadata_file = args.manifest
     # The panel is the WHOLE dataset for this job, and every row must be used exactly once.
     cfg.dataset.unified.datamodule.source_fractions = None
-    cfg.dataset.unified.datamodule.batch_size = int(args.batch)
+
+    # THE TRAIN DATALOADER SETS `drop_last=True` (structure_data.py), which is right for
+    # training and silently destructive here: it discards the final partial batch, i.e. part
+    # of the evaluation panel. MEASURED on the 2026-10-04 release evaluation -- a 24-source
+    # panel at batch 16 produced ONE batch and dropped the remaining 8 sources, and the report
+    # said `n_sources: 16` with nothing flagging the loss.
+    #
+    # Rather than turn `drop_last` off in shared training code, step the batch size down to
+    # the largest divisor of the panel size, so there IS no partial batch. The coverage
+    # assertion after the loop is the real guarantee; this just makes the common case work.
+    import pandas as _pd
+
+    n_manifest = int(len(_pd.read_parquet(args.manifest)))
+    eff_batch = min(int(args.batch), max(n_manifest, 1))
+    while eff_batch > 1 and n_manifest % eff_batch != 0:
+        eff_batch -= 1
+    if eff_batch != int(args.batch):
+        logger.info(
+            f"batch {args.batch} -> {eff_batch}: the panel has {n_manifest} rows and the train "
+            f"dataloader drops the last partial batch, so the batch must divide the panel."
+        )
+    # BOTH KEYS, and that is the whole point. `train._resolve_datamodule_config` merges with
+    # `OmegaConf.merge(unified_cfg, override_cfg)`, so `dataset.datamodule` WINS over
+    # `dataset.unified.datamodule`. Setting only the unified one is inert: the first attempt at
+    # this fix set `unified` to 4 and the job still ran a single batch of 16 and lost 8 sources
+    # exactly as before. The surrounding code already sets `num_workers` on both nodes, so the
+    # duality was known for that key and missed for this one.
+    cfg.dataset.unified.datamodule.batch_size = eff_batch
+    if cfg.dataset.get("datamodule") is not None:
+        cfg.dataset.datamodule.batch_size = eff_batch
+    args.batch = eff_batch
     cfg.dataset.datamodule.num_workers = 2
     cfg.dataset.unified.datamodule.num_workers = 2
     if cfg.get("val_generation") is not None:
@@ -122,6 +172,7 @@ def main() -> int:  # noqa: C901
 
     rows: list[dict] = []
     n_attempts = 0
+    n_seen = 0  # sources consumed so far, for the globally-unique id fallback
     t_start = time.time()
     per_source_ca: dict[str, list[torch.Tensor]] = {}
 
@@ -136,7 +187,30 @@ def main() -> int:  # noqa: C901
             if not cyclic.any():
                 continue
             cp = slice_batch(batch, cyclic, batch["mask"].shape[0])
-            ids = list(cp.get("example_id", [f"row{i}" for i in range(cp["mask"].shape[0])]))
+            # REAL provenance, or a GLOBALLY unique fallback. The old fallback numbered rows
+            # from 0 WITHIN EACH BATCH, so with more than one batch two different sources both
+            # answered to `row0` -- and `row<i>` carries no link back to the panel at all,
+            # which is what made the source contact map (hence `contact_retention`) impossible
+            # to supply. `example_id` now survives collation; if it ever stops doing so, the
+            # fallback is at least unique and the assertion after the loop still catches the
+            # provenance loss instead of reporting `row0..rowN` as though it were data.
+            # `id` FIRST, because that is the attribute that exists. `atomarray_to_atom37`
+            # builds the sample as `Data(..., id=sample_id, ...)` and `__getitem__` skips
+            # `id_column` when propagating metadata, so in simple mode there IS no
+            # `example_id` attribute -- reading only that name could never have worked, and
+            # the positional fallback hid it. `example_id` is still checked for the
+            # pipeline-mode path, which uses that name.
+            src_ids = cp.get("example_id") or cp.get("id")
+            if src_ids is not None:
+                ids = [str(x) for x in src_ids]
+            else:
+                logger.warning(
+                    "example_id is absent from the collated batch -- falling back to positional "
+                    "ids, which cannot be matched to a source complex. Source contacts and the "
+                    "sequence gate will be UNAVAILABLE for this run."
+                )
+                ids = [f"row{n_seen + i}" for i in range(cp["mask"].shape[0])]
+            n_seen += int(cp["mask"].shape[0])
 
             for seed in seeds:
                 bs, n = cp["mask"].shape
@@ -158,7 +232,7 @@ def main() -> int:  # noqa: C901
                         gen_batch.get("residue_type", None),
                         length_source=str(cfg.cp2lp.backbone.length_source),
                     )
-                    variants[SOURCE_TORSION_ARM] = torsions_to_backbone(
+                    variants[arm + SOURCE_ARM_SUFFIX] = torsions_to_backbone(
                         internal["phi"], internal["psi"], internal["omega"],
                         internal["root"], mask, geom,
                     )
@@ -210,6 +284,30 @@ def main() -> int:  # noqa: C901
                         )
                         n_attempts += 1
             logger.info(f"  {n_attempts} attempts so far")
+
+    # PANEL COVERAGE, asserted. The whole comparison is per-source, so a partially consumed
+    # panel does not make the numbers noisier -- it makes them numbers about a different,
+    # silently chosen subset. This fires NON-ZERO on purpose, unlike the "milestone not
+    # reached" gates in the sbatch wrappers: those distinguish "upstream never ran" and
+    # rightly exit 0, whereas this job HAS run and produced output that would be reported as
+    # though it covered the panel. A stalled chain is recoverable; a confident wrong number
+    # in a report is not.
+    n_sources_seen = len({r["example_id"] for r in rows})
+    if n_sources_seen != n_manifest:
+        raise SystemExit(
+            f"PANEL COVERAGE FAILURE: {n_sources_seen} of {n_manifest} panel sources produced "
+            f"attempts (requested batch={args.batch}). Check, in this order:\n"
+            f"  1. THE EFFECTIVE BATCH SIZE, which may not be the one set here. "
+            f"`train._resolve_datamodule_config` merges `dataset.unified.datamodule` UNDER "
+            f"`dataset.datamodule`, so the latter wins -- setting only the unified key is "
+            f"inert. Read the 'Data config' line in this log and confirm both say "
+            f"{args.batch}.\n"
+            f"  2. drop_last=True in the train dataloader, which discards any partial final "
+            f"batch; the batch size must divide {n_manifest}.\n"
+            f"  3. the cropping transform's length filters -- compare the panel's "
+            f"peptide_length against binder_min_length/binder_max_length.\n"
+            "Refusing to write a summary that would be read as covering the whole panel."
+        )
 
     # WITHIN-SOURCE DIVERSITY, over the paired seeds of one source. A one-pass editor with a
     # dead noise path produces the same LP every time, and that is invisible in any per-

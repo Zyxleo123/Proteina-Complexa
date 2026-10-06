@@ -1637,6 +1637,138 @@ geometry worse than its input"*, not *"the output is ideal"* — so the smoke no
 0.5000 for one arm and 1.0000 for the other at identical zero edit, entirely because the two
 processes drew different batches. The dataloader is now seeded.
 
+## The preservation-release arms: realistic opening and a usable interface do not yet coexist
+
+The torsion arm converged to a **near-identity edit**: `preserve_ca_rmsd_nm` 0.053, i.e. 0.53 Å
+of CA RMSD, with a terminal gap of 0.478 nm. The question was whether the objective was holding
+it there, and the arm already carried the instrument to answer it — `cp2lp.backbone.
+grad_probe_every_n_steps` logs *weighted* per-term gradient norms at the head, one backward per
+term. At the last probe of `cp2lp_bb_torsion` (g=10300):
+
+| term | grad norm at the head |
+|---|---|
+| `preserve` | **3.541** |
+| `open` | 1.0e-10 (the float floor) |
+| `steric` | 1.0e-10 (the float floor) |
+
+Preservation was not one of several pulls — it was essentially the entire non-adversarial
+gradient, with the other two terms sitting on their flat bottoms contributing nothing. So the
+"conservative edit" was a property of the objective, not of the network, and that is a claim a
+config change can test.
+
+**Two arms, because one cannot separate the two explanations.** Both are the torsion arm with
+`cp2lp.losses.preserve_weight: 0.0` and nothing else changed:
+
+| arm | init | question |
+|---|---|---|
+| `bb_release_cold` | the pinned fork | would it *learn* the transformation unleashed? |
+| `bb_release_warm` | the trained torsion g=10300 | can that converged solution *escape*? |
+
+Cold-vs-torsion differs in exactly two composed keys (`run_name`, `preserve_weight`), so it is
+single-variable in the loss; warm-vs-cold differs in exactly two (`run_name`,
+`pretrain_ckpt_path`), so it is single-variable in the init. If the warm arm stayed conservative,
+"cannot escape the basin" and "the objective never asked for movement" would be
+indistinguishable from one run.
+
+### The reference that makes "realistic" a number
+
+`terminal_opening_reward` is a flat-bottom hinge at `MIN_OPEN_TERMINAL_GAP_NM = 0.45`, and its
+docstring deliberately declines to name a target, delegating the real distribution to the
+adversary. That threshold was calibrated as a floor for *"not still a ring"*. Measured against
+the 536 real bound LPs of `store/cp2lp_triplets/real_reference` — same AE round trip, same
+scoring code the generated peptides go through, so this is a comparison and not a literature
+number:
+
+| terminal gap, nm | p5 | p25 | **p50** | p75 | p95 |
+|---|---|---|---|---|---|
+| real bound LPs | 0.858 | 1.575 | **2.138** | 2.300 | 3.324 |
+
+0.45 nm is the **1.1st percentile** of that distribution, and the torsion arm's 0.478 nm is below
+the 1.3rd — while `terminal_open_frac` read 1.000. **Never read openness against the threshold;
+read it against these percentiles.** They live in `cp2lp_bb_report.REAL_LP_GAP_PCTL_NM`, guarded
+by a test that recomputes them from the rows so the constant cannot drift from its source.
+
+### Both arms moved, and the gap reached the real range
+
+Releasing preservation grew the edit ~16x and moved the opening into the real interquartile
+range, with backbone validity intact:
+
+| | torsion control | cold @ g=2563 | warm @ +240 updates |
+|---|---|---|---|
+| edit (CA RMSD, nm) | 0.053 | 0.83 | 1.81 |
+| terminal gap (nm) | 0.478 | 1.71 | 2.72 |
+| `chain_intact` | 0.882 | 0.878 | 0.879 |
+| `d_acc` | ~1.000 | 0.866 | 0.862 |
+
+The warm arm left the converged solution within ~200 updates, so **the conservative edit was held
+by the objective and not by the optimisation landscape** — the result does not depend on the
+init. `loss_bb_anchor` fell in both (0.79 → 0.64), `loss_bb_steric` stayed small, and
+`d_shortcut_probe_acc` stayed at chance (0.50–0.54), so the adversarial signal was reading
+peptides rather than the CPSea-vs-PepBench receptor difference. `steric_min_inter_nm` held at
+0.18–0.29 nm throughout: the peptides stayed bound, so the `far = 3.0` nm saturation in the
+discriminator's interface block never came into play.
+
+One prediction recorded here because it was **wrong**: `d_acc` is redundant in the terminal-gap
+column (holding gap+Rg is exactly null, 0.9817 → 0.9817), from which this document previously
+reasoned that D could not supply an opening target. It does. Sufficiency (the gap alone reaches
+0.964) was the operative property, not necessity — a null blind-out test shows redundancy, not
+disuse.
+
+### The all-atom verdict, and why it is not the headline the training metrics suggested
+
+`release_end_v2`, 24/24 panel sources, 384 packed attempts, all five `joint_success` gates live:
+
+| | cold | warm |
+|---|---|---|
+| joint success | **4/96 = 4.2%** | **9/96 = 9.4%** |
+| valid candidates | 25/96 | 37/96 |
+| `contact_retention` median | 0.489 | 0.526 |
+| retention p75 / max | 0.673 / 0.859 | 0.609 / 0.803 |
+| retention ≥ 0.5 | 46.9% | 56.2% |
+| retention ≥ 0.9 | **0.0%** | **0.0%** |
+| failures | clash 67, contacts_lost 13, bb_broken 12 | clash 51, bb_broken 20, contacts_lost 16 |
+
+Both `*__source` baselines score 0/96, every one `not_open` — the source is a closed ring, which
+is the sanity check that the baseline is wired to the right structures.
+
+**Roughly half the source interface survives a typical attempt, and no attempt in either arm
+retains ≥90% of it.** Passes by terminal-gap bin:
+
+| bin | cold | warm |
+|---|---|---|
+| [0.45, 0.8) | 0/24 | — |
+| [0.8, 1.2) | **4/14** | **3/18** |
+| [1.2, 2) | 0/38 | **6/46** |
+| **≥ 2** (where real LPs live) | **0/20** | **0/32** |
+
+**Every joint success sits below the real median, and the ≥2 nm bin passes 0 of 52 across both
+arms**, failing on clash and `contacts_lost`. Realistic openness and a usable interface do not
+yet coexist. That reframes the retention ramp: the question is not how much preservation can be
+recovered by raising the weight, it is that at realistic openness none of it currently survives.
+
+**Clash is pervasive, not a high-gap artifact** — cold fails it 16/24, 10/14, 26/38, 15/20 across
+the four gap bins. Sterics, not retention weight, is the first thing to address.
+
+**"warm > cold" is not a headline-grade claim.** By this report's own rule that both binnings must
+agree, it fails: warm wins the [0.3,0.6) edit bin (18% vs 0%) while cold wins ≥0.6 (7% vs 4%), so
+the pooled difference is confounded by edit-size distribution. This also contradicts a reading
+made from the training curves — that the warm arm's overshoot was degrading it. Warm has *fewer*
+clashes (51 vs 67); its distinctive failure is backbone breaks (20 vs 12).
+
+### Running it
+
+```bash
+# both arms as siblings (preserve_weight: 0.0; warm needs the torsion milestone on disk)
+bash scripts/submit_cp2lp_backbone.sh --submit release
+
+# all-atom evaluation of the pair, chained behind the pilots, one report over both.
+# The arms have DIFFERENT milestone numbers (warm inherits 10300), so they share an
+# EVAL_CKPT_TAG label for the comparison directory and pass per-arm weights.
+EVAL_CKPT_TAG=release_end_v2 \
+  RELEASE_DEPS="bb_release_cold=<jobid>,bb_release_warm=<jobid>" \
+  bash scripts/submit_cp2lp_backbone.sh --submit evaluate-release
+```
+
 
 ## Traps found the hard way
 
@@ -1724,6 +1856,88 @@ processes drew different batches. The dataloader is now seeded.
   together — which is what keeps the ablation single-variable for free, and what
   `test_contactonly_differs_from_gan_in_exactly_one_knob` enforces.
 
+### Six silent failures in the evaluation path, found 2026-10-04/05
+
+The release arms were the first runs to exercise `--submit evaluate` end to end. Every defect
+below produced a confident, wrong, *successful-looking* result rather than an error, and they
+compound: the first makes the path unrunnable, and the rest only become visible once it runs.
+
+- **The evaluation resolved checkpoints without the `checkpoints/` segment.** Lightning writes
+  every milestone, `last.ckpt` and the EMA sidecars into `${STORE}/${RUN_NAME}/checkpoints/`, and
+  the run root holds nothing else. The default tag therefore named a file that cannot exist, the
+  "milestone not reached yet" gate fired, and the job **exited 0 having evaluated nothing** — a
+  whole chain reporting success with no rows. Guarded by
+  `test_eval_gpu_resolves_checkpoints_under_the_checkpoints_dir`.
+- **The arm label was the REPRESENTATION, and it is the grouping key in three places at once** —
+  the attempts filename, the pack stage's resume `tag`, and the report's `by_arm` grouping.
+  `torsion` is unique across cartesian-vs-torsion and identical across any two runs sharing a
+  representation. Both release arms are `torsion`, so the warm arm's eval overwrote
+  `attempts__torsion__release_end.jsonl`, its pack job found every tag already present
+  (`128 attempts already packed; skipping those`) and wrote a **0-byte** file, and the report
+  still printed a confident table over the cold arm alone. The label is now `run_name`, and the
+  source baseline is suffixed off it rather than being a bare shared name. **A dry run cannot
+  catch this**: it prints job wiring, not output filenames.
+- **Two of the five `joint_success` gates were unevaluable and defaulted to PASS.**
+  `sequence_exact` through `.get(..., True)`, `contact_retention` through a NaN that made
+  `ret == ret` false and skipped the comparison. Neither field was ever produced, because nothing
+  passed `source_contacts`/`source_sequence` into `score_packed` — `--source-pdb-root` was always
+  plumbed through the pack script and never set. So a reported "25% joint success" was measured
+  against three of its five documented criteria. A missing gate now **raises**. This reversed an
+  existing test that asserted a NaN should *skip* the gate, on the reasoning that the skip stays
+  visible because `contacts_lost` never fires; the run disproved it — the gate was skipped 64/64,
+  every row returned `ok=True`, and an absent failure reason reads exactly like "retention was
+  fine". A skipped gate that still returns a pass is a silent pass.
+- **`dataset.datamodule` OVERRIDES `dataset.unified.datamodule`.**
+  `train._resolve_datamodule_config` returns `OmegaConf.merge(unified_cfg, override_cfg)`, so a
+  value set only on the unified node is **inert**. The panel-coverage fix set
+  `unified.datamodule.batch_size` and the job still ran one batch of 16 and lost 8 of 24 sources,
+  with the logged Data config showing both values side by side. The surrounding code already set
+  `num_workers` on both nodes, so the duality was known for that key and missed for this one. Set
+  both. Guarded by `test_eval_sets_batch_size_on_the_node_that_actually_wins`.
+- **`drop_last=True` silently truncates an evaluation panel**, and the panel is the denominator
+  of every per-source rate. 24 sources at batch 16 ran one batch and reported `n_sources: 16`
+  with nothing flagging the loss. The batch now steps down to a divisor of the panel, and
+  coverage is **asserted with a non-zero exit** — unlike the sbatch "milestone not reached" gates,
+  which rightly exit 0 because upstream never ran. This job *has* run; a stalled chain is
+  recoverable, a confident wrong number in a report is not.
+- **The provenance key is `id`, not `example_id`.** `atomarray_to_atom37` builds the sample as
+  `Data(..., id=sample_id, ...)` and `StructureDataset.__getitem__` skips `id_column` when
+  propagating metadata columns, precisely because `id` already carries that value. On top of
+  that, `structure_collate_fn` routes every field through `_pad_and_stack`, which cannot stack
+  strings and returns `None` — and a `None` result **drops the key**. So the eval's
+  `cp.get("example_id", [f"row{i}" ...])` fell back to a positional label unique only within one
+  batch, carrying no link to the panel, which is why the source contact map could not be supplied
+  at all. `_SAMPLE_LEVEL_METADATA_KEYS` now passes both names through as plain lists (an
+  allowlist, not a blanket non-tensor passthrough). Note for anyone who starts *reading* the key
+  on the sampling path: `proteina.py`'s val_generation expansion `repeat_interleave`s tensors and
+  passes lists through, so after it the ids are length `bs` while tensors are `bs * n_repeat`.
+
+Two more from building the arms themselves:
+
+- **A warm start inherits the source milestone's G-update count and exits 0 having trained
+  nothing.** `g_updates` is a `persistent=True` buffer, so it rides in the state dict even though
+  `pretrain_ckpt_path` skips the optimizer states and restarts `global_step`. The warm arm loaded
+  the torsion g=10300 milestone against `max_g_updates: 10300`, logged "reached the budget
+  (global_step=1)", and exited 0 — which in these Slurm chains releases every `afterok` dependent
+  behind a stage that did no work. Budget a warm start as `inherited + wanted`, and move
+  `eval_checkpoint_g_updates` with it (matched by **equality**, not threshold, so a stale value
+  writes no milestone at all). The module now raises instead of stopping when it trips the budget
+  at `global_step <= 1`.
+- **Before "fixing" an init path, check what the checkpoints actually contain.** The obvious fix
+  for the noise-adapter overwrite — only draw when the columns are zero — is wrong here: the
+  `cp2lp_onepass_fork` checkpoint every arm starts from **already carries trained noise columns**
+  (rms 1.980e-02), and every existing arm re-drew them. Gating on zero would have silently changed
+  the initialisation of every arm in the repo, controls included — a confound introduced by a bug
+  fix. It is therefore a flag, `cp2lp.onepass.preserve_loaded_noise_adapter`, defaulting to the
+  historical behaviour and set on the warm arm alone. The decision is logged either way: the warm
+  arm must print `LEFT AS LOADED` and the cold arm `OVERWRITING trained columns`.
+- **A shared output directory needs atomic writes, not an existence check.** The arms' pack jobs
+  run concurrently, and `if exists: unlink; symlink` is a TOCTOU race — both jobs see no link,
+  both call `symlink`, and the loser dies with `FileExistsError`, stranding the report. Build
+  under a per-process temp name and `os.replace`. The deeper fix was to stop sharing: each pack
+  job now globs only `attempts__${RUN_NAME}__*`, so the stage is parallel rather than accidentally
+  shared.
+
 
 ## Files
 
@@ -1776,3 +1990,7 @@ processes drew different batches. The dataloader is now seeded.
 | `script_utils/test_cp2lp_bb_losses.py` | the steric normalisation, the preservation kink, the bonded exclusions |
 | `script_utils/test_cp2lp_bb_discriminator.py` | the three shortcuts: sidechains, sequence, exact local geometry |
 | `script_utils/test_cp2lp_bb_eval.py` | the gates that decide the reported numbers |
+| `configs/example/training_cp2lp_bb_release.yaml` | the shared base for the preservation-release pair (`preserve_weight: 0.0`) |
+| `configs/example/training_cp2lp_bb_release_warm.yaml` | warm from the trained torsion milestone — carries the inherited-budget arithmetic |
+| `configs/example/training_cp2lp_bb_release_cold.yaml` | cold from the fork — the single-variable-in-loss control against torsion |
+| `script_utils/test_collate_metadata.py` | `id`/`example_id` survive collation, and `slice_batch` keeps them aligned |

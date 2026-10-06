@@ -270,6 +270,56 @@ def test_noise_adapter_warns_and_returns_none_without_the_feature():
     assert init_noise_adapter_(_FakeFactory([3, 8], noise_at=-1)) is None
 
 
+def test_noise_adapter_preserves_trained_columns_when_asked():
+    """A WARM START from an arm's own checkpoint must keep the noise columns it learned.
+
+    `train.py` runs this on every `pretrain_ckpt_path` load, warm starts included, and the
+    draw is unconditional by default -- so warm-starting the release arm from the trained
+    torsion checkpoint would silently re-randomise the only weights that make the output
+    depend on the random input at all, while the config said "keep the current generator".
+    `preserve_loaded=True` is what the warm arm passes.
+    """
+    f = _FakeFactory([3, 8, 2, 4], noise_at=3)
+    with torch.no_grad():
+        f.linear_out.weight[:, 13:].fill_(0.37)  # stands in for trained weights
+    before = f.linear_out.weight[:, 13:].clone()
+
+    span = init_noise_adapter_(f, std=0.05, preserve_loaded=True)
+
+    assert span == (13, 4), "the span is still reported, so callers cannot tell the two apart"
+    assert torch.equal(f.linear_out.weight[:, 13:], before), "trained noise columns were re-drawn"
+
+
+def test_noise_adapter_redraws_trained_columns_by_default():
+    """THE DEFAULT MUST STAY THE HISTORICAL BEHAVIOUR, and that is not a conservatism tic.
+
+    MEASURED: the `cp2lp_onepass_fork` checkpoint every `bb_*` and `onepass_*` arm starts
+    from already carries TRAINED noise columns (rms 1.980e-02), and every one of those runs
+    re-drew them -- jobs 70458 and 71251 both logged `initialised at columns [315, 331) with
+    std=0.02`. If this flag defaulted to preserving, a bug fix would have silently changed
+    the initialisation of the controls the release arms are compared against.
+    """
+    f = _FakeFactory([3, 8, 2, 4], noise_at=3)
+    with torch.no_grad():
+        f.linear_out.weight[:, 13:].fill_(0.37)
+    init_noise_adapter_(f, std=0.05)
+    assert not torch.allclose(
+        f.linear_out.weight[:, 13:], torch.full_like(f.linear_out.weight[:, 13:], 0.37)
+    ), "the default stopped re-drawing; every pre-existing arm's init just changed"
+
+
+def test_noise_adapter_draws_on_exactly_zero_columns_either_way():
+    """Neither mode may disable the case the function exists for: a spliced-in feature
+    arrives at EXACTLY zero and does need the draw, or the trunk gets no gradient on step
+    one and the editor learns a deterministic edit before discovering its noise."""
+    for preserve in (False, True):
+        f = _FakeFactory([3, 8, 2, 4], noise_at=3)
+        assert float(f.linear_out.weight[:, 13:].abs().max()) == 0.0, "fixture is not zero"
+        init_noise_adapter_(f, std=0.05, preserve_loaded=preserve)
+        assert float(f.linear_out.weight[:, 13:].abs().max()) > 0.0, \
+            f"zero columns were not drawn with preserve_loaded={preserve}"
+
+
 # ================================================================== arm exclusivity
 
 

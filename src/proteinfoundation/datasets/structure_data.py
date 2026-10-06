@@ -588,6 +588,24 @@ def _allocate_budget(
 
 # Fixed-M peptide-surface fields and other sample-level tensors that must NOT be
 # binder-padded (their leading dim is not num_nodes).
+#: Per-sample metadata that is NOT a tensor and must survive collation as a plain list.
+#: Deliberately an allowlist: the collate loop drops anything `_pad_and_stack` cannot stack,
+#: which is correct for stray non-tensor fields and wrong for provenance. See the passthrough
+#: in `structure_collate_fn` for what the loss of `example_id` actually cost.
+#:
+#: CAUTION for anyone who starts READING `batch["example_id"]` on the sampling path:
+#: `proteina.py`'s val_generation expansion repeats TENSORS with `repeat_interleave` and
+#: passes non-tensors through untouched, so after it the ids are length `bs` while every
+#: tensor is `bs * n_repeat` and positional indexing silently mis-attributes. Nothing reads
+#: the key there today (checked), which is why it is left alone; repeat the list at that site
+#: before relying on it.
+#: `id` is the one that actually exists. `atomarray_to_atom37` builds the sample as
+#: `Data(..., id=sample_id, ...)`, and `StructureDataset.__getitem__` then propagates every
+#: metadata column EXCEPT `path_column` and `id_column` -- so `example_id` is deliberately
+#: never set as an attribute, because `id` already carries its value. `example_id` is kept
+#: here anyway for the pipeline-mode path, which does use that name.
+_SAMPLE_LEVEL_METADATA_KEYS = frozenset({"id", "example_id"})
+
 _SAMPLE_LEVEL_TENSOR_KEYS = frozenset(
     {
         "surface_xyz",
@@ -685,6 +703,23 @@ def structure_collate_fn(
             continue
 
         value_list = [getattr(sample, key) for sample in batch]
+
+        # PER-SAMPLE STRING METADATA, passed through as a plain list rather than stacked.
+        # Everything below routes through `_pad_and_stack`, which cannot stack strings and
+        # returns None, and a None result DROPS the key -- so `example_id` disappeared from
+        # every batch. That is a silent loss of provenance: `cp2lp_bb_evaluate.py` reads
+        # `cp.get("example_id", [f"row{i}" ...])`, so it fell back to a POSITIONAL label that
+        # is only unique within one batch, and the evaluation reported `row0..row15` with no
+        # way to tell which panel source any attempt came from -- which in turn is why the
+        # source contact map (and therefore `contact_retention`) could never be supplied.
+        #
+        # The fallback in that caller is evidence the key was MEANT to survive collation, so
+        # this restores the intent rather than changing the design. Kept to an explicit
+        # allowlist so the blast radius is one key: `slice_batch` already slices lists whose
+        # length is the batch size, so the value behaves correctly downstream.
+        if key in _SAMPLE_LEVEL_METADATA_KEYS:
+            result[key] = list(value_list)
+            continue
 
         try:
             # Sample-level tensors (surface point clouds, stashed rigid params): stack

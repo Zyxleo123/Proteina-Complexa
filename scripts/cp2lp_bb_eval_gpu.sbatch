@@ -29,7 +29,20 @@ cd "$REPO"
 BB_PANEL="${BB_PANEL:-${LPDATA}/cp2lp_bb_panel24.parquet}"
 BB_SEEDS="${BB_SEEDS:-0,1,2,3}"
 BB_EVAL_ROOT="${BB_EVAL_ROOT:-${TRIPLET_ROOT}/bb_eval}"
-CKPT="${BB_EVAL_CKPT:-${STORE}/${RUN_NAME}/${EVAL_CKPT_TAG}.ckpt}"
+# `checkpoints/` IS PART OF THE PATH. Lightning writes every milestone, `last.ckpt` and the
+# EMA sidecars into `${STORE}/${RUN_NAME}/checkpoints/`, and the run root holds nothing else.
+# Without this segment the default tag resolves to a file that cannot exist, the
+# "milestone not reached yet" gate below fires, and the job EXITS 0 having evaluated nothing
+# -- so a whole evaluation chain reports success and produces no rows. Measured on
+# `cp2lp_bb_torsion`, whose run root contains exactly one entry: `checkpoints`.
+#
+# `OUT` IS DELIBERATELY SHARED ACROSS ARMS and keyed by the tag alone, NOT by `RUN_NAME`:
+# `cp2lp_bb_report.sbatch` passes this one directory as `--packed-dir` and groups the rows it
+# finds there `by_arm`, so per-arm output directories would leave the report with one arm per
+# directory and nothing to compare. Arms that do not share a milestone number therefore pass
+# a shared `EVAL_CKPT_TAG` for the label plus a per-arm `BB_EVAL_CKPT` for the weights.
+BB_CKPT_DIR="${BB_CKPT_DIR:-${STORE}/${RUN_NAME}/checkpoints}"
+CKPT="${BB_EVAL_CKPT:-${BB_CKPT_DIR}/${EVAL_CKPT_TAG}.ckpt}"
 OUT="${BB_EVAL_ROOT}/${EVAL_CKPT_TAG}"
 
 if [[ ! -f "${BB_PANEL}" ]]; then
@@ -39,8 +52,8 @@ if [[ ! -f "${BB_PANEL}" ]]; then
 fi
 if [[ ! -f "${CKPT}" ]]; then
   echo "GATE: no checkpoint at ${CKPT} -- this milestone has not been reached yet."
-  echo "      Available in ${STORE}/${RUN_NAME}:"
-  ls -1 "${STORE}/${RUN_NAME}" 2>/dev/null | sed 's/^/        /' || echo "        (run dir missing)"
+  echo "      Available in ${BB_CKPT_DIR}:"
+  ls -1 "${BB_CKPT_DIR}" 2>/dev/null | sed 's/^/        /' || echo "        (checkpoint dir missing)"
   exit 0
 fi
 
@@ -52,6 +65,7 @@ mkdir -p "${OUT}"
   --manifest "${BB_PANEL}" \
   --out-dir "${OUT}" \
   --seeds "${BB_SEEDS}" \
+  --arm-label "${BB_ARM_LABEL:-${RUN_NAME}}" \
   --source-torsion-baseline
 
 echo "[done] dumps under ${OUT}"

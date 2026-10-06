@@ -873,9 +873,407 @@ def test_preamble_run_names_track_the_configs():
         for arm, cfg_name in (
             ("gan", "example/training_cp2lp_gan"),
             ("contactonly", "example/training_cp2lp_contactonly"),
+            ("bb_torsion", "example/training_cp2lp_bb_torsion"),
+            ("bb_release_warm", "example/training_cp2lp_bb_release_warm"),
+            ("bb_release_cold", "example/training_cp2lp_bb_release_cold"),
         ):
             want = OmegaConf.to_container(compose(config_name=cfg_name), resolve=False)["run_name"]
             m = re.search(rf'^\s*{arm}\)\s.*RUN_NAME="\$\{{RUN_NAME:-([^}}]+)\}}"', preamble, re.M)
             assert m, f"no RUN_NAME default found for arm {arm}"
             assert m.group(1) == want, \
                 f"arm {arm}: preamble default {m.group(1)!r} != config run_name {want!r}"
+
+
+def test_preamble_dispatches_release_arms_before_the_bb_glob():
+    """`case` takes the FIRST match, and the preamble has a `bb_*)` arm in both of its
+    dispatch tables. If either glob is listed before the release arms, `bb_release_warm`
+    falls into it and is handed the FORK checkpoint instead of the trained torsion one --
+    so the warm arm silently becomes a second cold arm, and the job log still prints the
+    right config name. There is no later check that would catch it.
+    """
+    import os
+    import re
+
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    preamble = open(os.path.join(repo, "scripts", "_cp2lp_preamble.sh")).read()
+
+    for pattern in ("bb_release_warm", "bb_release_cold"):
+        specific = [m.start() for m in re.finditer(rf"^\s*{pattern}\)", preamble, re.M)]
+        assert specific, f"no dispatch branch for {pattern}"
+        for glob_start in (m.start() for m in re.finditer(r"^\s*bb_\*\)", preamble, re.M)):
+            # Every `bb_*)` glob must come after at least one branch for this arm inside the
+            # same `case`. Comparing to the LAST preceding specific branch is enough here:
+            # both tables list the release arms, so a glob with none before it is the bug.
+            assert any(s < glob_start for s in specific), (
+                f"a `bb_*)` glob at offset {glob_start} precedes every `{pattern})` branch; "
+                "the release arm would be swallowed by it"
+            )
+
+
+def test_preamble_init_ckpt_tracks_the_release_configs():
+    """`cp2lp_train.sbatch` passes `++pretrain_ckpt_path=${INIT_CKPT}`, a Hydra override that
+    BEATS the yaml -- so the release configs' own `pretrain_ckpt_path` never runs and the
+    preamble's value does. A disagreement between the two is invisible in the job log, and
+    for the warm arm it is the difference between the experiment and a duplicate of the cold
+    arm. Assert the warm arm's preamble default names the same checkpoint its config does.
+    """
+    import os
+    import re
+
+    from hydra import compose, initialize_config_dir
+    from omegaconf import OmegaConf
+
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    preamble = open(os.path.join(repo, "scripts", "_cp2lp_preamble.sh")).read()
+
+    # Greedy to the LAST brace on the line: the value itself contains `${STORE}`, so a
+    # `[^}]+` class stops inside it and matches nothing.
+    m = re.search(r'^\s*RELEASE_WARM_CKPT="\$\{RELEASE_WARM_CKPT:-(.+)\}"\s*$', preamble, re.M)
+    assert m, "no RELEASE_WARM_CKPT default in the preamble"
+    # The preamble writes it through ${STORE}; the config spells the path out. Compare the
+    # part that identifies the checkpoint rather than re-deriving the store root here.
+    tail = m.group(1).split("}")[-1].lstrip("/")
+    assert tail == "cp2lp_bb_torsion/checkpoints/g010300.ckpt", tail
+    assert "-EMA" not in tail, "the warm start must use the raw checkpoint, not the EMA sidecar"
+
+    with initialize_config_dir(config_dir=os.path.join(repo, "configs"), version_base=None):
+        cfg = compose(config_name="example/training_cp2lp_bb_release_warm")
+        in_cfg = OmegaConf.to_container(cfg, resolve=False)["pretrain_ckpt_path"]
+    assert str(in_cfg).endswith(tail), \
+        f"config pretrain_ckpt_path {in_cfg!r} does not end with the preamble's {tail!r}"
+
+
+def test_only_the_warm_release_arm_preserves_its_noise_adapter():
+    """`preserve_loaded_noise_adapter` must be set on the WARM arm and nowhere else.
+
+    It changes the initialisation, so an arm that set it by accident -- or the warm arm
+    failing to set it -- is a silent confound rather than an error. MEASURED context: the
+    fork checkpoint already carries trained noise columns (rms 1.980e-02) and every existing
+    arm re-drew them, so the default is the historical behaviour and this flag is the
+    exception. Covers every cp2lp training config so a new arm cannot inherit it unnoticed.
+    """
+    import os
+
+    from hydra import compose, initialize_config_dir
+    from omegaconf import OmegaConf
+
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    cfg_dir = os.path.join(repo, "configs")
+    names = sorted(
+        "example/" + f[: -len(".yaml")]
+        for f in os.listdir(os.path.join(cfg_dir, "example"))
+        if f.startswith("training_cp2lp_") and f.endswith(".yaml")
+    )
+    assert len(names) >= 12, f"only found {len(names)} cp2lp configs; the glob is wrong"
+
+    enabled = []
+    with initialize_config_dir(config_dir=cfg_dir, version_base=None):
+        for n in names:
+            c = OmegaConf.to_container(compose(config_name=n), resolve=False)
+            op = (c.get("cp2lp") or {}).get("onepass") or {}
+            if bool(op.get("preserve_loaded_noise_adapter", False)):
+                enabled.append(n)
+
+    assert enabled == ["example/training_cp2lp_bb_release_warm"], (
+        f"preserve_loaded_noise_adapter is set on {enabled!r}; it belongs on the warm "
+        "release arm alone, because it changes the initialisation"
+    )
+
+
+def test_warm_release_budget_matches_the_control_update_count():
+    """The warm arm's budget must be its INHERITED count plus the control's update count.
+
+    `g_updates` is a `persistent=True` buffer, so it travels through `pretrain_ckpt_path`
+    even though the optimizer states do not. The first launch (job 72084) loaded the torsion
+    milestone's count of 10300 against a budget of 10300 and stopped after ONE step, exiting
+    0. The arithmetic below is what makes the warm arm do the same number of updates as the
+    control rather than zero of them -- and `eval_checkpoint_g_updates` has to move with the
+    budget because milestones are matched by equality, not by threshold.
+    """
+    import os
+
+    from hydra import compose, initialize_config_dir
+    from omegaconf import OmegaConf
+
+    # Measured, and printed by the preflight as `g_updates_in_fork=250` from the
+    # `${INIT_CKPT}.source` sidecar that `pin_cp2lp_fork.sh` writes.
+    FORK_G_UPDATES = 250
+    WARM_CKPT_G_UPDATES = 10300  # its milestone is written at exactly this count
+
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    with initialize_config_dir(config_dir=os.path.join(repo, "configs"), version_base=None):
+        cold = OmegaConf.to_container(
+            compose(config_name="example/training_cp2lp_bb_release_cold"), resolve=True
+        )["cp2lp"]
+        warm = OmegaConf.to_container(
+            compose(config_name="example/training_cp2lp_bb_release_warm"), resolve=True
+        )["cp2lp"]
+
+    control_updates = int(cold["max_g_updates"]) - FORK_G_UPDATES
+    assert control_updates > 0, "the cold arm would train for nothing"
+
+    want = WARM_CKPT_G_UPDATES + control_updates
+    assert int(warm["max_g_updates"]) == want, (
+        f"warm max_g_updates is {warm['max_g_updates']}, expected {want} "
+        f"(= inherited {WARM_CKPT_G_UPDATES} + the control's {control_updates} updates). "
+        "Too low and the run stops having trained nothing."
+    )
+    assert int(warm["max_g_updates"]) > WARM_CKPT_G_UPDATES, "warm arm starts at its budget"
+    assert warm["eval_checkpoint_g_updates"] == [want], (
+        f"warm milestone list is {warm['eval_checkpoint_g_updates']}, expected [{want}] -- "
+        "milestones are matched by equality, so a stale value writes no checkpoint at all"
+    )
+
+
+def test_eval_gpu_resolves_checkpoints_under_the_checkpoints_dir():
+    """The eval job's default checkpoint path must include the `checkpoints/` segment.
+
+    Lightning writes milestones, `last.ckpt` and the EMA sidecars into
+    `${STORE}/${RUN_NAME}/checkpoints/`; the run root holds nothing else (measured on
+    `cp2lp_bb_torsion`, whose root contains exactly one entry, `checkpoints`). Without the
+    segment the default tag resolves to a path that cannot exist, the "milestone not reached
+    yet" gate fires, and the job EXITS 0 having evaluated nothing -- an entire evaluation
+    chain reporting success with no rows produced. This was live until 2026-10-04 and had
+    never been exercised because the arms had only just finished.
+    """
+    import os
+    import re
+
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    src = open(os.path.join(repo, "scripts", "cp2lp_bb_eval_gpu.sbatch")).read()
+
+    m = re.search(r'^\s*CKPT="\$\{BB_EVAL_CKPT:-(.+?)\}"\s*$', src, re.M)
+    assert m, "no CKPT default in cp2lp_bb_eval_gpu.sbatch"
+    assert "BB_CKPT_DIR" in m.group(1), f"CKPT default does not go through BB_CKPT_DIR: {m.group(1)!r}"
+
+    d = re.search(r'^\s*BB_CKPT_DIR="\$\{BB_CKPT_DIR:-(.+)\}"\s*$', src, re.M)
+    assert d, "no BB_CKPT_DIR default"
+    assert d.group(1).rstrip("/").endswith("checkpoints"), (
+        f"BB_CKPT_DIR is {d.group(1)!r}; it must end in `checkpoints`"
+    )
+
+    # OUT must stay keyed by the TAG ALONE. `cp2lp_bb_report.sbatch` passes this single
+    # directory as `--packed-dir` and groups the rows `by_arm`, so adding RUN_NAME would give
+    # the report one arm per directory and nothing to compare.
+    o = re.search(r'^\s*OUT="(.+)"\s*$', src, re.M)
+    assert o, "no OUT in cp2lp_bb_eval_gpu.sbatch"
+    assert "RUN_NAME" not in o.group(1), (
+        f"OUT is {o.group(1)!r}; per-arm output dirs break the report's by-arm comparison"
+    )
+    rep = open(os.path.join(repo, "scripts", "cp2lp_bb_report.sbatch")).read()
+    ro = re.search(r'^\s*OUT="(.+)"\s*$', rep, re.M)
+    assert ro and ro.group(1) == o.group(1), (
+        f"eval OUT {o.group(1)!r} != report OUT {ro.group(1) if ro else None!r}; the report "
+        "would look in a different directory than the eval wrote to"
+    )
+
+
+def test_submitter_release_eval_paths():
+    """`evaluate-release` must build each arm's run directory as `cp2lp_<arm>`.
+
+    `bb_release_cold` -> `cp2lp_bb_release_cold`, matching the preamble's dispatch table. The
+    `bb_` prefix is NOT stripped: `${arm#bb_}` yields `cp2lp_release_cold`, which does not
+    exist, and the eval job would gate on the missing checkpoint and exit 0 having evaluated
+    nothing. Caught in review of my own line on 2026-10-04.
+    """
+    import os
+    import re
+
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    sub = open(os.path.join(repo, "scripts", "submit_cp2lp_backbone.sh")).read()
+    pre = open(os.path.join(repo, "scripts", "_cp2lp_preamble.sh")).read()
+
+    m = re.search(r'ck="\$\{STORE_ROOT\}/([^/]+)/checkpoints/', sub)
+    assert m, "no per-arm checkpoint path in the evaluate-release stage"
+    assert m.group(1) == "cp2lp_${arm}", (
+        f"run dir is built as {m.group(1)!r}; must be 'cp2lp_${{arm}}' -- stripping `bb_` "
+        "points at a directory that does not exist"
+    )
+
+    # And the derivation must agree with the preamble for every release arm.
+    for arm in ("bb_release_warm", "bb_release_cold"):
+        rn = re.search(rf'^\s*{arm}\)\s.*RUN_NAME="\$\{{RUN_NAME:-([^}}]+)\}}"', pre, re.M)
+        assert rn, f"no RUN_NAME for {arm} in the preamble"
+        assert rn.group(1) == f"cp2lp_{arm}", (
+            f"preamble run_name for {arm} is {rn.group(1)!r}, but evaluate-release derives "
+            f"'cp2lp_{arm}'"
+        )
+
+    # The EMA sidecars, and each arm's own endpoint -- the warm arm inherits 10300.
+    end = re.search(r'declare -A END=\((.+?)\)', sub, re.S)
+    assert end, "no END milestone map"
+    assert "[bb_release_cold]=g010300-EMA" in end.group(1), end.group(1)
+    assert "[bb_release_warm]=g020350-EMA" in end.group(1), (
+        "the warm arm's endpoint must be 20350: it inherits 10300 G-updates from the torsion "
+        f"checkpoint. Got: {end.group(1)}"
+    )
+
+
+def test_submitter_store_root_matches_preamble():
+    """The submitter hardcodes STORE_ROOT because it never sources the preamble. If the store
+    moves, a stale copy here points every checkpoint path at a tree that no longer exists."""
+    import os
+    import re
+
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    sub = open(os.path.join(repo, "scripts", "submit_cp2lp_backbone.sh")).read()
+    pre = open(os.path.join(repo, "scripts", "_cp2lp_preamble.sh")).read()
+
+    s = re.search(r'^\s*STORE_ROOT="\$\{STORE_ROOT:-(.+)\}"\s*$', sub, re.M)
+    assert s, "no STORE_ROOT in the submitter"
+    zfs = re.search(r'^\s*ZFS="\$\{ZFS:-(.+?)\}"\s*$', pre, re.M)
+    store = re.search(r'^\s*STORE="\$\{STORE:-(.+)\}"\s*$', pre, re.M)
+    assert zfs and store, "could not read ZFS/STORE from the preamble"
+    expect = store.group(1).replace("${ZFS}", zfs.group(1))
+    assert s.group(1) == expect, f"submitter STORE_ROOT {s.group(1)!r} != preamble {expect!r}"
+
+
+def test_eval_arm_label_is_unique_per_run_not_per_representation():
+    """The arm label is the grouping key in THREE places -- the attempts filename, the pack
+    stage's resume `tag`, and the report's `by_arm` grouping. Keying it on
+    `cfg.cp2lp.backbone.arm` (the REPRESENTATION) is unique across cartesian-vs-torsion and
+    identical across any two runs sharing a representation.
+
+    MEASURED COST: both preservation-release arms are `torsion`, so the warm arm's eval
+    overwrote `attempts__torsion__release_end.jsonl` and its pack job found every tag already
+    present ("128 attempts already packed; skipping those") and wrote a 0-byte file. The
+    warm arm's whole evaluation was lost while the report printed a confident table.
+    """
+    import os
+    import re
+
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    src = open(os.path.join(repo, "script_utils", "cp2lp_bb_evaluate.py")).read()
+
+    m = re.search(r"^\s*arm = (.+)$", src, re.M)
+    assert m, "no arm label assignment in cp2lp_bb_evaluate.py"
+    expr = m.group(1)
+    assert "run_name" in expr, (
+        f"arm label is {expr!r}; it must default to run_name (unique per run). The "
+        "representation name alone collides across runs."
+    )
+    assert expr.index("run_name") < expr.index("backbone.arm"), (
+        f"arm label is {expr!r}; the representation must be the LAST fallback, not preferred"
+    )
+
+    # The source baseline shares the fate of the arm label, so it must also be run-scoped.
+    assert 'SOURCE_ARM_SUFFIX = "__source"' in src, "source baseline label is not a suffix"
+    assert "variants[arm + SOURCE_ARM_SUFFIX]" in src, (
+        "the source baseline is not keyed off the run's arm label, so it collides across runs "
+        "exactly as the bare representation name did"
+    )
+
+
+def test_eval_asserts_panel_coverage_and_divides_the_batch():
+    """`drop_last=True` in the train dataloader silently discarded the panel's final partial
+    batch: a 24-source panel at batch 16 ran ONE batch and reported `n_sources: 16`, with
+    nothing flagging the 8 lost sources. Two defences, and the assertion is the real one."""
+    import os
+
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    src = open(os.path.join(repo, "script_utils", "cp2lp_bb_evaluate.py")).read()
+
+    assert "PANEL COVERAGE FAILURE" in src, "no coverage assertion in the eval stage"
+    assert "n_sources_seen != n_manifest" in src, "coverage is not compared to the manifest"
+    # Non-zero exit on purpose: this job HAS run and produced output that would be read as
+    # covering the panel. The sbatch "milestone not reached" gates exit 0; this must not.
+    assert "raise SystemExit" in src, "coverage failure must stop the chain, not exit 0"
+    assert "n_manifest % eff_batch" in src, "batch size is not stepped down to divide the panel"
+
+
+def test_pack_stage_supplies_source_complexes():
+    """Without `--source-pdb-root` the pack stage gets `source_contacts=None`, so
+    `contact_retention` and `sequence_exact` are never computed -- which is what made two of
+    the report's five gates unevaluable. The root is built FROM THE MANIFEST, because a panel
+    may draw rows from several splits and `path` is the only record of where each one lives."""
+    import os
+
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    sb = open(os.path.join(repo, "scripts", "cp2lp_bb_pack_eval.sbatch")).read()
+
+    assert "BB_SOURCE_PDB_ROOT" in sb and "--source-pdb-root" in sb
+    assert "source_pdbs" in sb, "no default source-pdb root is constructed"
+    assert "read_parquet" in sb, "the source root is not derived from the manifest"
+    assert 'f"{ex}.pdb"' in sb, "symlinks must be named <example_id>.pdb, the layout pack expects"
+
+
+def test_eval_sets_batch_size_on_the_node_that_actually_wins():
+    """`dataset.datamodule` OVERRIDES `dataset.unified.datamodule`.
+
+    `train._resolve_datamodule_config` returns `OmegaConf.merge(unified_cfg, override_cfg)`,
+    so a value set only on the unified node is inert. MEASURED: the first version of the
+    panel-coverage fix set `unified.datamodule.batch_size = 4` and the job still ran a single
+    batch of 16 and lost 8 of 24 sources, with the logged Data config showing both values
+    side by side. The surrounding code already sets `num_workers` on both nodes, so the
+    duality was known for that key and missed for this one.
+    """
+    import os
+    import re
+
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    src = open(os.path.join(repo, "script_utils", "cp2lp_bb_evaluate.py")).read()
+
+    assert re.search(r"cfg\.dataset\.unified\.datamodule\.batch_size\s*=\s*eff_batch", src), \
+        "unified batch_size is not set"
+    assert re.search(r"cfg\.dataset\.datamodule\.batch_size\s*=\s*eff_batch", src), (
+        "the OVERRIDE node's batch_size is not set, so the effective batch is whatever the "
+        "training config had and the panel-coverage fix is inert"
+    )
+
+
+def test_eval_reads_the_provenance_key_the_pipeline_actually_sets():
+    """The sample carries `id`, not `example_id`: `atomarray_to_atom37` builds
+    `Data(..., id=sample_id, ...)` and `__getitem__` skips `id_column` when propagating
+    metadata columns. Reading only `example_id` could never have worked, and the positional
+    fallback hid that for the whole life of this script."""
+    import os
+
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    src = open(os.path.join(repo, "script_utils", "cp2lp_bb_evaluate.py")).read()
+    assert 'cp.get("example_id") or cp.get("id")' in src, (
+        "the eval must fall back to `id`, which is the attribute the simple-mode dataset sets"
+    )
+
+    sd = open(os.path.join(repo, "src", "proteinfoundation", "datasets", "structure_data.py")).read()
+    assert '_SAMPLE_LEVEL_METADATA_KEYS = frozenset({"id", "example_id"})' in sd, (
+        "both provenance names must survive collation; `id` is the one that exists in "
+        "simple mode and `example_id` in pipeline mode"
+    )
+
+
+def test_pack_source_symlinks_are_race_safe():
+    """The arms' pack jobs run CONCURRENTLY against one shared eval directory.
+
+    "if exists: unlink; symlink" is a TOCTOU race -- both jobs see no link, both call
+    symlink, and the loser dies with FileExistsError. That is exactly how job 73694 died,
+    stranding the report on DependencyNeverSatisfied. Same family as the recorded
+    concurrent-shared-output corruption in this project.
+    """
+    import os
+    import re
+
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    sb = open(os.path.join(repo, "scripts", "cp2lp_bb_pack_eval.sbatch")).read()
+
+    assert "os.replace(tmp, dst)" in sb, "symlink creation is not atomic (needs tmp + replace)"
+    assert re.search(r'tmp = f"\{dst\}\.tmp\{os\.getpid\(\)\}"', sb), \
+        "the temp name is not per-process, so two jobs would collide on it too"
+    assert "except OSError" in sb, "a concurrent winner must be tolerated, not raised"
+    # And the naive form must be gone.
+    assert not re.search(r"if os\.path\.islink\(dst\) or os\.path\.exists\(dst\):\s*\n\s*os\.unlink\(dst\)", sb), \
+        "the racy check-then-unlink on the destination is still present"
+
+
+def test_pack_job_packs_only_its_own_arm():
+    """Globbing every attempts file made each concurrent pack job try to pack every arm:
+    duplicated Rosetta work, both jobs appending while both read each other's packed rows for
+    the resume set, and a race on the shared symlink farm."""
+    import os
+
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    sb = open(os.path.join(repo, "scripts", "cp2lp_bb_pack_eval.sbatch")).read()
+
+    assert 'FILES=("${OUT}"/attempts__"${RUN_NAME}"__*.jsonl)' in sb, (
+        "the pack stage does not restrict itself to this arm's attempts file"
+    )
+    assert "BB_PACK_ALL" in sb, "no escape hatch for re-packing a whole directory in one job"

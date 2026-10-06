@@ -242,15 +242,34 @@ def test_raw_backbone_validity_is_judged_before_packing_not_after():
 def test_nan_retention_does_not_silently_pass_the_contact_gate():
     """A NaN retention means "not measured", which must not be read as "retained".
 
-    The inverse of this bug was recorded before: NaN is truthy, so a naive filter scored
-    100%-abstention cells as 100% success. Here a NaN must not be compared as >= 0.5 and pass.
+    DELIBERATE REVERSAL of this test's original assertion, 2026-10-05. It used to assert
+    `ok and why == ""` -- that a NaN SKIPS the gate rather than failing it -- on the reasoning
+    that the skip would stay visible because `contacts_lost` would never fire for the row.
+
+    THE 2026-10-04 RELEASE EVALUATION DISPROVED THAT REASONING. `contact_retention` was absent
+    for every attempt (nothing passes `source_contacts` into `score_packed`), so the gate was
+    skipped 64 times out of 64, every one of those rows returned `ok=True`, and they went
+    straight into a reported "25% joint success". The absence of `contacts_lost` from the
+    failure table is NOT self-announcing: it reads exactly like "retention was fine", which is
+    how it was first read. A skipped gate that still returns a pass is a silent pass.
+
+    So: not measured is not a failure of the contact gate, it is a failure to EVALUATE the
+    gate, and it raises. Same family as the recorded NaN-truthiness bug, opposite direction.
     """
     rpt = _report()
-    ok, why = rpt.joint_success(_row(), _met(contact_retention=float("nan")), 0.45)
-    # Not measured is not a failure of the contact gate -- but it must not be counted as a
-    # measured pass either, so the row is reported with the gate skipped and that is visible
-    # in `contacts_lost` never firing for it.
-    assert ok and why == "", "a NaN retention should skip the gate, not fail it"
+    with pytest.raises(ValueError, match="NaN"):
+        rpt.joint_success(_row(), _met(contact_retention=float("nan")), 0.45)
+
+
+def test_joint_success_raises_rather_than_defaulting_a_missing_gate():
+    """The absent-field version of the same bug: `sequence_exact` defaulted through
+    `.get(..., True)`, so a gate nobody could evaluate was reported as satisfied."""
+    rpt = _report()
+    for field in ("sequence_exact", "contact_retention"):
+        met = _met()
+        del met[field]
+        with pytest.raises(KeyError, match=field):
+            rpt.joint_success(_row(), met, 0.45)
 
 
 # ---------------------------------------------------------------------------- binning
@@ -292,3 +311,154 @@ def test_agg_ignores_nan_and_reports_its_own_n():
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v", "--no-header"]))
+
+
+# --------------------------------------------------- the real-LP openness reference
+
+
+def test_open_threshold_is_far_below_real_openness():
+    """The report's openness narrative rests on an ORDERING, so assert the ordering.
+
+    `min_open_gap_nm` = 0.45 is a floor for "not still a ring", and the report used to treat
+    clearing it as being open. It is the 1.1st percentile of real bound-LP openness. If
+    someone later raises the threshold toward the real median, the report's "the first two
+    bins are below the 2nd percentile of real" line stops being true and has to be rewritten
+    with it -- this test is what makes that a failure instead of a stale sentence.
+    """
+    from cp2lp_bb_report import REAL_LP_GAP_PCTL_NM
+
+    from proteinfoundation.cp2lp.losses import MIN_OPEN_TERMINAL_GAP_NM
+
+    assert MIN_OPEN_TERMINAL_GAP_NM < REAL_LP_GAP_PCTL_NM[5], (
+        "the open threshold is no longer below the 5th percentile of real openness; the "
+        "report's reference text and the release configs' headers describe a different regime"
+    )
+    assert REAL_LP_GAP_PCTL_NM[50] > 4.0 * MIN_OPEN_TERMINAL_GAP_NM, (
+        "real openness is no longer several times the threshold -- re-derive the gap bins"
+    )
+    ps = sorted(REAL_LP_GAP_PCTL_NM)
+    vals = [REAL_LP_GAP_PCTL_NM[p] for p in ps]
+    assert vals == sorted(vals), "percentiles are not monotonic, so one of them is wrong"
+
+
+def test_real_lp_gap_reference_matches_the_measured_rows():
+    """The hardcoded reference must still be what the reference DATA says.
+
+    It is a copied-in measurement, which is the kind of constant that drifts from its source
+    silently -- the reference set can be regenerated with a different AE or a different
+    receptor split and nothing would flag the stale numbers. Recomputes from the rows when
+    they are reachable and skips when they are not, so this is a guard on a workstation and
+    not an obstacle in CI.
+    """
+    import glob
+    import json
+
+    import numpy as np
+
+    from cp2lp_bb_report import REAL_LP_GAP_PCTL_NM
+
+    pattern = (
+        "/zfsauton/scratch/yixiz/Proteina-Complexa/training_runs/store/cp2lp_triplets/"
+        "real_reference/seed0/*.jsonl"
+    )
+    files = glob.glob(pattern)
+    if not files:
+        pytest.skip("real_reference rows not reachable from here")
+
+    gaps = []
+    for f in files:
+        for line in open(f):
+            line = line.strip()
+            if not line:
+                continue
+            # A corrupt row must FAIL rather than be skipped: concurrent appends have
+            # NUL-corrupted shared output files in this project before, and silently
+            # dropping the bad lines is how a reference quietly loses half its population.
+            row = json.loads(line)
+            gaps.append(float(row["scores"]["terminal_gap_nm"]))
+
+    assert len(gaps) > 400, f"reference population shrank to {len(gaps)}; re-derive the constant"
+    for p, want in REAL_LP_GAP_PCTL_NM.items():
+        got = float(np.percentile(gaps, p))
+        assert abs(got - want) < 0.01, (
+            f"p{p} of the real gap is {got:.3f} nm, constant says {want:.3f} -- the reference "
+            "set changed under the hardcoded number"
+        )
+
+
+# --------------------------------------------- the gates must be measurable, not defaulted
+
+
+def _row_sel(**over):
+    """A row/sel pair that passes every gate, so each test perturbs exactly one thing."""
+    row = {"terminal_gap_nm": 1.8, "bb_chain_intact": 1.0}
+    sel = {
+        "clash_receptor_count": 0, "clash_self_count": 0,
+        "sequence_exact": True, "contact_retention": 0.9,
+    }
+    row.update(over.pop("row", {})); sel.update(over.pop("sel", {}))
+    return row, sel
+
+
+def test_joint_success_passes_a_fully_measured_row():
+    from cp2lp_bb_report import joint_success
+
+    row, sel = _row_sel()
+    ok, why = joint_success(row, sel, 0.45)
+    assert ok and why == "", (ok, why)
+
+
+@pytest.mark.parametrize("field", ["sequence_exact", "contact_retention"])
+def test_joint_success_raises_when_a_gate_cannot_be_evaluated(field):
+    """THE BUG THIS EXISTS FOR. `sequence_exact` defaulted through `.get(..., True)` and
+    `contact_retention` through a NaN that made `ret == ret` false, so both gates passed
+    silently. Neither field was ever produced -- nothing passes `source_contacts` /
+    `source_sequence` into `score_packed` -- so the 2026-10-04 release evaluation reported
+    "25% joint success" against three live gates while documenting five. An unmeasured
+    condition is not a satisfied one.
+    """
+    from cp2lp_bb_report import joint_success
+
+    row, sel = _row_sel()
+    del sel[field]
+    with pytest.raises(KeyError, match=field):
+        joint_success(row, sel, 0.45)
+
+
+@pytest.mark.parametrize("field", ["terminal_gap_nm", "bb_chain_intact"])
+def test_joint_success_raises_on_missing_row_fields_too(field):
+    from cp2lp_bb_report import joint_success
+
+    row, sel = _row_sel()
+    del row[field]
+    with pytest.raises(KeyError, match=field):
+        joint_success(row, sel, 0.45)
+
+
+def test_joint_success_refuses_nan_retention():
+    """A NaN means the source had no contacts to retain, i.e. the source complex was supplied
+    but is not a bound complex. Scoring that as a pass is how the gate died the first time."""
+    from cp2lp_bb_report import joint_success
+
+    row, sel = _row_sel()
+    sel["contact_retention"] = float("nan")
+    with pytest.raises(ValueError, match="NaN"):
+        joint_success(row, sel, 0.45)
+
+
+def test_joint_success_still_fails_each_real_condition():
+    """The loud-on-missing change must not have turned any live gate into a pass."""
+    from cp2lp_bb_report import joint_success
+
+    for over, expect in (
+        ({"row": {"terminal_gap_nm": 0.1}}, "not_open"),
+        ({"row": {"bb_chain_intact": 0.0}}, "raw_backbone_broken"),
+        ({"sel": {"sequence_exact": False}}, "sequence_mismatch"),
+        ({"sel": {"clash_receptor_count": 3}}, "clash"),
+        ({"sel": {"contact_retention": 0.1}}, "contacts_lost"),
+    ):
+        row, sel = _row_sel(**over)
+        ok, why = joint_success(row, sel, 0.45)
+        assert not ok and why == expect, (over, ok, why)
+    # and packing failure short-circuits before any field is required
+    assert joint_success({}, None, 0.45) == (False, "packing_failed")

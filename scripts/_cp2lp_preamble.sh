@@ -77,6 +77,13 @@ _cp2lp_defaults() {
     # not in it and are newly zero-initialised.
     bb_cartesian)        CONFIG_NAME="${CONFIG_NAME:-example/training_cp2lp_bb_cartesian}";        RUN_NAME="${RUN_NAME:-cp2lp_bb_cartesian}" ;;
     bb_torsion)          CONFIG_NAME="${CONFIG_NAME:-example/training_cp2lp_bb_torsion}";          RUN_NAME="${RUN_NAME:-cp2lp_bb_torsion}" ;;
+    # --- the two PRESERVATION-RELEASE arms: the torsion arm with `preserve_weight: 0.0`,
+    # warm from the trained torsion generator and cold from the fork. They MUST be listed
+    # before any `bb_*` glob, here and in the INIT_CKPT case below -- `case` takes the first
+    # match, and a glob that swallowed these would point them at the wrong checkpoint while
+    # the job log still printed the right config name.
+    bb_release_warm)     CONFIG_NAME="${CONFIG_NAME:-example/training_cp2lp_bb_release_warm}";     RUN_NAME="${RUN_NAME:-cp2lp_bb_release_warm}" ;;
+    bb_release_cold)     CONFIG_NAME="${CONFIG_NAME:-example/training_cp2lp_bb_release_cold}";     RUN_NAME="${RUN_NAME:-cp2lp_bb_release_cold}" ;;
     *)           CONFIG_NAME="${CONFIG_NAME:-example/training_cp2lp_gan}";          RUN_NAME="${RUN_NAME:-cp2lp_${ARM}}" ;;
   esac
 
@@ -85,11 +92,23 @@ _cp2lp_defaults() {
   # lpmix pin) -- it is what produces the fork, so it cannot start from it.
   FORK_RUN="${FORK_RUN:-cp2lp_onepass_fork}"
   FORK_CKPT="${FORK_CKPT:-${STORE}/${FORK_RUN}/${FORK_RUN}.ckpt}"
+  # The WARM release arm starts from the TRAINED torsion arm instead of the fork, because
+  # "can this converged solution escape its basin" is a claim about that solution. Raw, not
+  # the `-EMA` sidecar: the EMA copy is evaluation weights, and resuming optimisation from an
+  # averaged shadow would start from a point no optimizer step ever stood on.
+  #
+  # `++pretrain_ckpt_path=${INIT_CKPT}` in cp2lp_train.sbatch is a Hydra override and BEATS
+  # the yaml, so the release configs' own `pretrain_ckpt_path` is documentation and THIS is
+  # the value that runs. `test_preamble_init_ckpt_tracks_the_release_configs` asserts the two
+  # agree, because a disagreement is invisible in the job log.
+  RELEASE_WARM_CKPT="${RELEASE_WARM_CKPT:-${STORE}/cp2lp_bb_torsion/checkpoints/g010300.ckpt}"
   case "${ARM}" in
-    onepass_warmup) INIT_CKPT="${INIT_CKPT:-${FLOW_CKPT}}" ;;
-    onepass_*)      INIT_CKPT="${INIT_CKPT:-${FORK_CKPT}}" ;;
-    bb_*)           INIT_CKPT="${INIT_CKPT:-${FORK_CKPT}}" ;;
-    *)              INIT_CKPT="${INIT_CKPT:-${FLOW_CKPT}}" ;;
+    onepass_warmup)  INIT_CKPT="${INIT_CKPT:-${FLOW_CKPT}}" ;;
+    onepass_*)       INIT_CKPT="${INIT_CKPT:-${FORK_CKPT}}" ;;
+    # BEFORE `bb_*`: `case` takes the first match.
+    bb_release_warm) INIT_CKPT="${INIT_CKPT:-${RELEASE_WARM_CKPT}}" ;;
+    bb_*)            INIT_CKPT="${INIT_CKPT:-${FORK_CKPT}}" ;;
+    *)               INIT_CKPT="${INIT_CKPT:-${FLOW_CKPT}}" ;;
   esac
 
   WANDB_PROJECT="${WANDB_PROJECT:-cpsea_cp2lp}"

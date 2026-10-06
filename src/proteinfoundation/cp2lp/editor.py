@@ -72,6 +72,12 @@ EDITOR_NOISE_KEY = "editor_noise"
 #: this constant exists so the feature class and the sampler cannot drift apart silently.
 DEFAULT_NOISE_CHANNELS = 16
 
+#: Above this column-block RMS, `init_noise_adapter_` treats the noise columns as TRAINED and
+#: leaves them alone instead of re-drawing them. It separates "exactly zero", which is what a
+#: feature-append splice leaves behind, from anything an optimiser produced -- so it sits far
+#: below the 0.02 std of the draw itself and there is no regime where the two are confusable.
+NOISE_ADAPTER_TRAINED_RMS = 1e-8
+
 #: Fixed value for the trunk's time embedding. NOT a sampling time -- see the module
 #: docstring. 0.5 puts the input mid-schedule, which is the region the pretrained trunk
 #: saw most of and the furthest from both degenerate ends (t->1 makes `1/(1-t)` factors in
@@ -287,6 +293,7 @@ def init_noise_adapter_(
     factory: torch.nn.Module,
     std: float = 0.02,
     feature_name: str = "EditorNoiseSeqFeat",
+    preserve_loaded: bool = False,
 ) -> tuple[int, int] | None:
     """Gives the noise block SMALL NONZERO input weights, in place. ``(offset, width)``.
 
@@ -301,6 +308,24 @@ def init_noise_adapter_(
 
     A small draw breaks that ordering without disturbing the pretrained columns, which are
     left exactly as spliced. It must run AFTER the splice; ``train.py`` calls it there.
+
+    ``preserve_loaded`` -- OFF BY DEFAULT, AND THE DEFAULT IS THE HISTORICAL BEHAVIOUR.
+    The paragraph above is an argument about an APPENDED feature, whose columns the splice
+    leaves at exactly zero. Warm-starting from ANOTHER ARM'S OWN checkpoint goes down the
+    same `pretrain_ckpt_path` branch in `train.py`, and there the noise columns are not
+    zero -- they are trained, and are the only thing making the output depend on the random
+    input at all (the torsion arm's `seed_diversity_nm` was 0.241). Re-drawing them makes
+    "warm start from the trained generator" false, so a warm start passes True.
+
+    IT IS NOT THE DEFAULT, and that is deliberate rather than timid. MEASURED: the
+    `cp2lp_onepass_fork` checkpoint every `bb_*` and `onepass_*` arm starts from ALREADY
+    carries trained noise columns (rms 1.980e-02), and every one of those runs re-drew them
+    -- jobs 70458 and 71251 both logged `initialised at columns [315, 331) with std=0.02`.
+    Gating on "are the columns zero" would therefore have silently changed the
+    initialisation of every arm in the repo, including the control that a release arm is
+    compared against, which is a confound introduced by a bug fix. The flag keeps the
+    existing arms bit-identical and gives the new behaviour only to the run that asks for
+    it. Either way the decision is logged, never inferred.
 
     Returns None -- and warns -- if no noise feature is in the list, because that is the
     silent version of "the editor is deterministic and nothing said so".
@@ -319,11 +344,30 @@ def init_noise_adapter_(
                     f"noise columns [{offset}, {offset + width}) fall outside "
                     f"linear_out of width {weight.shape[1]}"
                 )
+            block = weight[:, offset : offset + width]
+            # Trained columns are orders of magnitude above this; spliced-zero columns are
+            # exactly 0.0. The threshold only has to separate "exactly zero" from anything
+            # a real optimiser produced, so it is far below the std of the draw itself.
+            rms = float(block.detach().float().pow(2).mean().sqrt())
+            if preserve_loaded and rms > NOISE_ADAPTER_TRAINED_RMS:
+                logger.info(
+                    f"CP2LP editor: noise adapter columns [{offset}, {offset + width}) of "
+                    f"{weight.shape[1]} already carry trained weights (rms={rms:.3e} > "
+                    f"{NOISE_ADAPTER_TRAINED_RMS:.3e}) -- LEFT AS LOADED, not re-drawn. This "
+                    "is a warm start from a checkpoint that already learned to read its noise."
+                )
+                return offset, width
             with torch.no_grad():
-                weight[:, offset : offset + width].normal_(0.0, float(std))
+                block.normal_(0.0, float(std))
+            # Say which of the two it was. "initialised" reads as harmless, and when the
+            # prior columns were trained this call DISCARDED them -- that is the difference
+            # between a warm start and a re-randomised one, and it has to be visible in the
+            # log of the run it happened to, not reconstructed later from a config.
+            had = "OVERWRITING trained columns" if rms > NOISE_ADAPTER_TRAINED_RMS else "spliced-zero columns"
             logger.info(
                 f"CP2LP editor: noise adapter initialised at columns "
-                f"[{offset}, {offset + width}) of {weight.shape[1]} with std={std}"
+                f"[{offset}, {offset + width}) of {weight.shape[1]} with std={std} "
+                f"-- {had} (prior rms={rms:.3e}, preserve_loaded={preserve_loaded})"
             )
             return offset, width
         offset += width

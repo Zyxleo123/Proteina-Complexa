@@ -1,0 +1,36 @@
+# @package _global_
+# RELEASE ARM, COLD. Preservation off from the start, from the same pinned fork the two
+# backbone arms were launched from.
+#
+# THE DISAMBIGUATOR. It answers the question the warm arm cannot answer alone: if the warm
+# arm stays conservative, is that because a converged solution cannot escape its basin, or
+# because the remaining objective never asked for movement in the first place? This arm never
+# learned the conservative solution, so it has no basin to escape. The two arms share their
+# objective exactly and differ only in `pretrain_ckpt_path`.
+#
+#   warm stays, cold moves      a basin/optimisation problem. The objective is fine; the
+#                               schedule is wrong. Phase B should branch off COLD.
+#   both stay                   the objective never wanted movement. Go to the third branch
+#                               in the shared base's header -- re-specify `open` against the
+#                               measured real distribution. Do NOT read this as "preservation
+#                               was not the explanation".
+#   both move                   preservation was the obstruction, and the result does not
+#                               depend on the init. Strongest form of the plan's branch 1.
+#
+# It is also the arm whose comparison against the FINISHED torsion run is single-variable in
+# the loss: same fork, same everything, `preserve_weight` 1.0 -> 0.0. That pairing is the
+# clean measurement of what preservation was buying and what it was costing.
+#
+# `pretrain_ckpt_path` is inherited from `training_cp2lp_backbone.yaml` rather than restated,
+# so this arm cannot drift from the fork the torsion arm actually used.
+
+defaults:
+  - /example/training_cp2lp_bb_release
+  - _self_
+
+run_name: cp2lp_bb_release_cold
+
+# The pinned fork, restated ONLY because the shared release base sets `???` to force each arm
+# to declare where it starts. Identical to `training_cp2lp_backbone.yaml`'s value -- the
+# submitter asserts the two agree before it submits, so a silent divergence cannot survive.
+pretrain_ckpt_path: /zfsauton/scratch/yixiz/Proteina-Complexa/training_runs/store/cp2lp_onepass_fork/cp2lp_onepass_fork.ckpt

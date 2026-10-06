@@ -220,6 +220,13 @@ class CP2LPGenerator(Proteina):
         self.onepass_t = float(op.get("t_fixed", DEFAULT_EDITOR_T))
         self.onepass_noise_channels = int(op.get("noise_channels", DEFAULT_NOISE_CHANNELS))
         self.onepass_noise_adapter_std = float(op.get("noise_adapter_std", 0.02))
+        # OFF BY DEFAULT = the historical behaviour. `init_noise_adapter_` re-draws the noise
+        # columns on every `pretrain_ckpt_path` load, and the fork checkpoint every arm starts
+        # from already carries TRAINED columns (rms 1.98e-02), so every existing arm re-drew
+        # them. Flipping that globally would have changed the initialisation of the controls
+        # these arms are compared against. A true WARM START from a trained arm sets this to
+        # true; see `configs/example/training_cp2lp_bb_release_warm.yaml`.
+        self.onepass_preserve_loaded_noise = bool(op.get("preserve_loaded_noise_adapter", False))
 
         roll = cfg.get("rollout", None) or {}
         self.cp2lp_nsteps = int(roll.get("nsteps", 24))
@@ -707,7 +714,11 @@ class CP2LPGenerator(Proteina):
             return None
         from proteinfoundation.cp2lp.editor import init_noise_adapter_
 
-        return init_noise_adapter_(self.nn.init_repr_factory, std=self.onepass_noise_adapter_std)
+        return init_noise_adapter_(
+            self.nn.init_repr_factory,
+            std=self.onepass_noise_adapter_std,
+            preserve_loaded=self.onepass_preserve_loaded_noise,
+        )
 
     def _noise_generator(self) -> torch.Generator:
         if self._editor_noise_gen is None:
@@ -1615,6 +1626,27 @@ class CP2LPGenerator(Proteina):
         exists to remove.
         """
         if self.max_g_updates and int(self.g_updates) >= self.max_g_updates:
+            # A WARM START THAT BEGINS AT ITS BUDGET IS A CONFIG ERROR, NOT A FINISHED RUN,
+            # and it has to fail loudly. `g_updates` is a persistent buffer, so it travels
+            # through `pretrain_ckpt_path` even though the optimizer states do not -- a warm
+            # start from a milestone inherits that milestone's count. MEASURED: job 72084
+            # loaded the torsion arm's g=10300 milestone against a budget of 10300, logged
+            # "reached the budget" after ONE step, and EXITED 0 -- which in this project's
+            # Slurm chains releases every `afterok` dependent behind a stage that did no
+            # work. `global_step` distinguishes the two cases: a genuine resume has taken
+            # thousands of steps, a fresh process that trips this has taken ~none.
+            if int(self.global_step) <= 1:
+                raise RuntimeError(
+                    f"CP2LP: this run starts AT OR ABOVE its budget -- g_updates="
+                    f"{int(self.g_updates)} loaded from the checkpoint, max_g_updates="
+                    f"{self.max_g_updates}, global_step={int(self.global_step)}. Nothing "
+                    "would be trained. `g_updates` is a persistent buffer and therefore "
+                    "travels through `pretrain_ckpt_path`, so a warm start inherits the "
+                    "source milestone's count: set `cp2lp.max_g_updates` to that count PLUS "
+                    "the updates you want, and move `cp2lp.eval_checkpoint_g_updates` with "
+                    "it (it is matched by equality, not threshold). See "
+                    "configs/example/training_cp2lp_bb_release_warm.yaml for the arithmetic."
+                )
             if self.trainer is not None and not self.trainer.should_stop:
                 logger.info(
                     f"CP2LP: reached the budget of {self.max_g_updates} generator updates "

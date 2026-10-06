@@ -1,0 +1,137 @@
+# @package _global_
+# SHARED BASE for the two PRESERVATION-RELEASE arms. NOT AN ARM -- nothing launches from
+# this file. Two thin children differ from it by `run_name` and `pretrain_ckpt_path`, which
+# is the entire difference between them:
+#
+#   training_cp2lp_bb_release_warm.yaml   warm start from the TRAINED torsion arm, g=10300
+#   training_cp2lp_bb_release_cold.yaml   cold start from the same pinned fork the arms used
+#
+# It is a child of `training_cp2lp_bb_torsion`, so the representation, the discriminator, the
+# AE, the data split, the anchor, the batch limits, the learning rates and the step budget are
+# the torsion arm's and are not restated here.
+#
+# ----------------------------------------------------------------------------------
+# THE ONE THING THIS CHANGES, AND WHY IT IS WORTH A RUN.
+#
+# `losses.preserve_weight: 0.0`. Nothing else.
+#
+# MEASURED on the finished torsion arm (wandb run 601591a8) at its last gradient probe,
+# g=10300. These are WEIGHTED per-term gradient norms at the arm's head, one backward each:
+#
+#       preserve   3.541
+#       open       1.0e-10   <- the float floor: flat bottom, exactly nothing
+#       steric     1.0e-10   <- the float floor: flat bottom, exactly nothing
+#
+# So preservation was not one of several pulls, it was ESSENTIALLY THE WHOLE non-adversarial
+# gradient. And the edit it produced is `preserve_ca_rmsd_nm` = 0.053, i.e. 0.53 A of CA
+# RMSD -- the near-identity regime the previous generation's export gate was measured to
+# select for. "The generator has learned conservative edits" is a measurement here, not a
+# hypothesis, which is what makes zeroing the term worth a GPU rather than an argument.
+#
+# THE EDIT-SIZE BUDGET IS ALREADY OFF and is left off: `backbone.max_atom_shift_nm` is
+# `null` in `training_cp2lp_backbone.yaml`, so no hard clip is being removed here. The
+# soft edit-size pressure WAS `preserve`, and that is the term going to zero.
+#
+# ----------------------------------------------------------------------------------
+# WHAT STILL CONSTRAINS THE OUTPUT once preservation is gone, because "unconstrained" would
+# be a different and much less interesting experiment:
+#
+#   steric        receptor overlap, per-peptide-residue normalised. Keeps the peptide out of
+#                 the receptor but says nothing about staying near it.
+#   open          terminal-gap hinge, flat above 0.45 nm. See the WARNING below -- it is
+#                 satisfied and contributes no gradient, so it constrains nothing further.
+#   anchor        denoise a corrupted REAL bound LP back to its own backbone THROUGH the
+#                 arm's head. Clean-LP geometry as the target, source-CP condition absent.
+#   adversarial   D over the LP-receptor complex, including the local interface block (top-k
+#                 pocket distances, min heavy-atom distance, soft contact count). This is the
+#                 term that has to keep the peptide BOUND, and it is now the only one that
+#                 does -- which is precisely the question the run answers.
+#
+# The torsion representation keeps bond lengths, bond angles and chain connectivity out of
+# the edit space entirely, so releasing preservation cannot buy movement by severing the
+# chain. That is why this release is being run on THIS arm and not on the Cartesian one,
+# where `chain_intact` was 0.0034.
+#
+# ----------------------------------------------------------------------------------
+# !! REGISTERED PREDICTION, AND THE THIRD BRANCH THE PLAN DOES NOT HAVE. !!
+#
+# MEASURED on the 536 real bound LPs of `store/cp2lp_triplets/real_reference`, through the
+# same AE round trip and the same scoring code the generated peptides go through:
+#
+#       terminal gap, nm     p5 0.858   p25 1.575   p50 2.138   p75 2.300   p95 3.324
+#
+# The torsion arm sits at `terminal_gap_nm` = 0.478. That is BELOW THE 1.3rd PERCENTILE of
+# real openness. And `open`'s threshold, 0.45 nm, is the 1.1st percentile -- it was
+# calibrated as a floor for "not still a ring", never as a target for "realistic LP", and
+# `terminal_opening_reward`'s own docstring says so: it declines to name a target and
+# delegates the real distribution to the adversary.
+#
+# But `d_acc` is REDUNDANT in that column. Measured in the glob probe: holding the terminal
+# gap and Rg columns moved D's accuracy by exactly nothing, 0.9817 -> 0.9817. The gap alone
+# is 0.964-sufficient, so D can read openness and plainly has other tells it prefers.
+#
+# Therefore, once `preserve` is zero, D is the ONLY remaining source of opening pressure,
+# and whether it supplies one is an open empirical question. So the result has three readings
+# and not two:
+#
+#   gap moves toward p50 = 2.14      preservation WAS the obstruction. Proceed to Phase B
+#                                    and ramp the weight back from this checkpoint.
+#   gap stays near 0.5, realism poor D WILL NOT SUPPLY AN OPENING TARGET. This is NOT
+#                                    "preservation was not the explanation" -- the leash came
+#                                    off and there was no destination. The fix is to
+#                                    re-specify `open` against the distribution above, not to
+#                                    abandon the preservation hypothesis.
+#   gap overshoots p95 = 3.32,       the peptide is leaving the pocket. Watch `contacts_kept`
+#   contacts collapse                and D's interface block; note the `far = 3.0` nm clamp
+#                                    in `discriminator.build_features`, beyond which the
+#                                    interface features saturate and the gradient BACK toward
+#                                    the pocket vanishes. A peptide past that clamp cannot be
+#                                    pulled home by D.
+#
+# READ `terminal_gap_nm` AS A DISTRIBUTION AGAINST THE PERCENTILES ABOVE, not against the
+# 0.45 nm threshold. `terminal_open_frac` was already 1.000 on the torsion arm while it sat
+# in the bottom 1.3% of real, so that metric cannot distinguish any of the three branches.
+#
+# ----------------------------------------------------------------------------------
+# NO EXTRA MILESTONE, deliberately, though "does it escape, and how fast" is the question.
+# Both backbone arms were killed mid-checkpoint-write on 2026-10-02 by `OSError: [Errno 122]
+# Disk quota exceeded` while trying to write three milestones across two arms (~39 GB), and
+# these two arms are another ~26 GB. Escape velocity is readable from the STEP METRICS, which
+# log every step -- `preserve_ca_rmsd_nm`, `terminal_gap_nm`, `seed_diversity_nm` -- so it
+# does not need a checkpoint. The milestones exist only to feed the packing eval.
+#
+# Run:
+#   bash scripts/submit_cp2lp_backbone.sh --submit release
+
+defaults:
+  - /example/training_cp2lp_bb_torsion
+  - _self_
+
+run_name: cp2lp_bb_release_base
+
+# SET BY EACH ARM. The arms differ in this and in `run_name`, and in nothing else.
+pretrain_ckpt_path: ???
+
+cp2lp:
+  # ONE MILESTONE, the endpoint, against the torsion arm's two. Not a budget cut for its own
+  # sake: both backbone arms were killed mid-checkpoint-write on 2026-10-02 by
+  # `OSError: [Errno 122] Disk quota exceeded` and lost BOTH the milestone and `last.ckpt`
+  # (0 bytes), so footprint here is a question of whether the run survives at all. Two arms
+  # at two milestones is ~26 GB of milestones plus ~11 GB of rolling `last`; dropping the
+  # mid-point halves the milestone half of that.
+  #
+  # The mid-point is the right thing to drop. This tranche's question -- does the edit grow
+  # and does the opening distribution move -- is answered by STEP METRICS, which log every
+  # step and cost nothing, and `last.ckpt` is still rewritten every 250 steps, so a mid-run
+  # state is recoverable if one is wanted. The milestone exists only to feed the packing eval
+  # and to be Phase B's warm start, and both of those want the ENDPOINT.
+  eval_checkpoint_g_updates: [10300]
+
+  losses:
+    # THE WHOLE EXPERIMENT. Interface-weighted backbone displacement from the source, which
+    # the gradient probe measured at 3.541 against two terms at the float floor.
+    #
+    # The `preserve_*` METRICS keep being logged at weight zero -- `_backbone_losses` computes
+    # the term either way -- so edit size becomes a pure measurement here rather than
+    # disappearing with the objective. That is the quantity Phase B ramps against.
+    preserve_weight: 0.0
