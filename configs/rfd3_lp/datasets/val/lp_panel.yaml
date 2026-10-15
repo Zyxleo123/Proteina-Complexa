@@ -1,0 +1,45 @@
+# In-loop GENERATIVE validation on the 32-complex LP panel.
+#
+# RFD3's validation is a rollout plus design metrics (`AADesignTrainer.validation_step`), not
+# a held-out loss, so this is what "generate some during validation" means here: a contig
+# spec per panel complex, sampled at each validation epoch.
+#
+# It is also the only instrument that can answer the question. Two epochs of training moved
+# exactly one metric -- `Seq Recovery` to 0.988 -- and that measures the model reproducing a
+# sequence our own condition revealed to it, while MSE and lDDT were flat to within 0.0 and
+# 0.08 SE. Generation is what distinguishes "learning the task" from "learning to copy".
+#
+# The specs come from `script_utils/lpgen_build_val_contigs.py`, which puts the peptide IN the
+# contig (so its sequence is given) and names only the receptor in `select_fixed_atoms` (so
+# the peptide's coordinates are generated) -- the same split `LPBinderCondition` applies
+# during training. Two specs per complex, `__fullseq` and `__partialseq`, matching the two
+# training tasks. The panel is held out: its families are in the manifest's `val` split, and
+# `heldout` is reserved separately for the later CP-sequence comparison.
+
+defaults:
+  - design_validation_base
+  - _self_
+
+dataset:
+  # THE POCKET-ORI FILE, not the original. `ori_token` is the coordinate ORIGIN: the prior is
+  # dropped there, so omitting it is not neutral -- rfd3 centres on the fixed motif, i.e. the
+  # receptor centroid, a median 17.8 A from the real site, and the peptide condenses inside
+  # the protein (raw CA RMSD ~21 A at a superposed ~3.1 A: right fold, wrong place). This file
+  # derives the origin from receptor pocket atoms pushed 6 A outward, calibrated to a median
+  # 3.27 A from the native peptide COM. See script_utils/lpgen_build_val_contigs.py.
+  #
+  # NOTE A RESTART BOUNDARY: runs launched before 2026-10-15 validated against
+  # lpgen_val_contigs.json (the receptor-centroid fallback). A resumed run's metrics.csv
+  # therefore switches convention at the restart, and the two halves are NOT comparable.
+  # For one clean curve across checkpoints, use `--submit reval`, which re-scores every saved
+  # checkpoint against this file without retraining.
+  data: /zfsauton/scratch/yixiz/LPData/preprocessed/metadata_lpgen/lpgen_val_contigs_pocket.json
+  name: lp-panel
+
+  # Every 2 epochs, matching the checkpoint cadence, so each saved checkpoint has a
+  # generative measurement attached to it rather than only a training curve.
+  eval_every_n: 2
+
+  # null = all 64 specs. Narrow this if a rollout over the whole panel costs more than the
+  # training it is meant to inform.
+  subset_to_keys: null

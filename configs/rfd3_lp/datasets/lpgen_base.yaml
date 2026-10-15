@@ -1,0 +1,126 @@
+# `datasets` group for the LP arm: design_base with the PDB sources swapped for the manifest.
+#
+# A separate group config rather than an override of `design_base`, because design_base's
+# own defaults pull in `train/pdb/rfd3_train_interface` and `train/pdb/rfd3_train_pn_unit`,
+# which require the PDB and CCD mirrors (atomworks warns `PDB_MIRROR_PATH` / `CCD_MIRROR_PATH`
+# are unset) and a metadata parquet we do not have. Overriding them away afterwards is
+# fiddlier and leaves their filters resolving against absent columns.
+#
+# Validation GENERATES rather than scoring a held-out loss, because that is what RFD3's
+# validation path does and because training loss cannot answer whether the arm works: after
+# two epochs only `Seq Recovery` had moved, and our condition reveals the sequence it
+# measures. See datasets/val/lp_panel.yaml.
+
+defaults:
+  # Our train dataset, in place of the two pdb ones.
+  #
+  # Targeted at `train`, NOT `train.lpgen`: train/lpgen.yaml already nests its body under
+  # an `lpgen:` key (because its own defaults use `base_transform_args@lpgen`), so
+  # addressing `train.lpgen` here produces `train.lpgen.lpgen.dataset` -- which composes
+  # without error and simply never registers a dataset. This matches upstream's
+  # `train/rfd3_monomer_distillation@train`.
+  - train/lpgen@train
+
+  # Conditions. The LP binder condition replaces the stock `ppi` entry and deliberately
+  # keeps the name "ppi" -- five places in rfd3 branch on that literal, including the
+  # full-binder crop. See proteinfoundation/lpgen/rfd3_conditions.py.
+  - conditions/lp_binder@global_transform_args.train_conditions.ppi
+  - conditions/unconditional@global_transform_args.train_conditions.unconditional
+  - conditions/island@global_transform_args.train_conditions.island
+  - conditions/sequence_design@global_transform_args.train_conditions.sequence_design
+  - conditions/tipatom@global_transform_args.train_conditions.tipatom
+
+  # GENERATIVE validation on the held-out LP panel. design_base's own val datasets are
+  # ContigJsonDatasets over benchmark JSONs under an upstream path we do not have; this one
+  # points at the panel specs built from our manifest.
+  - val/lp_panel@val.lp_panel
+
+  - _self_
+
+pipeline_target: rfd3.transforms.pipelines.build_atom14_base_pipeline
+
+# Crop budget. Our complexes are peptide (5-16) plus receptor (up to 1,339), so the great
+# majority exceed any sane crop size and the crop path is exercised constantly -- which is
+# why the binder protection below is not optional.
+diffusion_batch_size_train: 16
+diffusion_batch_size_inference: 8
+crop_size: 384
+max_atoms_in_crop: 3840
+n_recycles_train: 2
+n_recycles_validation: 1
+
+global_transform_args:
+  n_atoms_per_token: 14
+  central_atom: CB
+  sigma_perturb: 2.0
+  sigma_perturb_com: 1.0
+  association_scheme: dense
+  center_option: diffuse
+
+  generate_conformers: True
+  generate_conformers_for_non_protein_only: True
+  provide_reference_conformer_when_unmasked: True
+  ground_truth_conformer_policy: IGNORE
+  provide_elements_for_unindexed_components: True
+  use_element_for_atom_names_of_atomized_tokens: True
+
+  # KEEP THE PEPTIDE WHOLE. design_base ships this False; for an LP arm a cropped peptide
+  # is a corrupted training target, since the peptide IS the thing being generated.
+  keep_full_binder_in_spatial_crop: True
+  # Our peptides are 5-16 tokens, far under the stock 170, so this never excludes them.
+  max_binder_length: 170
+
+  # NO HOTSPOTS. design_base provides receptor hotspots on 75% of PPI examples. At the
+  # eventual inference condition the external input is target plus CP sequence -- no
+  # hotspots -- so training with them would condition the model on information it will not
+  # have, and would also leak where to bind. Set to zero deliberately, not by omission.
+  max_ppi_hotspots_frac_to_provide: 0.0
+  ppi_hotspot_max_distance: 4.5
+
+  max_ss_frac_to_provide: 0.4
+  min_ss_island_len: 1
+  max_ss_island_len: 10
+
+  # Condition mixture. Every LP example is a target-bound binder example, so the LP binder
+  # condition carries the run. Note design_base and pretrain both ship `ppi: frequency: 0.0`,
+  # i.e. binder conditioning DISABLED -- leaving that default would train none of the task.
+  # The others stay at low frequency as regularisers rather than being switched off, which
+  # keeps this closer to the recipe the released weights were trained with.
+  train_conditions:
+    ppi:
+      frequency: 8.0
+    unconditional:
+      frequency: 1.0
+    island:
+      frequency: 0.5
+    sequence_design:
+      frequency: 0.5
+    tipatom:
+      frequency: 0.0
+
+  meta_conditioning_probabilities:
+    # Hydrogen-bond conditioning OFF for the first run, per the plan. It also needs HBPLUS,
+    # which is not installed, so leaving it on would mean an unnecessary dependency.
+    calculate_hbonds: 0.0
+    calculate_rasa: 0.6
+    keep_protein_motif_rasa: 0.1
+    hbond_subsample: 0.0
+
+    # Fully indexed training: the peptide's residue indices are known at inference, so
+    # there is no reason to train unindexed variants for this task.
+    unindex_leak_global_index: 0.0
+    unindex_insert_random_break: 0.0
+    unindex_remove_random_break: 0.0
+
+    add_1d_ss_features: 0.1
+    featurize_plddt: 0.0  # distillation-only; our structures are experimental
+    add_global_is_non_loopy_feature: 0.99
+
+    add_ppi_hotspots: 0.0   # see max_ppi_hotspots_frac_to_provide above
+    # ALWAYS protect the binder, not 75% of the time: a sliced peptide is a corrupted
+    # target for this task, so the stock 0.75 would corrupt a quarter of the examples.
+    full_binder_crop: 1.0
+
+train:
+  lpgen:
+    probability: 1.0

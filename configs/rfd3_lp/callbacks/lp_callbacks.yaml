@@ -1,0 +1,35 @@
+# Callbacks for the LP arm: the training loggers PLUS the validation ones.
+#
+# `design_callbacks` (the stock choice, and what `train.yaml` selects) inherits only
+# `train_logging`, so it carries no validation callback at all. The consequence is quiet and
+# total: `AADesignTrainer.validation_step` computes design metrics and returns them, and
+# metrics leave that function *only* through `on_validation_batch_end` callbacks. With none
+# registered, a validation epoch runs the full rollout over all 64 panel specs, scores
+# everything, and discards it -- `metrics.csv` came back with `train/` columns only, and not
+# one structure was written. The run exits 0 and looks like it validated.
+#
+# `metrics_logging` adds the three that actually record anything:
+#   * StoreValidationMetricsInDFCallback   -> per-example metrics CSV per rank and epoch
+#   * DumpValidationStructuresCallback     -> the generated structures themselves, plus a
+#                                             per-prediction metadata JSON
+#   * LogDesignValidationMetricsCallback   -> aggregate design metrics to the logger
+#
+# The structures are the point: the question this validation exists to answer is whether the
+# model builds a plausible bound peptide for a given sequence, and that is judged by looking
+# at and scoring the output, not by a scalar.
+
+defaults:
+  - design_callbacks
+  - metrics_logging
+  - _self_
+
+# Every example rather than every 4th. The panel is 64 specs and validation runs every 2
+# epochs, so the extra I/O is small against a tranche, and a complete set is what makes the
+# per-checkpoint comparison trustworthy rather than a sample of a sample.
+dump_validation_structures_callback:
+  dump_every_n: 1
+  dump_predictions: True
+  dump_prediction_metadata_json: True
+  # Trajectories are large and answer a different question (how it got there, not what it
+  # produced); leave them off until something specifically needs them.
+  dump_trajectories: False

@@ -1,0 +1,123 @@
+# LP training dataset for RFdiffusion3: the common LP manifest, read directly.
+#
+# Verified on the real stack (probe job 80890): lpgen_manifest.parquet loads as-is, 6/6 and
+# 3/3 with zero failures, and `pn_unit_iid` separates the chains exactly (`A_1` receptor
+# 74-417 residues, `B_1` peptide 5-14, both matching the manifest's own length columns). So
+# RFD3 needs no data conversion -- the per-complex native export is for PPFlow/POTFlow only.
+#
+# Modelled on `train/pdb/rfd3_train_interface.yaml`, the interface (binder) dataset, NOT on
+# `train/rfd3_monomer_distillation.yaml`. Three reasons that matter:
+#
+#   * The distillation template sets `b_factor_min: 70`. That is a pLDDT filter and its data
+#     is AF2 models, where the B-factor column holds pLDDT and higher is better. Ours is
+#     experimental, where that column is crystallographic disorder and lower is better --
+#     and measured over this manifest it splits by source: PepBench is **entirely 0.000**,
+#     ProtFrag is 41.6-121.8. Copying it would silently reject 100% of PepBench, the real
+#     bound-peptide half that carries 24% of every batch, leaving only monomeric fragments.
+#     `base_transform_args` leaves it `null`; keep it that way.
+#   * The distillation template passes `pn_unit_iid_colnames: null`. Measured: with the
+#     columns supplied, the PPI condition accepts 6/6 of our examples; with `null`, 0/3.
+#     `query_pn_unit_iids` is populated only from those named columns and `PPICondition`
+#     refuses any example lacking exactly two -- so `null` silently disables binder
+#     conditioning entirely.
+#   * The distillation template crops contiguously 25% of the time, and the contiguous crop
+#     has no binder protection at all. See the crop note below.
+#
+# Uses the MODERN `PandasDataset(loader=...)` form rather than `StructuralDatasetWrapper`.
+# That class is a deprecated shim even in atomworks 2.2.1 ("Use PandasDataset with the
+# appropriate loader function instead") and 3.x removed it outright, which is exactly what
+# breaks both of RFD3's shipped dataset configs on 3.x. Writing it this way means this
+# config does not inherit that debt. NOTE the loader parameter is `metadata_row_parser`,
+# not `dataset_parser` -- the shim passed it positionally, so the wrong name resolves fine
+# and fails only at first item access.
+
+defaults:
+  - pdb/base_transform_args@lpgen
+  - _self_
+
+lpgen:
+  dataset:
+    _target_: atomworks.ml.datasets.PandasDataset
+    name: lpgen_train
+    id_column: example_id
+    data: /zfsauton/scratch/yixiz/LPData/preprocessed/metadata_lpgen/lpgen_manifest.parquet
+    save_failed_examples_to_dir: ${paths.data.failed_examples_dir}
+
+    # The manifest holds every split; `heldout` is reserved for the later CP-sequence
+    # comparison and must never be trained on.
+    filters:
+      - "split == 'train'"
+
+    columns_to_load:
+      # `split` MUST be here: `filters` below queries it, and columns_to_load is applied
+      # BEFORE the filter, so omitting it fails with KeyError: 'split' at construction.
+      - split
+      - example_id
+      - rfd3_example_id
+      - path
+      - receptor_pn_unit_iid
+      - peptide_pn_unit_iid
+      - receptor_chain_ids
+      - peptide_chain_id
+      - peptide_length
+      - receptor_length
+      - dataset_source
+      - sample_weight
+
+    loader:
+      _target_: atomworks.ml.datasets.parsers.load_example_from_metadata_row
+      _partial_: true
+      metadata_row_parser:
+        _target_: atomworks.ml.datasets.parsers.GenericDFParser
+        # RFD3's logging callbacks parse this with atomworks' own 4-field brace format and
+        # raise on anything else -- in `on_train_batch_start`, i.e. only after the model and
+        # the data path already work. The manifest carries a conforming id in this column;
+        # `example_id` stays this project's primary key everywhere else.
+        example_id_colname: rfd3_example_id
+        path_colname: path
+        # Load-bearing, and these must be the ATOMWORKS pn_unit_iid values (`A_1`, `B_1`),
+        # not bare chain ids. GenericDFParser's docstring says "the CIFUtils pn_unit_iid(s)";
+        # measured, atomworks reports `<chain>_1` for every one of our single-assembly PDBs.
+        # Passing `A`/`B` composes, instantiates and loads without complaint, then fails deep
+        # in the spatial crop with "No crop center found!" because `is_query_pn_unit` matches
+        # nothing. This is what populates `query_pn_unit_iids`, which PPICondition gates on.
+        pn_unit_iid_colnames:
+          - receptor_pn_unit_iid
+          - peptide_pn_unit_iid
+      cif_parser_args:
+        # These are small two-chain PDBs read straight off scratch; a structure cache would
+        # add a copy of the dataset for no gain.
+        cache_dir: null
+        load_from_cache: false
+        save_to_cache: false
+
+    # These belong under `dataset.transform` -- where base_transform_args puts them, and
+    # where rfd3_train_interface.yaml overrides them. Getting the level wrong is quiet:
+    # as a sibling of `transform` it both sets `transform: null`, discarding the whole
+    # inherited transform block, and passes the crop keys to PandasDataset as kwargs.
+    transform:
+      # SPATIAL CROPPING ONLY. The plan requires retaining full peptide chains, and only
+      # the spatial route can do that: `PPIFullBinderCropSpatial` is selected by a
+      # ConditionalRoute (transforms/pipelines.py:227) requiring ALL of
+      #   keep_full_binder_in_spatial_crop AND sampled_condition_name == "ppi"
+      #   AND binder tokens < max_binder_length AND conditions["full_binder_crop"]
+      # The contiguous route (`CropContiguousLikeAF3`) has no binder protection at all, so
+      # any nonzero contiguous probability will sometimes slice the peptide. Our complexes
+      # reach ~1,355 tokens against crop_size, so cropping fires on most examples.
+      crop_contiguous_probability: 0.0
+      crop_spatial_probability: 1.0
+      dna_contact_crop_probability: 0.0
+
+  # PER-ROW SAMPLING WEIGHTS. Without a `weights` (or `sampler`) sibling of `dataset`,
+  # foundry falls back to uniform sampling over rows -- it warns ("No weights or sampler
+  # provided ... using uniform weights with replacement"), but that is one line in a long
+  # log. Uniform over rows is 92% ProtFrag here, against the configured 24% PepBench /
+  # 76% ProtFrag. Verified by drawing through the same WeightedRandomSampler foundry uses:
+  # PepBench is 7.8% of rows and 24.4% of draws.
+  #
+  # NOT `calculate_weights_for_pdb_dataset_df` (what the PDB datasets use): it derives
+  # weights from PDB-specific cluster/composition columns the manifest does not have, and
+  # would recompute a mixture already decided.
+  weights:
+    _target_: proteinfoundation.lpgen.rfd3_sampling.weights_from_column
+    column: sample_weight

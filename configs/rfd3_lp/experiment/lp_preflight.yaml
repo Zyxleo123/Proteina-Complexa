@@ -1,0 +1,67 @@
+# @package _global_
+# GPU preflight for the LP arm: a few real optimizer steps, then stop.
+#
+# This is the plan's step-4 check -- one real minibatch through
+# forward/backward/optimizer-update, a checkpoint written, and peak memory plus step
+# throughput recorded from the same run. It does NOT need the released RFD3 weights:
+# `ckpt_path: null` trains from fresh weights, which still exercises the model build, the
+# data path, the loss and the optimizer. Fine-tuning from the released checkpoint is
+# `experiment=lp_finetune ckpt_path=<file>`.
+#
+# Built on `/debug/default` for two of its properties, not for its sizes:
+#   * `limit_train_batches` / `limit_val_batches` bound the run to a handful of batches;
+#   * `n_fallback_retries: 0` makes a bad example FAIL instead of being silently swapped
+#     for another one. With the production value of 4, a systematically broken subset
+#     disappears into retries and the preflight passes while training on less data than it
+#     claims -- which is exactly how the 1,806 residue-collision structures would have hidden.
+#
+# Its sizes are then put back: `/debug/default` sets `crop_size: 100`,
+# `diffusion_batch_size_train: 1` and `n_recycles_train: 1`, and a peak-memory number taken
+# at those settings tells you nothing about whether a real tranche fits. The point of
+# recording memory is to size the real run.
+
+defaults:
+  - lp_finetune
+  - /debug/default
+  - override /logger: csv
+  - _self_
+
+name: lpgen-rfd3-lp-preflight
+tags: [lpgen, rfd3, lp, preflight]
+task_name: lp_preflight
+ckpt_path: null
+
+datasets:
+  # Restore production geometry so peak memory is the number we actually need.
+  crop_size: 384
+  max_atoms_in_crop: 3840
+  diffusion_batch_size_train: 16
+  n_recycles_train: 2
+
+dataloader:
+  train:
+    dataloader_params:
+      batch_size: 1
+      # Single-threaded so a failing example raises in the main process with a usable
+      # traceback instead of a worker-crash message.
+      num_workers: 0
+      pin_memory: False
+      prefetch_factor: null
+    # The load-bearing part: no silent substitution of failing examples.
+    n_fallback_retries: 0
+
+trainer:
+  devices_per_node: 1
+  # grad_accum_steps is 3, so 12 batches is 4 real optimizer updates -- enough to see a
+  # step time that is not dominated by the first-call warmup.
+  limit_train_batches: 12
+  limit_val_batches: 1
+  # One epoch, and `n_examples_per_epoch` must not exceed what the loader holds.
+  max_epochs: 1
+  n_examples_per_epoch: 12
+  # Write a checkpoint at the end of the single epoch so save/reload can be checked.
+  checkpoint_every_n_epochs: 1
+  validate_every_n_epochs: 1
+  # No validation datasets are wired yet, so there is nothing to prevalidate; leaving this
+  # True (as /debug/default's sibling experiment does) just logs a skip.
+  prevalidate: False

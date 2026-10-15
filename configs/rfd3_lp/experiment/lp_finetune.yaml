@@ -1,0 +1,146 @@
+# @package _global_
+# LP fine-tune experiment for RFdiffusion3.
+#
+# An LP-specific experiment rather than the default PDB pretraining recipe, as the plan
+# requires. Launch (the job script wires the search path and PYTHONPATH):
+#
+#   uv run python models/rfd3/src/rfd3/train.py \
+#       experiment=lp_finetune ckpt_path=<released rfd3 weights> \
+#       hydra.searchpath="[pkg://rfd3.configs,pkg://configs,file://$REPO/configs/rfd3_lp]"
+#
+# INITIALIZATION vs RESUMPTION. `ckpt_path=<file>` builds `CheckpointConfig(path=...)`,
+# whose `reset_optimizer` defaults to False -- but `trainer/rfd3_base.yaml` sets
+# `skip_optimizer_loading: True` and the trainer computes
+# `reset_optimizer = ckpt_config.reset_optimizer or self.skip_optimizer_loading`, so the
+# optimizer IS fresh with the stock trainer config. Two things still carry over and cannot
+# be reset -- `CheckpointConfig`'s own docstring is
+# `TODO: Implement reset_scheduler and reset_ema`:
+#   * the LR schedule position, so check the effective LR on the first logged step before
+#     concluding anything about the data;
+#   * the EMA state.
+#
+# DO NOT bound this run with a small `max_epochs`. Loading a checkpoint does
+# `current_epoch += 1` and then immediately evaluates
+# `if max_epochs is not None and current_epoch >= max_epochs: should_stop = True`
+# (trainers/fabric.py). A released checkpoint from a long pretraining run therefore trips
+# that instantly and the job trains ZERO steps and exits CLEANLY -- indistinguishable from
+# a completed tranche. The stock `max_epochs: 100_000` is left alone for exactly this
+# reason; bound the tranche by wall clock (the SLURM time limit) instead.
+
+defaults:
+  - override /datasets: lpgen_base
+  # `logger` is a config GROUP, so it must be selected here. Writing `logger: csv` as a
+  # top-level value instead sets it to the STRING "csv", and instantiate_loggers then dies
+  # with `'str' object has no attribute 'items'`.
+  # CSV rather than wandb for the first runs: one fewer moving part, and the preflight's
+  # question is whether a step happens at all.
+  - override /logger: csv
+  # Validation callbacks. Without these a validation epoch runs the full rollout, scores it,
+  # and silently discards both the metrics and the structures -- see callbacks/lp_callbacks.
+  - override /callbacks: lp_callbacks
+  - _self_
+
+name: lpgen-rfd3-lp-finetune
+tags: [lpgen, rfd3, lp]
+
+# Fresh weights by default; the launcher passes the released checkpoint for a fine-tune so
+# that initialization is an explicit act rather than a default.
+ckpt_path: null
+
+# EVERY path in the stock `paths` config points at the upstream developers' filesystem:
+# `log_dir: /net/scratch/$USER/...`, `/projects/ml/...`, `/squash/...`,
+# `/net/tukwila/...`. Most are only strings for datasets we do not use and are harmless,
+# but `log_dir` is CREATED at startup, so the stock value aborts the run with
+# `PermissionError: /net`. Override the ones that are actually touched.
+paths:
+  log_dir: /zfsauton/scratch/yixiz/lpgen/rfd3/logs
+
+  data:
+    # Where the transform pipeline dumps examples it could not process. Stock is `null`
+    # (discard). Pointing it somewhere real is the counterpart to `n_fallback_retries: 0`:
+    # a failing example is then both loud and recoverable for inspection.
+    failed_examples_dir: /zfsauton/scratch/yixiz/lpgen/rfd3/failed_examples
+
+    # Also an upstream path; our dataset passes `cache_dir: null` in cif_parser_args, so
+    # nothing should consult this, but leaving a dead path in the config invites a
+    # confusing failure later.
+    cif_cache_dir: null
+
+    # The stock default is /net/tukwila/lschaaf/datahub/... -- an upstream developer's
+    # path that does not exist here. `None` is explicitly supported and means "no cache"
+    # (transforms/pipelines.py:441 "passing None when residue_cache_dir is unset is
+    # intended"), so set it explicitly: a missing directory is treated the same way
+    # silently, which would hide the fact that the cached residue-level features the
+    # upstream recipe supplies are simply absent on this cluster.
+    residue_cache_dir: null
+
+datasets:
+  # Smaller than design_base's 32 so a first run fits a single GPU; the plan allows one
+  # batch-size adjustment, and gradient accumulation carries the effective batch.
+  diffusion_batch_size_train: 16
+
+# OPTIMISATION, after a measured divergence (job 83990, 2026-10-14).
+#
+# The stock recipe is `AF3Scheduler` with `base_lr: 0.0018`, warmup 1000 steps -- AF3's own
+# schedule, for AF3's own batch size. Our effective batch is THREE structures
+# (`dataloader.train.batch_size: 1` x `grad_accum_steps: 3`; note
+# `diffusion_batch_size_train: 16` is the diffusion-sample dimension WITHIN one structure,
+# not 16 independent complexes). At that batch, 1.8e-3 blew the sequence head up ~485 steps
+# into warmup, at an instantaneous LR of ~8.7e-4: Token Lvl Sequence Loss went 1.5-3.4 ->
+# 54 monotonically and Seq Recovery collapsed 0.4-0.8 -> 0.02-0.08, while the structure
+# losses carried on looking healthy. Nothing stopped it, because the stock trainer sets
+# `error_if_grad_nonfinite: false`.
+# NOTE the path: `optimizer` is nested under `model` (model/rfd3_base.yaml does
+# `- optimizers/adam@optimizer`), so a TOP-LEVEL `optimizer:` key here would create a new,
+# unused branch and change nothing -- a silent no-op.
+# THE PATH MUST BE `model.lr_scheduler`. The trainer reads exactly one node:
+#   hydra.utils.instantiate(self.state["train_cfg"].model.lr_scheduler, ...)
+#   -- foundry/trainers/fabric.py, construct_scheduler
+# and `model/rfd3_base.yaml` fills it with `- schedulers/af3@lr_scheduler`.
+#
+# An earlier version of this file set `model.optimizer.lr_scheduler` instead. That path
+# does not exist in the stock config at all -- the patch CREATED it. The resolved config
+# then contained two AF3 scheduler blocks that looked identical apart from `base_lr`, the
+# invented one reading 0.0001 and the real one still 0.0018, and a run launched that way
+# trained at the stock rate. It was caught only by tracing which node the trainer actually
+# instantiates; nothing in the config, the log or the run's behaviour flagged it.
+#
+# The whole block is restated rather than just `base_lr`, because `lr_scheduler` is filled
+# by a defaults-list entry and assigning a partial dict to it REPLACES the node instead of
+# merging -- measured: it resolved to exactly `{base_lr: 0.0001}`, dropping `_target_` and,
+# worse, `warmup_steps`. Losing the warmup would make divergence *more* likely.
+model:
+  lr_scheduler:
+    _target_: foundry.training.schedulers.AF3Scheduler
+    # ~20x below AF3's 1.8e-3, for a batch ~2 orders of magnitude smaller. A starting
+    # value chosen to sit inside the regime that did train (the first ~480 steps, where
+    # the instantaneous LR was below ~9e-4), not a tuned optimum.
+    base_lr: 0.0001
+    warmup_steps: 1000
+    decay_factor: 0.95
+    decay_steps: 50000
+
+trainer:
+  # Fail on a non-finite gradient instead of absorbing it. The stock `false` is why a
+  # blown-up sequence head kept training for another 300 steps and then got checkpointed.
+  error_if_grad_nonfinite: True
+
+  # Effective batch 3 is the root cause, so widen it. Accumulation costs step time, not
+  # memory, and there is room: the preflight ran at 46% of an a6000 with mean GPU
+  # utilisation under 50%. 16 x 1.29 s/batch ~ 21 s/optimizer step.
+  grad_accum_steps: 16
+
+  # An "epoch" is `n_examples_per_epoch` examples, so this is the knob that makes
+  # checkpoint and validation cadence meaningful rather than the dataset size.
+  n_examples_per_epoch: 2400
+  checkpoint_every_n_epochs: 2
+  # Every 2 epochs, aligned with checkpoint_every_n_epochs, so EVERY saved checkpoint has a
+  # generative measurement attached rather than only a training curve. The panel is 64 specs
+  # and a validation pass costs roughly a fifth of an epoch, which is a real but worthwhile
+  # overhead given that the training metrics have already been shown not to answer the
+  # question.
+  validate_every_n_epochs: 2
+  prevalidate: False
+  # bf16 is emulated but functional on the pre-Ampere nodes here (V100 7.14 TFLOP/s,
+  # 2080 Ti 5.25, both faster than fp32), so this needs no change to preflight on legacy.
+  precision: bf16-mixed

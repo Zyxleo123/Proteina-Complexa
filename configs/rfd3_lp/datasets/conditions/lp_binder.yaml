@@ -1,0 +1,48 @@
+# The LP binder training condition.
+#
+# Registered under the group key `ppi` (see datasets/lpgen_base.yaml) and the class keeps
+# `name = "ppi"` deliberately: the literal string is branched on in five places in rfd3 --
+# transforms/pipelines.py:227 (the full-binder crop) and :458, design_transforms.py:589 and
+# :637, hbonds.py:304. A condition under any other name silently skips all five, and the
+# peptide then gets sliced by a generic spatial crop with nothing reported.
+#
+# Importable because the job sets PYTHONPATH=$REPO/src; the class lives in this repository
+# rather than patched into the upstream tree so it stays reviewable.
+_target_: proteinfoundation.lpgen.rfd3_conditions.LPBinderCondition
+
+# Frequency is set by the mixture in datasets/lpgen_base.yaml; this is the fallback.
+frequency: 1.0
+
+# Pin the binder to the peptide instead of stock PPICondition's
+# `np.random.choice(query_pn_unit_iids)`, which would make the RECEPTOR the generated chain
+# on half of all examples. "smaller" is exact for this manifest: measured, the peptide is
+# the smaller protein pn_unit in 6/6 examples and the counts match the manifest's own
+# length columns. `peptide_chain_id` is the cross-check and logs a warning on disagreement.
+selector: smaller
+peptide_chain_id: B
+
+# The plan's two-task mixture:
+#   half the examples reveal the full LP sequence and generate only its geometry;
+#   half reveal a random 80-95% of identities, generating the rest AND the geometry.
+# The revealed fraction is realised by choosing which peptide tokens are motif -- the
+# native token-level mechanism -- because the per-atom knobs
+# (`sample_is_motif_atom_with_fixed_seq`, `sample_fix_motif_coordinates`) are all-or-nothing
+# per-example flips over the whole motif set and so cannot treat receptor and peptide
+# differently.
+#
+# MEASURED CONSEQUENCE OF THIS DOSAGE (2026-10-15), because it is the knob that decides
+# whether the sequence task is learnable at all. Under these values the schedule hides a
+# mean of 0.74 identities per example: 51.4% of examples hide NOTHING, and hidden tokens are
+# 0.54% of all tokens the sequence loss scores (median 121 per example, receptor included --
+# `sequence_valid_mask` excludes only UNK/X/DX/<G>, NOT the positions whose identity we
+# supply). After ~24k examples, accuracy on held-out identities measured 4.95% against a
+# 9.7% "always guess the most common amino acid" prior on the validation panel: chance.
+#
+# So `Seq Recovery` near 1.0 is ~99.5% a copy of an input and is a TRIPWIRE, not a
+# capability -- it is what caught the LR divergence (collapse to 0.02-0.08), and nothing
+# more. Lowering `reveal_frac_min` toward ~0.5 is the lever if the sequence half of the task
+# is meant to work; it is left at 0.80 here because the milestone as written only requires
+# pose-given-sequence, so widening it is a scope decision rather than a fix.
+p_full_sequence: 0.5
+reveal_frac_min: 0.80
+reveal_frac_max: 0.95
