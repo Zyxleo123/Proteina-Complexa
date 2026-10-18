@@ -47,6 +47,7 @@ fi
 echo "Scoring $CKPT"
 echo "  test=$EVAL_TEST_PARQUET n_complexes=${EVAL_N_COMPLEXES:-1000} n_repeat=${EVAL_N_REPEAT:-4}"
 echo "  nsteps=${EVAL_NSTEPS:-inherit(400)} seed=${EVAL_SEED:-0} out=$EVAL_OUT_DIR"
+echo "  seq_cond=${EVAL_SEQ_COND:-off} keep_frac=${EVAL_KEEP_FRAC:-1.0}"
 
 srun "$PY" script_utils/eval_val_gen_testset.py \
   --run-dir "$EVAL_RUN_DIR" \
@@ -57,4 +58,5 @@ srun "$PY" script_utils/eval_val_gen_testset.py \
   ${EVAL_NSTEPS:+--nsteps "$EVAL_NSTEPS"} \
   --seed "${EVAL_SEED:-0}" \
   --rosetta-dump-max "${EVAL_ROSETTA_DUMP_MAX:-128}" \
+  ${EVAL_SEQ_COND:+--seq-cond --keep-frac "${EVAL_KEEP_FRAC:-1.0}"} \
   --out-dir "$EVAL_OUT_DIR"

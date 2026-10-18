@@ -81,6 +81,15 @@ def parse_args() -> argparse.Namespace:
                    help="Max complexes dumped per batch. Set >= batch_size*n_repeat so every sample "
                         "is dumped for Rosetta (batch_size 16 * n_repeat 4 = 64).")
     p.add_argument("--subset-seed", type=int, default=0, help="Seed for the stratified subset draw.")
+    p.add_argument("--seq-cond", action="store_true",
+                   help="Run the SEQUENCE-CONDITIONED pass: reveal the binder's true sequence to the "
+                        "model before integrating ('sequence given, generate the rest'), as "
+                        "val_generation does when seq_cond is enabled. Requires a seq-cond-trained "
+                        "ckpt. Metrics still log under the `val_gen/` prefix (so the aggregator reads "
+                        "them unchanged); adds `val_gen/seq/*` recovery, which the aggregator ignores.")
+    p.add_argument("--keep-frac", type=float, default=1.0,
+                   help="Fraction of the binder sequence revealed under --seq-cond (default 1.0 = the "
+                        "whole sequence). Ignored without --seq-cond.")
     p.add_argument("--device", default="cuda")
     p.add_argument("--dry-run", action="store_true", help="Build the subset, print plan, no GPU.")
     return p.parse_args()
@@ -204,6 +213,12 @@ def main() -> int:
     vg.rosetta_dump_dir = str(dump_dir)
     vg.rosetta_dump_max = args.rosetta_dump_max
     vg.rosetta_auto_submit_every_n_vals = 0  # this driver never submits the sidecar itself
+    if args.seq_cond:
+        # Reveal the true binder sequence before integrating. validation_step_generate suppresses
+        # the Rosetta dump on the seq-cond pass during TRAINING (both passes share one pool there);
+        # this opt-in re-enables it because only the seq-cond pass runs here -- nothing to pollute.
+        vg.seq_cond = {"enabled": True, "keep_frac": args.keep_frac}
+        vg.rosetta_dump_seqcond = True
     if cfg_exp.get("rollout_finetune") is not None:
         cfg_exp.rollout_finetune.enabled = False  # a training term; must not fire in a scoring run
 
@@ -252,7 +267,10 @@ def main() -> int:
             model._eval_gstep = batch_idx  # unique step_dir for this batch's dump
             batch = model.transfer_batch_to_device(batch, device, 0)
             collected.clear()
-            model.validation_step_generate(batch, batch_idx)
+            # prefix stays "val_gen" (not the training default "val_gen_seqcond") so the aggregator
+            # and Rosetta scorer read the same keys they do for the free pass -- only the model's
+            # inputs differ.
+            model.validation_step_generate(batch, batch_idx, seq_cond=args.seq_cond, prefix="val_gen")
             row = {
                 "batch_idx": batch_idx,
                 "ckpt_name": ckpt_path.name,
@@ -260,6 +278,8 @@ def main() -> int:
                 "nsteps": args.nsteps or 400,
                 "seed": args.seed,
                 "n_repeat": args.n_repeat,
+                "seq_cond": bool(args.seq_cond),
+                "keep_frac": (args.keep_frac if args.seq_cond else None),
                 "metrics": dict(collected),
             }
             fh.write(json.dumps(row) + "\n")

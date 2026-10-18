@@ -68,6 +68,19 @@ GUIDANCE_ARMS="${GUIDANCE_ARMS:-0|-|-|-|-|-}"
 # = the full grid, exactly as before. The value is a glob of edits_shard*.jsonl and must
 # word-split into argv, so it is deliberately unquoted at the call site below.
 ABSTAINED_FROM="${ABSTAINED_FROM:-}"
+
+# Restrict the run to an explicit list of example_ids. EXAMPLES is a space-separated list;
+# EXAMPLES_FILE is a newline-separated file (blank lines and `#` comments ignored) written by
+# an upstream selection job, which is how the Stage 0 profile pins WHICH peptides it measured
+# as an artefact rather than as a number recomputed at read time. Unset = every example, as
+# before. An unknown id is FATAL inside sdedit_cyclize.py, not a silent skip.
+EXAMPLES="${EXAMPLES:-}"
+if [[ -n "${EXAMPLES_FILE:-}" ]]; then
+  [[ -f "$EXAMPLES_FILE" ]] || { echo "FATAL: EXAMPLES_FILE not found: $EXAMPLES_FILE"; exit 1; }
+  EXAMPLES="$(grep -v '^[[:space:]]*\(#.*\)\?$' "$EXAMPLES_FILE" | tr '\n' ' ')"
+  [[ -n "${EXAMPLES// /}" ]] || { echo "FATAL: EXAMPLES_FILE is empty: $EXAMPLES_FILE"; exit 1; }
+  echo "examples from ${EXAMPLES_FILE}: $(wc -w <<< "$EXAMPLES") id(s)"
+fi
 if [[ -n "$ABSTAINED_FROM" ]]; then
   # A glob that matches nothing would pass the literal pattern to python and die there with
   # a confusing FileNotFoundError; say so here instead.
@@ -124,6 +137,8 @@ for ARM in ${GUIDANCE_ARMS}; do
     ${GUIDANCE_CB_WINDOW_A:+--guidance-cb-window-A ${GUIDANCE_CB_WINDOW_A}} \
     ${ABSTAINED_FROM:+--abstained-from ${ABSTAINED_FROM}} \
     ${ABSTAINED_FROM:+--abstained-min-rate "${ABSTAINED_MIN_RATE:-1.0}"} \
+    ${EXAMPLES:+--examples ${EXAMPLES}} \
+    ${PROFILE:+--profile} \
     ${PDB_DIR:+--pdb-dir "$PDB_DIR"} \
     ${COMPLEX_DIR:+--complex-pdb-dir "$COMPLEX_DIR"}
 done

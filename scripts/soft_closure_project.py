@@ -73,6 +73,10 @@ ATOMS_FOR_TYPE = {
     "mainchain":  ("N",  "C",  1.33, None,            None),
     "disulfide":  ("SG", "SG", 2.05, ("CYS",),        ("CYS",)),
     "isopeptide": ("NZ", "CG", 1.33, ("LYS",),        ("ASP", "ASN")),
+    # Not a chemistry: the terminal CA pair, used by the corruption-ceiling experiment to
+    # pull the termini APART. Chemistry-independent, so it needs no terminal mutation, and
+    # it is the same CA-CA measure the pre-cyclization gap and the LNR/PepBench medians use.
+    "ca_termini": ("CA", "CA", 3.80, None,            None),
 }
 # Residues to mutate into when the terminal identity does not already support the chemistry.
 MUTATE_TO = {"disulfide": ("CYS", "CYS"), "isopeptide": ("LYS", "ASP")}
@@ -231,10 +235,62 @@ def terminal_cb_A(pep_xyz_A, res_atoms):
 
 
 # ---------------------------------------------------------------------------------------
+# Ring opening. Needed because OpenMM puts the ring bond back on its own: PDBFile and
+# PDBFixer's addMissingAtoms both call Topology.createDisulfideBonds(), which bonds ANY
+# CYS SG pair within ~3 A -- and a CPSea terminal SG-SG sits at 2.05 A. So a "decyclized"
+# disulfide peptide silently stays cyclic, and a pull on its termini then measures how far
+# a closed macrocycle stretches (~8 A) instead of how far an open one can be opened.
+# Head-to-tail and isopeptide linkages are not auto-created (a non-sequential N-C is not a
+# standard bond and NZ-CG is not one amber14 builds), so only disulfide was affected -- by
+# accident, not by design.
+# ---------------------------------------------------------------------------------------
+def terminal_bonds(topology, pep_chain_id):
+    """Bonds joining the peptide's FIRST and LAST residue -- i.e. the ring bond, whatever
+    its chemistry. Returns a list of (bond, atom1, atom2)."""
+    chain = next((c for c in topology.chains() if c.id == pep_chain_id), None)
+    if chain is None:
+        return []
+    residues = list(chain.residues())
+    if len(residues) < 3:
+        return []
+    first, last = residues[0].index, residues[-1].index
+    found = []
+    for bond in topology.bonds():
+        a, b = bond[0], bond[1]
+        ri, rj = a.residue.index, b.residue.index
+        if {ri, rj} == {first, last}:
+            found.append((bond, a, b))
+    return found
+
+
+def break_ring_bond(topology, pep_chain_id):
+    """Removes the first<->last residue bond(s) in place. Returns what was removed.
+
+    Mutates Topology._bonds because Topology exposes no bond removal. Every consumer reads
+    bonds through topology.bonds(), which iterates that list, so filtering it is what
+    "delete a bond" means here.
+    """
+    victims = terminal_bonds(topology, pep_chain_id)
+    if not victims:
+        return []
+    drop = {id(b) for b, _, _ in victims}
+    topology._bonds = [b for b in topology._bonds if id(b) not in drop]
+    return [f"{a.residue.name}{a.residue.id}:{a.name}-{b.residue.name}{b.residue.id}:{b.name}"
+            for _, a, b in victims]
+
+
+# ---------------------------------------------------------------------------------------
 # System preparation.
 # ---------------------------------------------------------------------------------------
-def prepare_complex(pdb_path: Path, mutations: list[str] | None, pep_chain: str):
+def prepare_complex(pdb_path: Path, mutations: list[str] | None, pep_chain: str,
+                    break_ring: bool = False):
     """PDBFixer-prepared complex. `mutations` are PDBFixer specs ("ALA-3-CYS") on `pep_chain`.
+
+    `break_ring=True` (default False, so the closure path is unchanged) opens the ring by
+    deleting the first<->last residue bond. It has to happen AFTER addMissingAtoms, which
+    rebuilds the topology and re-runs createDisulfideBonds, and BEFORE addMissingHydrogens,
+    so that a cysteine freed from its disulfide gets its HG built and matches the CYS
+    template rather than CYX. Returns (fixer, n_added, removed_bond_descriptions).
 
     `missingResidues` is cleared on purpose: a staged LNR PDB carries no SEQRES, so anything
     PDBFixer "finds" there would be invented loop, and a rebuilt receptor loop would silently
@@ -254,8 +310,9 @@ def prepare_complex(pdb_path: Path, mutations: list[str] | None, pep_chain: str)
     fixer.findMissingAtoms()
     n_added = sum(len(v) for v in fixer.missingAtoms.values()) + len(fixer.missingTerminals)
     fixer.addMissingAtoms()
+    removed = break_ring_bond(fixer.topology, pep_chain) if break_ring else []
     fixer.addMissingHydrogens(7.0)
-    return fixer, n_added
+    return fixer, n_added, removed
 
 
 def index_maps(topology):
@@ -650,11 +707,11 @@ def main() -> None:
             # Prepared ONCE per example. Every replica shares this topology, this frozen
             # receptor and these contact restraints; only the starting coordinates differ.
             t_prep = time.time()
-            probe, n_added = prepare_complex(src, None, "B")
+            probe, n_added, _ = prepare_complex(src, None, "B")
             muts = mutations_for(args.cyc_type, probe.topology)
             if muts:
                 print(f"  {example_id}: mutating termini for {args.cyc_type}: {muts}", flush=True)
-                fixer, n_added = prepare_complex(src, muts, "B")
+                fixer, n_added, _ = prepare_complex(src, muts, "B")
             else:
                 fixer = probe
             ref = reference_state(fixer)

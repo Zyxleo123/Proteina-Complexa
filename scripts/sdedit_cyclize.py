@@ -327,6 +327,40 @@ def load_abstained_cells(paths, min_rate: float) -> dict:
     return rates, kept
 
 
+_T_IMPORT = time.time()  # process start, near enough: nothing heavy runs before this module
+
+
+def _profile_begin(args):
+    """Returns the start time for one edit, or None when --profile is off.
+
+    Resetting the CUDA peak counter here is what makes the reported peak PER EDIT rather than
+    a running maximum over the whole shard -- without it the first large pocket would set a
+    high-water mark that every later row inherits, and the small/large comparison the Stage 0
+    profile exists to make would read as flat.
+    """
+    if not args.profile:
+        return None
+    if args.device.startswith("cuda") and torch.cuda.is_available():
+        torch.cuda.synchronize()
+        torch.cuda.reset_peak_memory_stats()
+    return time.time()
+
+
+def _profile_end(args, t0):
+    """Cost columns for one edit, or {} when --profile is off."""
+    if t0 is None:
+        return {}
+    out = {}
+    if args.device.startswith("cuda") and torch.cuda.is_available():
+        # Synchronize BEFORE reading the clock: the sampler's last kernels may still be in
+        # flight, and an unsynchronized stop would bill their time to the next edit.
+        torch.cuda.synchronize()
+        out["prof/peak_gpu_alloc_MB"] = round(torch.cuda.max_memory_allocated() / 2**20, 1)
+        out["prof/peak_gpu_reserved_MB"] = round(torch.cuda.max_memory_reserved() / 2**20, 1)
+    out["prof/gen_seconds"] = round(time.time() - t0, 3)
+    return out
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--ckpt-path", required=True)
@@ -378,6 +412,13 @@ def main() -> None:
     ap.add_argument("--shard-index", type=int, default=0)
     ap.add_argument("--shard-count", type=int, default=1)
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    ap.add_argument("--profile", action="store_true",
+                    help="Stamp per-edit cost on each row: prof/gen_seconds and the CUDA peak "
+                         "allocated/reserved bytes for THAT edit (the allocator's peak counter "
+                         "is reset per edit, so the number is not a running maximum over the "
+                         "shard). Off by default -- resetting peak stats mid-run would corrupt "
+                         "any other reading of them, and the rows carry no cost columns without "
+                         "it, so an existing run resumes byte-identical.")
     add_guidance_args(ap)
     add_graft_args(ap)
     ap.add_argument("--dry-run", action="store_true",
@@ -527,6 +568,7 @@ def main() -> None:
                              "(the input complex PDB); this parquet has none.")
 
     n_done = n_fail = 0
+    prof_secs = []
     t_wall = time.time()
     with out_path.open("a") as fh:
         for idx in my_indices:
@@ -584,6 +626,7 @@ def main() -> None:
                                 run_key += f"|{gtag}"
                             if run_key in done:
                                 continue
+                            prof_t0 = _profile_begin(args)
                             try:
                                 row = run_one(model, base_batch, mask, cyc_name, type_idx,
                                               t_ca, t_lat, seed, nsteps, self_cond,
@@ -605,7 +648,12 @@ def main() -> None:
                                 continue
                             row.update(run_key=run_key, example_id=example_id, status="ok",
                                        cyc_type=cyc_name, t_ca_start=t_ca, t_lat_start=t_lat, seed=seed)
-                            for col in ("peptide_length", "nc_gap_angstrom", "best_ss_cb_dist",
+                            prof_row = _profile_end(args, prof_t0)
+                            row.update(prof_row)
+                            if "prof/gen_seconds" in prof_row:
+                                prof_secs.append(prof_row["prof/gen_seconds"])
+                            for col in ("peptide_length", "receptor_length", "nc_gap_angstrom",
+                                        "best_ss_cb_dist",
                                         "best_iso_cb_dist", "n_cys"):
                                 if col in meta.columns:
                                     v = meta.iloc[idx][col]
@@ -617,6 +665,22 @@ def main() -> None:
                                 print(f"  {n_done} edits ({time.time() - t_wall:.0f}s)", flush=True)
 
     print(f"done: {n_done} edits, {n_fail} failed, {time.time() - t_wall:.0f}s", flush=True)
+
+    if args.profile:
+        # Setup is billed separately on purpose. It is paid once per JOB (imports, 2.9 GB flow
+        # checkpoint + 4.1 GB AE off ZFS, dataset build), so extrapolating a tranche from a
+        # per-structure figure that has setup smeared into it overstates the cost by more the
+        # more structures each job does. Both numbers are needed to size Stage 1 honestly.
+        total = time.time() - _T_IMPORT
+        gen = sum(prof_secs)
+        print("PROFILE_SUMMARY " + json.dumps({
+            "n_edits": n_done, "n_failed": n_fail,
+            "process_seconds": round(total, 1),
+            "generation_seconds": round(gen, 1),
+            "setup_seconds": round(total - gen, 1),
+            "mean_gen_seconds": round(gen / n_done, 3) if n_done else None,
+            "resumed_rows": len(done),
+        }), flush=True)
 
     # Per-edit failures are caught and written as rows, so without this the script exits 0
     # even when EVERY edit failed -- which is how a smoke run whose 2/2 edits died on the

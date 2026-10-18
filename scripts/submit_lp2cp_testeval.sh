@@ -45,9 +45,26 @@ N_COMPLEXES="${N_COMPLEXES:-1000}"
 N_REPEAT="${N_REPEAT:-4}"
 EVAL_NSTEPS="${EVAL_NSTEPS:-}"
 SEED="${SEED:-0}"
+# SEQ_COND=1 reveals the binder's true sequence to the model before sampling ("sequence given,
+# generate the rest") -- for a seq-cond-trained ckpt (e.g. cpsea_seqcond_v2). KEEP_FRAC is the
+# fraction revealed (1.0 = whole sequence). Empty SEQ_COND => the free/unconditioned pass.
+SEQ_COND="${SEQ_COND:-}"
+KEEP_FRAC="${KEEP_FRAC:-1.0}"
 OUT_DIR="${OUT_DIR:-evaluation_results/lp2cp_testeval/$RUN_BASE}"
-SHARD_COUNT="${SHARD_COUNT:-16}"
+# SLURM counts each array TASK against the QOS per-user submit cap, so a wide array + your existing
+# jobs can trip QOSMaxSubmitJobPerUserLimit. 4 shards keep the Rosetta stage under ~2.4 h and cost
+# only 4 pending jobs. Raise if your cap is generous.
+SHARD_COUNT="${SHARD_COUNT:-4}"
 ROSETTA_DUMP_MAX="${ROSETTA_DUMP_MAX:-128}"
+
+# STAGE selects which jobs to submit, so a run that half-submitted (e.g. GPU landed but the Rosetta
+# array hit the submit cap) can be finished without re-queuing the GPU:
+#   all   (default)  GPU + Rosetta array + aggregate
+#   gpu              GPU only
+#   post             Rosetta array + aggregate only. Chains on GPU_JID (afterok) if set; otherwise
+#                    runs with NO dependency, assuming the dump already exists on disk.
+STAGE="${STAGE:-all}"
+GPU_JID="${GPU_JID:-}"
 
 GPU_PARTITION="${GPU_PARTITION:-general}"
 GPU_QOS="${GPU_QOS:-qos_general}"
@@ -111,6 +128,8 @@ GPU_ENV=".slurm_envs/lp2cp_testeval_gpu_${STAMP}_$$.env"
   printf 'EVAL_SEED=%q\n'             "$SEED"
   printf 'EVAL_OUT_DIR=%q\n'          "$OUT_DIR"
   printf 'EVAL_ROSETTA_DUMP_MAX=%q\n' "$ROSETTA_DUMP_MAX"
+  printf 'EVAL_SEQ_COND=%q\n'         "$SEQ_COND"
+  printf 'EVAL_KEEP_FRAC=%q\n'        "$KEEP_FRAC"
 } > "$GPU_ENV"
 
 # ---- Stage 2 env (Rosetta array) ---------------------------------------------------------------
@@ -140,31 +159,54 @@ echo
 echo "Plan:"
 echo "  ckpt:        ${EVAL_CKPT_PATH:-$RUN_DIR/checkpoints/last-EMA.ckpt}"
 echo "  test:        $TEST_PARQUET  (n_complexes=$N_COMPLEXES, n_repeat=$N_REPEAT, nsteps=${EVAL_NSTEPS:-inherit-400})"
+if [[ -n "$SEQ_COND" ]]; then echo "  seq_cond:    on (keep_frac=$KEEP_FRAC)"; else echo "  seq_cond:    off (free/unconditioned pass)"; fi
 echo "  out:         $OUT_DIR"
 echo "  rosetta:     $SHARD_COUNT shards -> $ROSETTA_OUT_DIR"
 
+echo "  stage:       $STAGE${GPU_JID:+  (GPU_JID=$GPU_JID)}"
+
 if [[ -n "${DRY_RUN:-}" ]]; then
-  echo "DRY_RUN -- would submit:"
-  echo "  sbatch ${GPU_SB[*]} scripts/lp2cp_testeval_gpu.sbatch $GPU_ENV"
-  echo "  sbatch --dependency=afterok:<gpu> ${ROS_SB[*]} scripts/lp2cp_testeval_rosetta.sbatch $ROS_ENV"
-  echo "  sbatch --dependency=afterok:<ros> ${AGG_SB[*]} scripts/lp2cp_testeval_aggregate.sbatch $AGG_ENV"
+  echo "DRY_RUN -- would submit (stage=$STAGE):"
+  [[ "$STAGE" == all || "$STAGE" == gpu ]] && \
+    echo "  sbatch ${GPU_SB[*]} scripts/lp2cp_testeval_gpu.sbatch $GPU_ENV"
+  [[ "$STAGE" == all || "$STAGE" == post ]] && {
+    echo "  sbatch [--dependency=afterok:<gpu>] ${ROS_SB[*]} scripts/lp2cp_testeval_rosetta.sbatch $ROS_ENV"
+    echo "  sbatch --dependency=afterok:<ros> ${AGG_SB[*]} scripts/lp2cp_testeval_aggregate.sbatch $AGG_ENV"
+  }
   exit 0
 fi
 
-# Scrub SLURM_* so a submit from inside an allocation does not trigger user-env retrieval.
-GPU_JID="$(env $(compgen -v | grep '^SLURM_' | sed 's/^/-u /') \
-  sbatch --parsable "${GPU_SB[@]}" scripts/lp2cp_testeval_gpu.sbatch "$GPU_ENV")"
-echo "submitted GPU stage -> job $GPU_JID"
+# env-scrub prefix: strip SLURM_* so a submit from inside an allocation does not trigger user-env
+# retrieval (requeue-hold). Also disable `set -e` around each sbatch so one hitting a QOS submit cap
+# reports and leaves already-submitted jobs intact, instead of aborting the whole chain silently.
+_scrub() { env $(compgen -v | grep '^SLURM_' | sed 's/^/-u /') "$@"; }
 
-ROS_JID="$(env $(compgen -v | grep '^SLURM_' | sed 's/^/-u /') \
-  sbatch --parsable --dependency="afterok:$GPU_JID" "${ROS_SB[@]}" \
-  scripts/lp2cp_testeval_rosetta.sbatch "$ROS_ENV")"
-echo "submitted Rosetta array -> job $ROS_JID (afterok:$GPU_JID)"
+if [[ "$STAGE" == all || "$STAGE" == gpu ]]; then
+  if GPU_JID="$(_scrub sbatch --parsable "${GPU_SB[@]}" scripts/lp2cp_testeval_gpu.sbatch "$GPU_ENV")"; then
+    echo "submitted GPU stage -> job $GPU_JID"
+  else
+    echo "FATAL: GPU stage submit failed."; exit 1
+  fi
+fi
+[[ "$STAGE" == gpu ]] && { echo "stage=gpu: done. Run STAGE=post GPU_JID=$GPU_JID $0 for the rest."; exit 0; }
 
-AGG_JID="$(env $(compgen -v | grep '^SLURM_' | sed 's/^/-u /') \
-  sbatch --parsable --dependency="afterok:$ROS_JID" "${AGG_SB[@]}" \
-  scripts/lp2cp_testeval_aggregate.sbatch "$AGG_ENV")"
-echo "submitted aggregate -> job $AGG_JID (afterok:$ROS_JID)"
+# Rosetta array: chain on the GPU job when we have its id, else submit unchained (dump already on disk).
+ROS_DEP=(); [[ -n "$GPU_JID" ]] && ROS_DEP=( --dependency="afterok:$GPU_JID" )
+if ROS_JID="$(_scrub sbatch --parsable "${ROS_DEP[@]}" "${ROS_SB[@]}" scripts/lp2cp_testeval_rosetta.sbatch "$ROS_ENV")"; then
+  echo "submitted Rosetta array -> job $ROS_JID (${GPU_JID:+afterok:$GPU_JID}${GPU_JID:-no dependency})"
+else
+  echo "ERROR: Rosetta array submit failed (QOS submit cap? try a smaller SHARD_COUNT, or wait for"
+  echo "       queued jobs to drain and re-run: STAGE=post GPU_JID=${GPU_JID:-<gpu job>} $0)"
+  exit 1
+fi
+
+if AGG_JID="$(_scrub sbatch --parsable --dependency="afterok:$ROS_JID" "${AGG_SB[@]}" scripts/lp2cp_testeval_aggregate.sbatch "$AGG_ENV")"; then
+  echo "submitted aggregate -> job $AGG_JID (afterok:$ROS_JID)"
+else
+  echo "ERROR: aggregate submit failed. The dG rows will still be on disk; aggregate by hand:"
+  echo "       .venv/bin/python script_utils/aggregate_lp2cp_testeval.py --out-dir $OUT_DIR"
+  exit 1
+fi
 echo
 echo "Results land in $OUT_DIR/summary.json and $OUT_DIR/summary.png"
 echo "Re-aggregate any time (no GPU): .venv/bin/python script_utils/aggregate_lp2cp_testeval.py --out-dir $OUT_DIR"
