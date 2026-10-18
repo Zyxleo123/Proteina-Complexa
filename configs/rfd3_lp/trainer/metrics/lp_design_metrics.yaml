@@ -1,0 +1,56 @@
+# Design metrics PLUS the PPI hotspot metric.
+#
+# `PPIMetrics` (rfd3/metrics/design_metrics.py:382) computes `fraction_hotspots_contacted`
+# -- the fraction of the hotspots that were REQUESTED for which some diffused (peptide) atom
+# ends up within the cutoff. That is precisely the hotspot-retention score this arm exists to
+# move, and it is the only metric here that can distinguish "built a peptide" from "built a
+# peptide where it was asked to".
+#
+# IT IS DEAD CODE UPSTREAM. The class is defined and never instantiated: a search of the
+# whole foundry tree finds `PPIMetrics` only at its own definition, in no yaml and in no
+# `_target_`. `trainer/metrics/design_metrics.yaml` registers general / backbone / sidechain
+# / metadata / hbond and stops. So the metric has, as far as can be told from the tree, never
+# been run -- which is the reason for the two notes below rather than a clean inheritance.
+#
+# NOTE 1 -- IT SCORES ONLY EXAMPLES THAT CARRY A REQUEST. `compute` does
+# `if ppi_hotspots_mask.sum() == 0: continue`, and returns `{}` when nothing survives. So on
+# a validation panel with no hotspots the metric contributes NO COLUMN AT ALL rather than a
+# zero: an absent `ppi_metrics.fraction_hotspots_contacted` means "nothing was asked", not
+# "nothing was retained". Do not read its absence as a failure, and do not average it across
+# arms that differ in how many specs carry hotspots.
+#
+# NOTE 2 -- THE DENOMINATOR IS THE REQUEST, NOT THE INTERFACE. It is the fraction of
+# PROVIDED hotspots that got contacted, and the provided set is a random subsample of the
+# ground-truth interface (uniform on [0, ceil(n*frac)-1], see datasets/lpgen_hotspot.yaml).
+# A number near 1.0 therefore means "the few atoms we named were touched", NOT "the native
+# interface was reproduced". The interface-recovery question is a different measurement.
+#
+# NOTE 3 -- AND THIS IS WHY `PPIMetrics` IS NOT THE THING REGISTERED BELOW. Upstream's
+# version reports a hard 0.0 on every spec of a SEQUENCE-GIVEN panel, silently. It counts
+# contacts only to `~get_motif_features(atom_array)["is_motif_atom"]`, and
+# `is_motif_atom = is_fixed | is_sequence_fixed | is_unindexed` -- so on this panel, where the
+# peptide's sequence is supplied and only its coordinates are generated, BOTH chains are
+# motif, the diffused set is empty, and `np.any` over an empty axis is all-False. Verified:
+# `np.any(np.zeros((7,0), bool), axis=1).mean() == 0.0`.
+#
+# A flat 0.0 is indistinguishable from a model that never obeys the hotspot channel, which is
+# precisely the hypothesis this arm tests -- so the arm would have been failed by its own
+# instrument. `proteinfoundation.lpgen.rfd3_metrics.LPHotspotMetrics` defines the generated
+# set as `~is_motif_atom_with_fixed_coord` instead (coordinates generated, regardless of
+# whether the sequence was given) and additionally reports the CONTINUOUS distances, without
+# which the decoy arm has a floor at 0.0 and cannot distinguish "ignored the request" from
+# "moved toward it and fell short".
+#
+# Importable because the jobs set PYTHONPATH=$REPO/src; it lives in this repository rather
+# than patched into the upstream tree so it stays reviewable.
+#
+# The cutoff must match the conditioning cutoff in datasets/lpgen_hotspot.yaml
+# (`ppi_hotspot_max_distance`), or an obedient model is graded short. Both are 4.5 A.
+
+defaults:
+  - design_metrics
+  - _self_
+
+ppi_metrics:
+  _target_: proteinfoundation.lpgen.rfd3_metrics.LPHotspotMetrics
+  distance_cutoff: 4.5

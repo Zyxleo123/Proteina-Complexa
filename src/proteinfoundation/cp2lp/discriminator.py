@@ -33,6 +33,8 @@ is shown, exactly like a generated one.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -481,3 +483,66 @@ def discriminator_accuracy(real_logits: torch.Tensor, fake_logits: torch.Tensor)
     """Fraction of examples the discriminator sides correctly on. 0.5 is chance."""
     correct = (real_logits > 0).float().sum() + (fake_logits <= 0).float().sum()
     return float(correct / (real_logits.numel() + fake_logits.numel()))
+
+
+#: Column meanings of the `glob` block built by :meth:`CP2LPDiscriminator.build_features`,
+#: in order. Named because the openness pair (0, 1) is the subject of the glob-dependence
+#: probe and a positional literal in a probe script would silently survive a reordering.
+GLOB_COLUMNS = ("terminal_gap_nm", "radius_of_gyration_nm", "contact_count", "mean_min_heavy_nm")
+#: The two columns that measure *how open the peptide is*. Real bound LPs sit near 2.14 nm
+#: terminal separation and the arms reach 1.0-1.25, so these carry the one deficit the task
+#: has not closed -- and `probe_forward` deliberately excludes them (`glob[:, 2:]`), so the
+#: shortcut probe is blind to them by construction.
+GLOB_OPENNESS_COLS = (0, 1)
+#: The two columns that measure *how tightly the peptide is pressed into the pocket*. These
+#: were never held out by the original probe, which tested (0, 1) and found an exact null --
+#: so they are where D's tell must live if it lives in `glob` at all.
+#:
+#: `contact_count` is the suspect, and the reason is its SHAPE: it rewards closeness
+#: monotonically with no upper bound and no overlap penalty, while `backbone_steric_loss` is
+#: the only term opposing it. Measured on the release arms, the packed backbones sit at a
+#: median 1.23-1.65 A from receptor heavy atoms against a zero-edit source baseline's 2.70 A
+#: and real bound LPs' 2.62 A, so something is paying the generator to interpenetrate. If
+#: holding this column collapses `d_acc`, the adversarial term is that something, and no
+#: amount of steric weight is the clean fix.
+GLOB_INTERFACE_COLS = (2, 3)
+
+
+@torch.no_grad()
+def glob_ablated_pair(
+    real_feats: dict[str, torch.Tensor],
+    fake_feats: dict[str, torch.Tensor],
+    cols: Sequence[int],
+) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor], torch.Tensor]:
+    """Hold `glob[:, cols]` at ONE shared constant across both classes.
+
+    Returns ``(real_ablated, fake_ablated, fill)`` as shallow copies -- the other feature
+    blocks are shared, not cloned, so this is cheap enough to call per discriminator step.
+
+    Two properties this API exists to enforce, both of which are easy to get wrong by hand:
+
+    * **The fill is pooled over real AND fake.** A per-class median would replace a
+      continuous separator with a *categorical* one -- each class pinned to its own
+      constant is a PERFECT separator, so a bug there reads as "D does not depend on these
+      columns" while having strengthened the signal. The fill is therefore computed once,
+      over the concatenation, and applied to both.
+    * **The columns are held, not dropped.** `glob` reaches the head as a raw
+      concatenation (``forward``: ``parts = [masked_mean, masked_max, glob]``), so removing
+      a column would shift every later column onto the wrong head weight and measure a
+      re-binding rather than an ablation. Holding removes the information and nothing else.
+
+    Note the asymmetry when reading the result. `glob` enters only the HEAD, while the
+    trunk still sees `geom` (CA-CA at offsets 1-3, `d_centroid`, `is_first`, `is_last`) and
+    `iface`, from which an openness proxy is partly recoverable. So a collapse in accuracy
+    PROVES dependence, and a null does NOT prove independence -- it bounds it from below.
+    """
+    idx = torch.as_tensor(list(cols), dtype=torch.long, device=real_feats["glob"].device)
+    pooled = torch.cat([real_feats["glob"][:, idx], fake_feats["glob"][:, idx]], dim=0)
+    fill = pooled.median(dim=0).values  # [len(cols)]
+
+    out = []
+    for feats in (real_feats, fake_feats):
+        glob = feats["glob"].clone()
+        glob[:, idx] = fill.to(glob.dtype)
+        out.append({**feats, "glob": glob})
+    return out[0], out[1], fill

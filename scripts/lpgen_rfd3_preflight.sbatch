@@ -65,6 +65,25 @@ MEMLOG="${RUN_DIR}/gpu_mem.csv"
 SAMPLER=$!
 trap 'kill $SAMPLER 2>/dev/null || true' EXIT
 
+# ------------------------------------------------------------ checkpoint retention
+# THE PREFLIGHT IS WHERE THIS BIT HARDEST. `lp_preflight` sets
+# checkpoint_every_n_epochs: 1 so that a one-epoch run still proves save/reload works --
+# correct for max_epochs: 1, catastrophic the moment someone soak-tests with
+# `EXTRA_PREFLIGHT_ARGS=trainer.max_epochs=999`. That is exactly what happened: 20
+# checkpoints, 26 GB, in 55 minutes. Keep the cadence (it is what makes a 1-epoch
+# preflight meaningful) and bound what survives instead. No milestone ladder here --
+# a smoke test has no epoch anyone will want to re-sample, only the last one.
+PRUNE_LOG="${RUN_DIR}/ckpt_prune.log"   # NOT in ckpt/: see lpgen_prune_ckpts.py's trap 1
+prune_ckpts() {
+  "$PY" -I "${REPO}/script_utils/lpgen_prune_ckpts.py" \
+    --ckpt-dir "${RUN_DIR}/ckpt" --keep-newest 1 --keep-every 0 >> "$PRUNE_LOG" 2>&1 || true
+}
+if [[ "${CKPT_PRUNE_INTERVAL_SEC}" -gt 0 ]]; then
+  ( while true; do sleep "${CKPT_PRUNE_INTERVAL_SEC}"; prune_ckpts; done ) &
+  PRUNER=$!
+  trap 'kill $SAMPLER $PRUNER 2>/dev/null || true' EXIT
+fi
+
 # Fragmentation is a real factor here: the first OOM reported 4.70 GiB "reserved by
 # PyTorch but unallocated" against 1.18 GiB free, and torch's own message recommends this.
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
@@ -80,7 +99,8 @@ set +e
   ${EXTRA_PREFLIGHT_ARGS:-} 2>&1 | tee "${RUN_DIR}/train.log"
 RC=${PIPESTATUS[0]}
 set -e
-kill $SAMPLER 2>/dev/null || true
+# ${PRUNER:-} because the in-job sweep is optional and this runs under `set -u`.
+kill $SAMPLER ${PRUNER:-} 2>/dev/null || true
 
 echo "=================================================================="
 echo "[preflight] train.py exit code: ${RC}"
@@ -121,7 +141,10 @@ if grep -q 'Loading checkpoint from' "$LOGF" 2>/dev/null; then
   fi
 fi
 
-echo "[preflight] checkpoints written:"
+# Final sweep: a soak preflight would otherwise leave tens of GB behind for a result
+# that is "the build works". The newest is always kept, so save/reload stays checkable.
+prune_ckpts
+echo "[preflight] checkpoints written (after retention sweep, see ${PRUNE_LOG}):"
 find "$RUN_DIR" -name '*.ckpt' -o -name '*.pt' 2>/dev/null | head -10 || true
 echo "[preflight] run dir: $RUN_DIR"
 exit "$RC"

@@ -118,6 +118,30 @@ MEMLOG="${RUN_DIR}/gpu_mem_${SLURM_JOB_ID:-local}.csv"
 SAMPLER=$!
 trap 'kill $SAMPLER 2>/dev/null || true' EXIT
 
+# ---------------------------------------------------------------- checkpoint retention
+# foundry never prunes (trainers/fabric.py:815 has no save_top_k), so without this a
+# multi-day run fills the quota on its own. Sweep once now -- which clears whatever the
+# PREVIOUS job in this run name accumulated -- then on a timer, because a single job can
+# outlive its own disk budget. The log goes to RUN_DIR and NOT to CKPT_DIR: resume
+# resolves a directory with `sorted(iterdir())[-1]` and does not filter for *.ckpt
+# (fabric.py:948), so a `prune.log` sitting in there would be loaded AS the checkpoint.
+PRUNE_LOG="${RUN_DIR}/ckpt_prune_${SLURM_JOB_ID:-local}.log"
+prune_ckpts() {
+  "$PY" -I "${REPO}/script_utils/lpgen_prune_ckpts.py" \
+    --ckpt-dir "$CKPT_DIR" \
+    --keep-newest "${CKPT_KEEP_NEWEST}" \
+    --keep-every "${CKPT_KEEP_EVERY}" >> "$PRUNE_LOG" 2>&1 || true
+}
+echo "[train] checkpoint retention: keep newest ${CKPT_KEEP_NEWEST} + every ${CKPT_KEEP_EVERY}th epoch"
+echo "[train]   sweep log: ${PRUNE_LOG}"
+prune_ckpts
+tail -1 "$PRUNE_LOG" 2>/dev/null | sed 's/^/[train]   /'
+if [[ "${CKPT_PRUNE_INTERVAL_SEC}" -gt 0 ]]; then
+  ( while true; do sleep "${CKPT_PRUNE_INTERVAL_SEC}"; prune_ckpts; done ) &
+  PRUNER=$!
+  trap 'kill $SAMPLER $PRUNER 2>/dev/null || true' EXIT
+fi
+
 cd "$ARM_TREE"
 echo "[train] experiment=${TRAIN_EXPERIMENT} run_dir=${RUN_DIR}"
 set +e
@@ -129,7 +153,8 @@ set +e
   ${EXTRA_TRAIN_ARGS:-} 2>&1 | tee -a "${RUN_DIR}/train_${SLURM_JOB_ID:-local}.log"
 RC=${PIPESTATUS[0]}
 set -e
-kill $SAMPLER 2>/dev/null || true
+# ${PRUNER:-} because the in-job sweep is optional and this runs under `set -u`.
+kill $SAMPLER ${PRUNER:-} 2>/dev/null || true
 
 echo "=================================================================="
 echo "[train] train.py exit code: ${RC}"
@@ -170,7 +195,12 @@ if grep -q 'Loading checkpoint from' "$LOGF" 2>/dev/null; then
   fi
 fi
 
+# Final sweep, after the last checkpoint has settled: the timer may well have fired last
+# while a checkpoint was still too new to judge, and this is the state the next job
+# inherits. The newest is always kept, so this never costs the resume point.
+prune_ckpts
 echo "[train] checkpoints now in ${CKPT_DIR}:"
 find "$CKPT_DIR" -maxdepth 1 -name '*.ckpt' -printf '  %f  %s bytes\n' | sort | tail -5
+echo "[train] checkpoint disk: $(du -sh "$CKPT_DIR" 2>/dev/null | cut -f1) ($(tail -1 "$PRUNE_LOG" 2>/dev/null))"
 echo "[train] resubmit the SAME --set TRAIN_RUN_NAME=${TRAIN_RUN_NAME} to continue from the latest"
 exit "$RC"

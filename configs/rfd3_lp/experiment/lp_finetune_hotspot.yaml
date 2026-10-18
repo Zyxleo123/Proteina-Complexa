@@ -1,0 +1,53 @@
+# @package _global_
+# LP fine-tune WITH hotspot conditioning. The hotspot-retention arm.
+#
+# Launch (the job script wires the search path and PYTHONPATH):
+#
+#   ./scripts/submit_lpgen.sh --submit train \
+#       --set TRAIN_EXPERIMENT=lp_finetune_hotspot \
+#       --set TRAIN_RUN_NAME=lp_hotspot_v1 \
+#       --set TRAIN_CKPT_PATH=/zfsauton/scratch/yixiz/lpgen/weights/foundry/rfd3_latest.ckpt
+#
+# INHERITS `lp_finetune` AND CHANGES TWO GROUPS. Everything that run learned the hard way --
+# the `model.lr_scheduler` path (not `model.optimizer.lr_scheduler`, which silently creates a
+# dead branch), `base_lr: 0.0001` after the 1.8e-3 divergence, `error_if_grad_nonfinite`,
+# `grad_accum_steps: 16`, the overridden `paths.log_dir` that otherwise aborts on `/net` --
+# is inherited rather than restated, so this arm cannot drift away from the control.
+#
+# WHY INITIALIZE FROM THE RELEASED CHECKPOINT AND NOT FROM THE BASE ARM'S LP CHECKPOINT.
+# `is_atom_level_hotspot` is a real atom-level input channel of the released network
+# (model/components/rfd3_net.yaml:43), and the base LP arm feeds it a CONSTANT ZERO on every
+# atom of every example -- `AddAdditional1dFeaturesToFeats` is built with
+# `autofill_zeros_if_not_present_in_atomarray=True` (pipelines.py:521), so the channel is not
+# absent, it is actively trained dead. The released weights were trained with
+# `add_ppi_hotspots: 0.75`, so they are the warm start for this channel and an LP checkpoint
+# of the base arm is a cold one. `TRAIN_CKPT_PATH` is not optional for this arm.
+#
+# WHAT TO READ, AND IN WHAT ORDER. `ppi_metrics.fraction_hotspots_contacted` is the arm's
+# reason to exist, but on its own it is NOT evidence of hotspot obedience: the model would
+# score well by binding the native pocket it was going to bind anyway, because the hotspots
+# are drawn FROM that pocket. The comparison that carries the claim is the per-arm panel from
+# `lpgen_build_val_contigs.py --hotspot-mode obedience`:
+#   hs_native vs hs_none    does giving hotspots change anything at all
+#   hs_decoy                can the peptide be sent to a DIFFERENT patch
+#   hs_decoy_orinative      does the hotspot channel pull against a conflicting prior
+# Read `Seq Recovery` only as a tripwire; it is ~99.5% a copy of an input we revealed.
+
+defaults:
+  - lp_finetune
+  # Hotspots on, at RFD3's own stock dosage. One variable against `lpgen_base`.
+  - override /datasets: lpgen_hotspot
+  # Registers `PPIMetrics`, which upstream defines and never instantiates. Without this the
+  # arm trains the hotspot channel and measures NOTHING about whether it is being used --
+  # the stock metric set has no hotspot term at all.
+  - override /trainer/metrics: lp_design_metrics
+  - _self_
+
+name: lpgen-rfd3-lp-finetune-hotspot
+tags: [lpgen, rfd3, lp, hotspot]
+
+# Fine-tune only. Left null so the launcher passes the path explicitly and initialization
+# stays a deliberate act -- but see the note above: for THIS arm a from-scratch or
+# from-base-arm start makes the hotspot channel cold and the comparison meaningless. The
+# train job prints a loud warning when it starts from random weights.
+ckpt_path: null

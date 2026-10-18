@@ -84,6 +84,25 @@ _cp2lp_defaults() {
     # the job log still printed the right config name.
     bb_release_warm)     CONFIG_NAME="${CONFIG_NAME:-example/training_cp2lp_bb_release_warm}";     RUN_NAME="${RUN_NAME:-cp2lp_bb_release_warm}" ;;
     bb_release_cold)     CONFIG_NAME="${CONFIG_NAME:-example/training_cp2lp_bb_release_cold}";     RUN_NAME="${RUN_NAME:-cp2lp_bb_release_cold}" ;;
+    # Steric SHAPE arm: a child of bb_release_cold differing in `steric_depth_gain` alone. It
+    # starts from the same pinned fork, so the `bb_*` INIT_CKPT fallback below is already right.
+    bb_shape_warm)       CONFIG_NAME="${CONFIG_NAME:-example/training_cp2lp_bb_shape_warm}";       RUN_NAME="${RUN_NAME:-cp2lp_bb_shape_warm}" ;;
+    # RETENTION LADDER. Three rungs differing only in `preserve_weight`; all warm-start from
+    # the release-COLD endpoint, so they share bb_shape_warm's INIT_CKPT below.
+    bb_retain_w010)      CONFIG_NAME="${CONFIG_NAME:-example/training_cp2lp_bb_retain_w010}";      RUN_NAME="${RUN_NAME:-cp2lp_bb_retain_w010}" ;;
+    bb_retain_w025)      CONFIG_NAME="${CONFIG_NAME:-example/training_cp2lp_bb_retain_w025}";      RUN_NAME="${RUN_NAME:-cp2lp_bb_retain_w025}" ;;
+    bb_retain_w050)      CONFIG_NAME="${CONFIG_NAME:-example/training_cp2lp_bb_retain_w050}";      RUN_NAME="${RUN_NAME:-cp2lp_bb_retain_w050}" ;;
+    # TERMINAL-EXEMPT rungs. Same 0.25 weight as bb_retain_w025, which is their k=0 control;
+    # they differ from it only in `preserve_terminal_exempt_k`. BEFORE the bare `bb_retain_w025`
+    # case is unnecessary (the names are distinct) but the ordering is kept explicit anyway.
+    bb_retain_w025_x1)   CONFIG_NAME="${CONFIG_NAME:-example/training_cp2lp_bb_retain_w025_x1}";   RUN_NAME="${RUN_NAME:-cp2lp_bb_retain_w025_x1}" ;;
+    bb_retain_w025_x2)   CONFIG_NAME="${CONFIG_NAME:-example/training_cp2lp_bb_retain_w025_x2}";   RUN_NAME="${RUN_NAME:-cp2lp_bb_retain_w025_x2}" ;;
+    # LOW-WEIGHT ladder at fixed k=1. The w025 tranche showed 0.25 is already past the knee at
+    # every exemption level (edit collapses to ~0.06 nm), so this scans BELOW it.
+    bb_retain_w002_x1)   CONFIG_NAME="${CONFIG_NAME:-example/training_cp2lp_bb_retain_w002_x1}";   RUN_NAME="${RUN_NAME:-cp2lp_bb_retain_w002_x1}" ;;
+    bb_retain_w005_x1)   CONFIG_NAME="${CONFIG_NAME:-example/training_cp2lp_bb_retain_w005_x1}";   RUN_NAME="${RUN_NAME:-cp2lp_bb_retain_w005_x1}" ;;
+    bb_retain_w010_x1)   CONFIG_NAME="${CONFIG_NAME:-example/training_cp2lp_bb_retain_w010_x1}";   RUN_NAME="${RUN_NAME:-cp2lp_bb_retain_w010_x1}" ;;
+    bb_shape)            CONFIG_NAME="${CONFIG_NAME:-example/training_cp2lp_bb_shape}";            RUN_NAME="${RUN_NAME:-cp2lp_bb_shape}" ;;
     *)           CONFIG_NAME="${CONFIG_NAME:-example/training_cp2lp_gan}";          RUN_NAME="${RUN_NAME:-cp2lp_${ARM}}" ;;
   esac
 
@@ -102,11 +121,20 @@ _cp2lp_defaults() {
   # the value that runs. `test_preamble_init_ckpt_tracks_the_release_configs` asserts the two
   # agree, because a disagreement is invisible in the job log.
   RELEASE_WARM_CKPT="${RELEASE_WARM_CKPT:-${STORE}/cp2lp_bb_torsion/checkpoints/g010300.ckpt}"
+  # Raw, not `-EMA`, for the same reason as RELEASE_WARM_CKPT above. Asserted against the
+  # config's own `pretrain_ckpt_path` by the submitter before it submits.
+  SHAPE_WARM_CKPT="${SHAPE_WARM_CKPT:-${STORE}/cp2lp_bb_release_cold/checkpoints/g010300.ckpt}"
   case "${ARM}" in
     onepass_warmup)  INIT_CKPT="${INIT_CKPT:-${FLOW_CKPT}}" ;;
     onepass_*)       INIT_CKPT="${INIT_CKPT:-${FORK_CKPT}}" ;;
     # BEFORE `bb_*`: `case` takes the first match.
     bb_release_warm) INIT_CKPT="${INIT_CKPT:-${RELEASE_WARM_CKPT}}" ;;
+    # The WARM shape arm starts from the release-COLD endpoint, which is the state that
+    # measured 0.0705 nm of interpenetration -- the defect this tranche is trying to repair.
+    bb_shape_warm)   INIT_CKPT="${INIT_CKPT:-${SHAPE_WARM_CKPT}}" ;;
+    # Same start as bb_shape_warm: the release-COLD endpoint is the measured state the ladder
+    # ramps away from (edit 0.650 nm, retention 0.489, gap 1.957 nm).
+    bb_retain_*)     INIT_CKPT="${INIT_CKPT:-${SHAPE_WARM_CKPT}}" ;;
     bb_*)            INIT_CKPT="${INIT_CKPT:-${FORK_CKPT}}" ;;
     *)               INIT_CKPT="${INIT_CKPT:-${FLOW_CKPT}}" ;;
   esac

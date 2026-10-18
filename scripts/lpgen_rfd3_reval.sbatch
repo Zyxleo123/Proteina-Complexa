@@ -26,7 +26,13 @@
 #
 # So instead: keep `should_stop` FALSE through prevalidation by setting
 # `max_epochs = ckpt_epoch + 2`, and neutralise the one training epoch that then starts:
-#   limit_train_batches=0        -> train_loop breaks at batch_idx 0 (:533), does no work
+#   limit_train_batches=0        -> train_loop breaks at batch_idx 0 (:533), does no work.
+#                                   NOTE THE `+`: it is a real Trainer kwarg (fabric.py:84)
+#                                   but is NOT declared in configs/trainer/rfd3_base.yaml,
+#                                   so a plain override dies with "Key
+#                                   'limit_train_batches' is not in struct" (job 85091).
+#                                   The other three keys below ARE declared; only this one
+#                                   needs the add-key prefix.
 #   validate_every_n_epochs=huge -> `should_validate` is False, so the post-epoch validation
 #                                   does NOT run and the curve gets no duplicate point
 #                                   (prevalidate is unaffected: it is gated only on
@@ -89,7 +95,18 @@ REVAL_MAX_EPOCHS=$((CKPT_EPOCH + 2))
 # lp_scratch_v1_reval because TRAIN_RUN_NAME still held its default.
 CKPT_RUN_DIR="$(dirname "$(dirname "${REVAL_CKPT}")")"
 CKPT_RUN_NAME="$(basename "${CKPT_RUN_DIR}")"
-RUN_DIR="${REVAL_ROOT_OVERRIDE:-${LPGEN_RUNS_DIR}/${CKPT_RUN_NAME}_reval}/${CKPT_TAG}"
+REVAL_ROOT_RESOLVED="${REVAL_ROOT_OVERRIDE:-${LPGEN_RUNS_DIR}/${CKPT_RUN_NAME}_reval}"
+# The scorer globs ${REVAL_ROOT}/*/val_structures/predictions, so if this job writes
+# somewhere else the scorer finds nothing and exits 0 saying no checkpoint was
+# re-evaluated -- a silent empty curve. Assert the two agree rather than trusting it.
+if [[ "${REVAL_ROOT_RESOLVED}" != "${REVAL_ROOT}" ]]; then
+  echo "[reval] ERROR: output root disagrees with the root the scorer will read." >&2
+  echo "[reval]   this job:   ${REVAL_ROOT_RESOLVED}" >&2
+  echo "[reval]   scorer:     ${REVAL_ROOT}" >&2
+  echo "[reval] Set REVAL_RUN_NAME=${CKPT_RUN_NAME} so both derive from one name." >&2
+  exit 1
+fi
+RUN_DIR="${REVAL_ROOT_RESOLVED}/${CKPT_TAG}"
 mkdir -p "$RUN_DIR"
 echo "[reval] ckpt epoch ${CKPT_EPOCH} -> max_epochs ${REVAL_MAX_EPOCHS}"
 
@@ -129,7 +146,7 @@ set +e
   "datasets.val.lp_panel.dataset.eval_every_n=1" \
   "trainer.prevalidate=True" \
   "trainer.max_epochs=${REVAL_MAX_EPOCHS}" \
-  "trainer.limit_train_batches=0" \
+  "+trainer.limit_train_batches=0" \
   "trainer.validate_every_n_epochs=1000000" \
   "trainer.checkpoint_every_n_epochs=1000000" \
   ${EXTRA_REVAL_ARGS:-} 2>&1 | tee "${RUN_DIR}/reval.log"
@@ -142,14 +159,35 @@ echo "[reval] train.py exit code: ${RC}"
 # A validation-only run that trained by accident would corrupt the curve it exists to
 # measure, so assert the trap behaved as intended.
 # One epoch DOES start by design (it is how should_stop stays false through prevalidation),
-# but limit_train_batches=0 must make it do nothing. Assert on optimizer steps, not on the
-# epoch banner: a re-eval that silently trained would move the weights it is measuring.
-N_OPT=$(grep -cE "Optimizer step|optimizer_step|global_step" "${RUN_DIR}/reval.log" 2>/dev/null; true)
-if [[ "${N_OPT}" -gt 0 ]]; then
-  echo "[reval] ERROR: ${N_OPT} optimizer-step line(s) found -- this run TRAINED." >&2
+# but limit_train_batches=0 must make it do nothing. A re-eval that silently trained would
+# move the weights it is measuring, so this must be a REAL check.
+#
+# The markers were CALIBRATED against an actual training log rather than guessed. An earlier
+# version grepped for "Optimizer step|optimizer_step|global_step" and was VACUOUS: all three
+# appear ZERO times even in a genuine training run (measured on train_84949.log), so it
+# could never have fired. `mse_loss` is logged 9x by a real training epoch and 0x by a
+# no-op one, and the `train/` columns in metrics.csv are the same signal in data rather
+# than in log text.
+N_LOSS=$(grep -c "mse_loss" "${RUN_DIR}/reval.log" 2>/dev/null; true)
+if [[ "${N_LOSS}" -gt 0 ]]; then
+  echo "[reval] ERROR: ${N_LOSS} training-loss line(s) found -- this run TRAINED." >&2
   echo "[reval] limit_train_batches=0 did not take effect; the measurement is not clean." >&2
   exit 1
 fi
+for MCSV in "${RUN_DIR}"/lightning_logs/version_*/metrics.csv; do
+  [[ -f "$MCSV" ]] || continue
+  if "$ARM_PY" -c "
+import pandas as pd, sys
+m = pd.read_csv(sys.argv[1])
+tr = [c for c in m.columns if c.startswith('train/')]
+n = int(m[tr].notna().sum().sum()) if tr else 0
+print(f'[reval] {sys.argv[1]}: {len(m)} rows, {len(tr)} train/ cols, {n} non-null train/ cells')
+sys.exit(1 if n > 0 else 0)
+" "$MCSV"; then :; else
+    echo "[reval] ERROR: metrics.csv carries TRAINING metrics -- this run trained." >&2
+    exit 1
+  fi
+done
 if ! grep -q "Prevalidating with epoch ${CKPT_EPOCH}" "${RUN_DIR}/reval.log" 2>/dev/null; then
   echo "[reval] ERROR: prevalidation did not run at the checkpoint's own epoch." >&2
   exit 1

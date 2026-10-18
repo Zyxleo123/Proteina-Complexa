@@ -1,0 +1,85 @@
+# @package _global_
+# STERIC SHAPE ARM, WARM. The same `steric_depth_gain: 2.0` as its cold sibling, started from
+# the release-cold generator that ALREADY sits at the defect.
+#
+# WHY THIS ARM IS WORTH ITS OWN GPU. The cold arm has to re-derive the whole solution -- open
+# the ring, find the pocket, learn a pose -- before the clash question even becomes live, so it
+# answers "does the shape knob work" only near its end. This arm starts AT the measured defect:
+# `cp2lp_bb_release_cold`'s g010300 endpoint logged `steric_min_inter_nm` = 0.0705 nm against
+# real bound LPs' 0.262, with 0.464 violating pairs per residue. Turning the depth penalty up
+# under that state should push it out within a few hundred updates, so the SIGN of the effect is
+# readable in ~1-2h instead of ~18h.
+#
+# It is a different question from the cold arm's, not a cheaper version of it:
+#
+#   warm   "can depth pressure repair an already-interpenetrating solution?"  -- a trajectory
+#          claim, read WITHIN this run against its own starting point.
+#   cold   "does an arm trained with it from scratch end up elsewhere?"       -- the clean
+#          single-variable claim against the finished release_cold.
+#
+# So read warm as a BEFORE/AFTER on `steric_min_inter_nm` starting from 0.0705, and read cold
+# against release_cold. Do NOT cross-compare warm's endpoint with cold's: they differ in init
+# as well as in nothing else, which is the whole point of having both.
+#
+# ----------------------------------------------------------------------------------
+# INHERITS FROM THE COLD ARM ON PURPOSE. `steric_depth_gain` is NOT restated here -- it comes
+# from `training_cp2lp_bb_shape`, so the two arms cannot silently disagree about the one knob
+# the tranche is about. A copied `2.0` is exactly the kind of drift that turns a sibling pair
+# into two unrelated runs.
+#
+# ----------------------------------------------------------------------------------
+# !! THE WARM-START BUDGET TRAP, measured once already. !!
+#
+# `g_updates` is a `register_buffer(..., persistent=True)`, so it travels in the state_dict.
+# `pretrain_ckpt_path` is "weights only" with respect to the OPTIMIZER -- train.py skips
+# optimizer states and the trainer's `global_step` restarts at 0 -- but a persistent buffer is
+# a weight as far as `load_state_dict` is concerned. Job 72084 loaded a g=10300 milestone
+# against `max_g_updates: 10300`, logged "reached the budget (global_step=1)", and EXITED 0,
+# releasing every dependent job behind a stage that did no work.
+#
+# THE ARITHMETIC, so this arm performs the SAME number of updates as its cold sibling:
+#
+#     fork carries                250    (printed as `[preflight] g_updates_in_fork=250`)
+#     cold budget 10300        -> 10300 - 250   = 10050 updates
+#     release_cold's milestone    10300  (written at exactly that count)
+#     this arm's budget 20350  -> 20350 - 10300 = 10050 updates
+#
+# 20350 and not 20600: matching the sibling's ACTUAL update count is what makes the pair
+# comparable, and the cold arm never performs a round 10300 either.
+#
+# `eval_checkpoint_g_updates` MUST move with the budget -- it is matched by EQUALITY
+# (`if n not in self.eval_ckpt_g_updates`), not by threshold, so a stale value writes NO
+# milestone at all and the packing eval has nothing to read.
+#
+# ----------------------------------------------------------------------------------
+# CHECK THE LOG BEFORE TRUSTING THE PAIR. This arm must print `LEFT AS LOADED`; the cold arm
+# must print `OVERWRITING trained columns ... preserve_loaded=False`. `train.py` calls
+# `init_editor_noise_adapter()` on EVERY `pretrain_ckpt_path` load, warm starts included, and
+# the draw is unconditional by default -- so without the flag below this arm would silently
+# re-randomise the noise-adapter columns the release-cold generator LEARNED while this file
+# claimed to keep it. The flag defaults to FALSE (historical) precisely so that fixing it here
+# does not retroactively change the initialisation of every other arm in the repo.
+#
+# Run (both siblings, concurrently):
+#   bash scripts/submit_cp2lp_backbone.sh --submit shape
+
+defaults:
+  - /example/training_cp2lp_bb_shape
+  - _self_
+
+run_name: cp2lp_bb_shape_warm
+
+# The RAW milestone, not the `-EMA` sidecar: the EMA copy is evaluation weights, and resuming
+# optimisation from an averaged shadow would start from a point no optimizer step ever stood on.
+pretrain_ckpt_path: /zfsauton/scratch/yixiz/Proteina-Complexa/training_runs/store/cp2lp_bb_release_cold/checkpoints/g010300.ckpt
+
+cp2lp:
+  # See THE WARM-START BUDGET TRAP above. Both of these must move together.
+  max_g_updates: 20350
+  eval_checkpoint_g_updates: [20350]
+
+  onepass:
+    # Keeps the loaded generator's noise-adapter columns instead of re-drawing them, which is
+    # what makes this a warm start rather than a partially re-randomised one. One of only two
+    # places in the repo this is true.
+    preserve_loaded_noise_adapter: true

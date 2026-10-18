@@ -970,14 +970,145 @@ def test_only_the_warm_release_arm_preserves_its_noise_adapter():
     with initialize_config_dir(config_dir=cfg_dir, version_base=None):
         for n in names:
             c = OmegaConf.to_container(compose(config_name=n), resolve=False)
+            # SHARED BASES ARE NOT ARMS. A file whose `run_name` ends in `_base` is a
+            # defaults-only parent that nothing launches from (it typically leaves a key at
+            # `???` to force each child to declare it), so it carries the flag on behalf of its
+            # children and is not itself a run whose initialisation could change. Keyed off the
+            # repo's own naming convention so a new base needs no edit here.
+            if str(c.get("run_name") or "").endswith("_base"):
+                continue
             op = (c.get("cp2lp") or {}).get("onepass") or {}
             if bool(op.get("preserve_loaded_noise_adapter", False)):
                 enabled.append(n)
 
-    assert enabled == ["example/training_cp2lp_bb_release_warm"], (
-        f"preserve_loaded_noise_adapter is set on {enabled!r}; it belongs on the warm "
-        "release arm alone, because it changes the initialisation"
+    # TIED TO THE PROPERTY, not to a hardcoded list. The flag is justified by one thing and
+    # one thing only: the arm warm-starts from ANOTHER ARM'S milestone, whose noise-adapter
+    # columns are trained and must not be re-drawn. A fork-started arm has no such columns to
+    # protect, so the flag there is a silent change of initialisation. Checking warm-start-ness
+    # rather than a name list means a new warm arm does not have to edit this test, while a
+    # fork-started arm that sets the flag still fails -- which is the case worth catching.
+    FORK = "cp2lp_onepass_fork"
+    with initialize_config_dir(config_dir=cfg_dir, version_base=None):
+        for n in enabled:
+            c = OmegaConf.to_container(compose(config_name=n), resolve=True)
+            ckpt = str(c.get("pretrain_ckpt_path") or "")
+            assert ckpt and FORK not in ckpt, (
+                f"{n} sets preserve_loaded_noise_adapter but starts from the FORK "
+                f"({ckpt!r}). The fork's columns were re-drawn by every existing arm, so "
+                "preserving them there silently changes that arm's initialisation."
+            )
+            assert "-EMA" not in ckpt, (
+                f"{n} warm-starts from an EMA sidecar ({ckpt!r}). EMA weights are evaluation "
+                "weights; resuming optimisation from an averaged shadow starts from a point "
+                "no optimizer step ever stood on."
+            )
+
+    # THE OTHER DIRECTION OF THE SAME BUG: a warm arm that silently re-randomises what it
+    # claimed to keep. DERIVED, not enumerated -- "expected" is every launchable arm that starts
+    # from something other than the fork, so adding a warm arm needs no edit here while a warm
+    # arm that FORGETS the flag still fails. A hardcoded list had to be edited three times in
+    # one session, which is how a guard quietly becomes a formality.
+    expected = []
+    with initialize_config_dir(config_dir=cfg_dir, version_base=None):
+        for n in names:
+            c = OmegaConf.to_container(compose(config_name=n), resolve=True)
+            if str(c.get("run_name") or "").endswith("_base"):
+                continue
+            ckpt = str(c.get("pretrain_ckpt_path") or "")
+            # "ANOTHER ARM'S MILESTONE" is the condition, and `/checkpoints/` is what says so:
+            # Lightning writes milestones there, while the pinned starting points every cold arm
+            # uses are standalone files (`cp2lp_onepass_fork/cp2lp_onepass_fork.ckpt`, and the
+            # flow pin `cpsea_lpmix_from_v4cfg/cp2lp_init.ckpt` that gan/contactonly/
+            # onepass_warmup start from). Only a checkpoint written BY a training run can carry
+            # noise-adapter columns that run learned, which is the thing the flag protects.
+            if "/checkpoints/" in ckpt:
+                expected.append(n)
+    assert sorted(enabled) == sorted(expected), (
+        f"preserve_loaded_noise_adapter is set on {sorted(enabled)!r}, but the warm-start arms "
+        f"(pretrain_ckpt_path != the fork) are {sorted(expected)!r}. Every warm start needs the "
+        "flag, and nothing that starts from the fork may have it."
     )
+
+
+def test_every_warm_arm_budget_matches_its_control_update_count():
+    """Same arithmetic as the release pair, applied to EVERY (cold, warm) shape sibling.
+
+    The trap generalises: any arm warm-started from another arm's milestone inherits that
+    milestone's `g_updates` through the persistent buffer, so a budget equal to the inherited
+    count stops after one step and EXITS 0 -- releasing every `afterok` dependent behind a
+    stage that did no work. This is the same defect job 72084 hit, and the shape pair walks
+    into it identically unless the budget is `inherited + wanted`.
+    """
+    import os
+
+    from hydra import compose, initialize_config_dir
+    from omegaconf import OmegaConf
+
+    FORK_G_UPDATES = 250
+    # (cold config, warm config, the g_updates the warm arm's start checkpoint carries)
+    PAIRS = [
+        ("example/training_cp2lp_bb_shape", "example/training_cp2lp_bb_shape_warm", 10300),
+    ]
+    # The retention ladder warm-starts from release_cold, so its "control update count" is set
+    # by its own wanted budget rather than by a cold sibling. Checked separately below.
+    LADDER = [f"example/training_cp2lp_bb_retain_w{t}" for t in ("010", "025", "050")]
+    LADDER_INHERITED, LADDER_WANTED = 10300, 3000
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    with initialize_config_dir(config_dir=os.path.join(repo, "configs"), version_base=None):
+        for cold_n, warm_n, inherited in PAIRS:
+            cold = OmegaConf.to_container(compose(config_name=cold_n), resolve=True)
+            warm = OmegaConf.to_container(compose(config_name=warm_n), resolve=True)
+            cc, wc = cold["cp2lp"], warm["cp2lp"]
+
+            control_updates = int(cc["max_g_updates"]) - FORK_G_UPDATES
+            assert control_updates > 0, f"{cold_n} would train for nothing"
+            want = inherited + control_updates
+            assert int(wc["max_g_updates"]) == want, (
+                f"{warm_n} max_g_updates is {wc['max_g_updates']}, expected {want} "
+                f"(= inherited {inherited} + the control's {control_updates}). Too low and "
+                "the run stops having trained nothing, and exits 0 doing it."
+            )
+            assert wc["eval_checkpoint_g_updates"] == [want], (
+                f"{warm_n} eval_checkpoint_g_updates is {wc['eval_checkpoint_g_updates']}, "
+                f"expected [{want}]. Milestones are matched by EQUALITY, not threshold, so a "
+                "stale value writes no milestone at all and the eval has nothing to read."
+            )
+            # The pair is only a pair if the knob under test is identical in both.
+            assert (
+                cc["losses"]["steric_depth_gain"] == wc["losses"]["steric_depth_gain"]
+            ), f"{cold_n} and {warm_n} disagree on steric_depth_gain; they are not siblings"
+            assert cc["losses"]["steric_weight"] == wc["losses"]["steric_weight"], (
+                f"{cold_n} and {warm_n} disagree on steric_weight, which is NOT the knob "
+                "under test -- the comparison would be two-variable"
+            )
+
+    # ---- the retention ladder: same trap, and the rungs must differ in ONE loss key only.
+    want = LADDER_INHERITED + LADDER_WANTED
+    seen = {}
+    with initialize_config_dir(config_dir=os.path.join(repo, "configs"), version_base=None):
+        for n in LADDER:
+            c = OmegaConf.to_container(compose(config_name=n), resolve=True)["cp2lp"]
+            assert int(c["max_g_updates"]) == want, (
+                f"{n} max_g_updates is {c['max_g_updates']}, expected {want} (= inherited "
+                f"{LADDER_INHERITED} + {LADDER_WANTED} wanted). Too low and it exits 0 having "
+                "trained nothing."
+            )
+            assert c["eval_checkpoint_g_updates"] == [want], (
+                f"{n} eval_checkpoint_g_updates is {c['eval_checkpoint_g_updates']}, expected "
+                f"[{want}] -- matched by EQUALITY, so a stale value writes no milestone."
+            )
+            # The ladder deliberately does NOT combine with the steric shape knob: folding in
+            # an untested second knob would make it uninterpretable against the only baseline
+            # that has retention numbers.
+            assert float(c["losses"].get("steric_depth_gain", 0.0)) == 0.0, (
+                f"{n} sets steric_depth_gain; the retention ladder must stay single-variable "
+                "against cp2lp_bb_release_cold, which was trained with the linear hinge."
+            )
+            seen[n] = float(c["losses"]["preserve_weight"])
+    assert sorted(seen.values()) == [0.1, 0.25, 0.5], (
+        f"ladder weights are {sorted(seen.values())}, expected [0.1, 0.25, 0.5]"
+    )
+    assert len(set(seen.values())) == len(seen), "two rungs share a preserve_weight"
 
 
 def test_warm_release_budget_matches_the_control_update_count():

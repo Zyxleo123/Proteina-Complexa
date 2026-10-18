@@ -1,0 +1,45 @@
+# @package _global_
+# RETENTION LADDER, terminal-exempt rung: preserve_weight 0.25, exempt k=1 residue(s) per end.
+#
+# the MINIMAL exemption: only the two ring-bond residues go free.
+#
+# THE SINGLE VARIABLE. Identical to `training_cp2lp_bb_retain_w025` -- same warm start, same
+# 0.25 weight, same budget, same milestone -- except `preserve_terminal_exempt_k: 1`. So
+# w025 is this rung's matched k=0 CONTROL and the comparison isolates the exemption alone.
+#
+# WHY THE EXEMPTION IS THE POINT, not a refinement. `backbone_preservation_loss` bills every
+# residue's displacement from the source, termini included, and `source_interface_weights`
+# weights only by contact strength -- a terminus touching the receptor gets weight up to 1.0.
+# Opening a macrocycle from a 0.35 nm terminal gap to real LPs' 2.14 nm REQUIRES the two
+# ring-bond residues to separate by ~1.8 nm, so a plain weight ladder charges for exactly the
+# displacement the task needs. That is why zeroing `preserve_weight` is what opened the gap,
+# and why the k=0 ladder traces a trade-off rather than trying to break it.
+#
+# The exemption frees terminal travel while keeping interior interface drift charged -- and
+# interface drift is what actually costs retention:
+#
+#     PARTIAL corr(edit, retention | gap)   -0.367   <- the real cost, still charged
+#     PARTIAL corr(gap,  retention | edit)  +0.005   <- exactly null, no longer charged
+#
+# WHAT IT COSTS. The termini carry 18.5% of interface contacts at k=1 per end, so this rung
+# gives up charging for that share. That is the price of letting the ring open, and it is why
+# both k=1 and k=2 are being run rather than one guess.
+#
+# A DEGENERATE CASE TO WATCH, not a bug: `binder_min_length` is 5, so at k=2 a 5-mer has only
+# ONE charged residue and the term is nearly dead for it. `preserve_exempt_frac` is logged for
+# exactly this -- if it approaches 1.0 the term has been exempted out of existence and the rung
+# is really a preserve=0 run wearing a weight.
+#
+# READ: `preserve_ca_rmsd_nm` (interface edit, baseline 0.650) and `terminal_gap_nm` (baseline
+# tail median 1.957, real p25-p75 1.575-2.300) TOGETHER. The win this rung is built to find is
+# the edit falling while the gap HOLDS -- which the k=0 control should NOT be able to do.
+
+defaults:
+  - /example/training_cp2lp_bb_retain_w025
+  - _self_
+
+run_name: cp2lp_bb_retain_w025_x1
+
+cp2lp:
+  losses:
+    preserve_terminal_exempt_k: 1

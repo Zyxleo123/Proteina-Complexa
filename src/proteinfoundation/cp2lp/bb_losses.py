@@ -77,6 +77,19 @@ from proteinfoundation.cp2lp.losses import (  # noqa: F401  (re-exported on purp
     terminal_opening_reward,
 )
 
+#: Coefficient on the depth-growing half of the steric penalty. 0.0 is the historical linear
+#: hinge and is the default, so no existing arm or control changes. See `_overlap_penalty` for
+#: why a linear hinge sets an equilibrium rather than enforcing a floor, and why 2.0 is the
+#: recommended first alternative. NOT weight-neutral: it scales the deep tail by up to 1 + this.
+DEFAULT_STERIC_DEPTH_GAIN = 0.0
+
+#: Residues per end exempted from the preservation weight. 0 is the historical behaviour --
+#: every residue charged, termini included -- and is the default so no existing arm changes.
+#: See the exemption block in `source_interface_weights` for why a non-zero value is what lets
+#: a preservation ladder test "keep the interface AND stay open" rather than trace the
+#: trade-off between them.
+DEFAULT_PRESERVE_TERMINAL_EXEMPT_K = 0
+
 #: Intra-residue bond tolerance for the Arm A safeguard, nm. Same magnitude as the peptide
 #: bond's, because a 0.02 nm error in N-CA is no more acceptable than one in C-N.
 INTRA_BOND_TOL_NM = 0.02
@@ -124,6 +137,7 @@ def source_interface_weights(
     cutoff_nm: float = 0.8,
     min_strength: float = 0.5,
     non_interface: float = NON_INTERFACE_WEIGHT,
+    terminal_exempt_k: int = DEFAULT_PRESERVE_TERMINAL_EXEMPT_K,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """``[b, n]`` per-residue preservation weight, from the SOURCE's all-atom contacts.
 
@@ -151,10 +165,48 @@ def source_interface_weights(
         strength = c.amax(dim=-1)  # [b, n] strongest contact this residue makes
         is_iface = (strength >= min_strength).float() * pm.float()
         w = (non_interface + (1.0 - non_interface) * strength.clamp(0.0, 1.0)) * pm.float()
+        # TERMINAL EXEMPTION. Zero the weight on the first/last `k` residues, so the
+        # preservation term stops charging for the one displacement the task REQUIRES.
+        #
+        # WHY. Opening a macrocycle from a 0.35 nm terminal gap to real LPs' 2.14 nm means the
+        # two ring-bond residues must separate by ~1.8 nm, and this term bills every residue's
+        # displacement from the source with no positional exemption -- a terminus that touches
+        # the receptor gets weight up to 1.0. So raising `preserve_weight` suppresses the
+        # OPENING, which is why zeroing it is what opened the gap in the first place. That
+        # makes a plain weight ladder a trade-off curve rather than an attempt to break it.
+        #
+        # What the exemption buys: terminal travel becomes free while interior interface drift
+        # stays charged -- and interface drift is what actually costs retention (partial
+        # corr(edit, retention | gap) = -0.367, against corr(gap, retention | edit) = +0.005).
+        #
+        # WHAT IT COSTS, so the choice of k is made with eyes open: the termini carry 18.5% /
+        # 42.3% / 66.9% of interface contacts at k = 1 / 2 / 3 per end, so exempting them gives
+        # up charging for that share of the interface. k=1 is the minimal exemption; k=2 may be
+        # needed because a torsion lever arm cannot move residue 0 without residue 1 following.
+        #
+        # MASK-AWARE BY CONSTRUCTION. "Last k" is per example and must come from the MASK, not
+        # from the end of the padded tensor -- peptides here are 5-16 residues in a padded
+        # batch, so indexing the tensor's tail would exempt PADDING and leave the real
+        # C-terminus fully charged, which is the silent-no-op version of this feature. Counted
+        # from both ends with a cumulative sum over the mask.
+        k = int(terminal_exempt_k)
+        if k > 0:
+            mi = pm.long()
+            fwd = torch.cumsum(mi, dim=1)                        # 1..L at valid positions
+            rev = torch.cumsum(mi.flip(1), dim=1).flip(1)        # L..1 at valid positions
+            exempt = pm & ((fwd <= k) | (rev <= k))
+            w = w * (~exempt).to(w.dtype)
+
         nres = pm.float().sum(dim=1).clamp(min=1.0)
         metrics = {
             "iface_residue_frac": (is_iface.sum(dim=1) / nres).mean(),
             "iface_weight_mean": (w.sum(dim=1) / nres).mean(),
+            # Non-zero only when the exemption is on, so a run's own log says whether the knob
+            # took effect rather than leaving it to be inferred from the config.
+            "preserve_exempt_frac": (
+                (exempt.float().sum(dim=1) / nres).mean() if k > 0
+                else torch.zeros((), device=w.device, dtype=w.dtype)
+            ),
         }
     return w, metrics
 
@@ -217,6 +269,63 @@ def backbone_preservation_loss(
 # ---------------------------------------------------------------------------- sterics
 
 
+def _overlap_penalty(
+    gap: torch.Tensor, threshold_nm: float, depth_gain: float
+) -> torch.Tensor:
+    """`relu(threshold - d)` plus an optional term that grows with overlap DEPTH. Nanometres.
+
+    WHY A SHAPE KNOB AND NOT JUST A BIGGER WEIGHT. Measured on the release arms at their last
+    step: `steric_weight` is 1.0, the largest of the active terms, and the term's gradient norm
+    at the head is 0.78 against a total generator norm of 2.42 -- so steric is neither
+    down-weighted nor drowned out. And the arms still ended at `steric_min_inter_nm` = 0.0705
+    (cold) and 0.206 (warm) against real bound LPs' 0.262, i.e. INSIDE a covalent bond length.
+    Three explanations are therefore already eliminated: the weight, the threshold (0.20 against
+    real 0.262, only 0.06 nm apart) and "the term is drowned out".
+
+    What is left is the functional form. `relu` is LINEAR in overlap depth, so its derivative is
+    a constant 1 per violating pair no matter how deep the overlap goes; resistance per pair
+    never rises, only the pair COUNT does. Against terms that keep pushing inward that balances
+    at whatever depth makes count x constant-slope equal the opposing pull, and nothing in the
+    form says 0.07 nm is catastrophically worse than 0.19 nm. **A linear hinge sets an
+    equilibrium; it cannot enforce a floor.** Rosetta's packer does not produce this geometry
+    precisely because `fa_rep` is steeply superlinear near contact -- which is also why the same
+    packer repacks the zero-edit source backbone with 0 clashes out of 96 while the generated
+    backbones clash on 74%.
+
+    THE FORM. One knob, added to the historical term rather than replacing it:
+
+        relu + depth_gain * relu**2 / threshold
+
+    * `depth_gain = 0.0` returns `relu(threshold - d)` on the SAME tensor path -- the historical
+      loss bit-for-bit, so every existing arm and control is unchanged. It is the default.
+    * The penalty is MONOTONICALLY >= the historical one everywhere, for any `depth_gain >= 0`.
+      That is the property a bare exponent does not have and the reason this is not
+      `relu ** p`: `threshold * (relu/threshold) ** 2` is *weaker* than linear for every
+      overlap shallower than half the threshold, and its restoring force decays to 0 at the
+      boundary, so it would trade a deep-overlap fix for a shallow-overlap regression right
+      where most pairs sit.
+    * The restoring force is `1 + 2 * depth_gain * relu / threshold`: never below the linear 1,
+      and rising with depth. At the cold arm's measured operating point (d = 0.0705, i.e.
+      overlap 0.65 * threshold) `depth_gain = 2.0` gives 3.6x the linear force, while a bare
+      exponent of 2 would give only 1.3x there.
+
+    SCALE, stated because it does move: at full overlap the penalty is `threshold * (1 +
+    depth_gain)`, so the term's magnitude grows by up to `1 + depth_gain`. That is intended --
+    it is the deep tail being made expensive -- but it means `depth_gain` is not weight-neutral
+    and an arm that changes both is not single-variable. Change this one first.
+
+    Bounded and polynomial by construction, with no division by a variable: an inverse-power
+    soft core would be stronger and would also reintroduce the NaN class this project has
+    already paid for once.
+    """
+    overlap = F.relu(threshold_nm - gap)
+    if depth_gain == 0.0:  # bit-identical to the historical term, not merely equivalent
+        return overlap
+    # `threshold_nm` is a positive constant, so this cannot divide by zero and the square keeps
+    # the gradient finite everywhere including exactly at the boundary.
+    return overlap + depth_gain * overlap * overlap / threshold_nm
+
+
 def backbone_steric_loss(
     gen_bb: torch.Tensor,
     pep_mask: torch.Tensor,
@@ -225,8 +334,14 @@ def backbone_steric_loss(
     target_mask: torch.Tensor | None = None,
     threshold_nm: float = CLASH_THRESHOLD_NM,
     min_seq_sep: int = 2,
+    depth_gain: float = DEFAULT_STERIC_DEPTH_GAIN,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Backbone-vs-receptor and backbone-vs-backbone overlap, normalised PER PEPTIDE RESIDUE.
+
+    `exponent` controls how the penalty grows with overlap DEPTH -- see `_overlap_penalty`. It
+    defaults to the historical linear hinge. The `*_violating_*` metrics threshold the raw gap
+    rather than the penalty, so incidence stays comparable across exponents even though the
+    severity sums do not.
 
     The denominator is the thing to read here. For each example the overlap sum is divided by
     that example's peptide residue count, and only then averaged across examples. The two
@@ -258,7 +373,8 @@ def backbone_steric_loss(
     sep = (ar[None, :] - ar[:, None]).abs()
     self_pair = (sep >= min_seq_sep)[None].expand(b, n, n) & pm[:, :, None] & pm[:, None, :]
     # /2 because the matrix counts each pair twice.
-    intra = (F.relu(threshold_nm - d_self) * self_pair.to(dtype)).sum(dim=(1, 2)) / 2.0
+    pen_self = _overlap_penalty(d_self, threshold_nm, depth_gain)
+    intra = (pen_self * self_pair.to(dtype)).sum(dim=(1, 2)) / 2.0
     per_example = intra / nres
 
     metrics: dict[str, torch.Tensor] = {}
@@ -274,7 +390,8 @@ def backbone_steric_loss(
         tm = target_mask.bool()
         d_t = heavy_atom_distances(atom37, atom_mask, target_atom37, target_atom_mask)
         t_pair = pm[:, :, None] & tm[:, None, :]
-        inter = (F.relu(threshold_nm - d_t) * t_pair.to(dtype)).sum(dim=(1, 2))
+        pen_t = _overlap_penalty(d_t, threshold_nm, depth_gain)
+        inter = (pen_t * t_pair.to(dtype)).sum(dim=(1, 2))
         per_example = per_example + inter / nres
         with torch.no_grad():
             metrics["steric_inter_per_res_nm"] = (inter / nres).mean()

@@ -1,0 +1,107 @@
+# @package _global_
+# STERIC SHAPE ARM. One key against `training_cp2lp_bb_release_cold`: `steric_depth_gain`.
+#
+# ----------------------------------------------------------------------------------
+# WHY THIS AND NOT A BIGGER WEIGHT. Three explanations for the clash are already ELIMINATED by
+# measurement, which is what makes this worth a GPU rather than an argument.
+#
+# From the packed `release_end_v2` evaluation, best-of-3 seeds, predeclared selection order:
+#
+#                                     min receptor dist (p50)   clashing
+#     cp2lp_bb_release_cold                     1.23 A            74.0%
+#     cp2lp_bb_release_warm                     1.65 A            61.5%
+#     ..._cold__source     (zero edit)          2.70 A             0.0%
+#     real bound LPs, backbone, n=536           2.62 A               --
+#
+# The IDENTICAL Rosetta protocol (ref2015, PackRotamersMover + chi-only MinMover, 3 draws,
+# source rotamers via or_include_current) packs the zero-edit source with ZERO clashes out of
+# 96. So it is not the packer, and there is no better packer to find. And from the two release
+# runs' last logged step:
+#
+#     steric_weight                 1.0     <- the LARGEST active weight (adversarial is 0.3)
+#     clash_threshold_nm            0.20    <- real LPs sit at 0.262, only 0.06 nm away
+#     gradnorm/steric               0.78    <- against a TOTAL generator norm of 2.42
+#     steric_min_inter_nm           0.0705 (cold) / 0.206 (warm)
+#     loss_bb_steric / loss_bb_anchor  0.029 / 0.642
+#
+# So: not the weight, not the threshold, and not "the term is drowned out". 0.0705 nm is inside
+# a covalent bond length while the term that forbids it is pulling at a third of the whole
+# generator gradient.
+#
+# WHAT IS LEFT IS THE SHAPE. `relu(threshold - d)` is LINEAR in overlap depth, so its derivative
+# is a constant 1 per violating pair however deep the overlap goes -- resistance per pair never
+# rises, only the pair COUNT does. Against terms that keep pushing inward that balances at
+# whatever depth makes count x constant-slope equal the opposing pull, and nothing in the form
+# says 0.07 nm is catastrophically worse than 0.19 nm. A LINEAR HINGE SETS AN EQUILIBRIUM; IT
+# CANNOT ENFORCE A FLOOR. Rosetta's packer does not produce this geometry precisely because
+# `fa_rep` is steeply superlinear near contact.
+#
+# ----------------------------------------------------------------------------------
+# THE FORM, and why it is a sum rather than an exponent (see `_overlap_penalty`):
+#
+#     relu + depth_gain * relu**2 / threshold
+#
+# `depth_gain: 0.0` is the historical hinge BIT-FOR-BIT, which is the repo default, so every
+# existing arm and control is untouched and `release_cold` stays a valid baseline. At 2.0 the
+# restoring force is `1 + 2 * 2 * relu/threshold`:
+#
+#     at the cold arm's measured depth (d = 0.0705)   3.59x the linear force
+#     at half overlap          (d = 0.10)             3.00x
+#     just inside the boundary (d = 0.199)            1.02x   <- deliberately unchanged
+#     outside the threshold    (d >= 0.20)            0        <- an exact no-op
+#
+# NOT `threshold * (relu/threshold) ** 2`, which was the first thing tried and is wrong: it is
+# *weaker* than linear for every overlap shallower than half the threshold and its force decays
+# to 0 at the boundary, so it would trade the deep-overlap fix for a shallow-overlap regression
+# exactly where most pairs sit. The sum is monotonically >= the historical penalty everywhere,
+# pinned by `test_never_weaker_than_linear`.
+#
+# NOT WEIGHT-NEUTRAL, stated because it is the one way to misread this arm: at full overlap the
+# penalty is `threshold * (1 + depth_gain)`, so the deep tail's magnitude grows by up to 3x
+# here. That is the intended effect, but it means an arm that changes `steric_depth_gain` AND
+# `steric_weight` is not single-variable. This one changes only the former.
+#
+# ----------------------------------------------------------------------------------
+# WHAT TO READ, and the trap in reading it.
+#
+# PRIMARY:   `steric_min_inter_nm` -- must climb from 0.0705 toward real LPs' 0.262.
+#            Read it as a DISTRIBUTION against p5 0.214 / p25 0.251 / p50 0.262, never against
+#            the 0.20 threshold, which is a floor for "not interpenetrating" and was never a
+#            target. This is the same mistake `terminal_open_frac` already made once.
+# PRIMARY:   `steric_inter_violating_count` -- incidence, 0.464/residue in the cold arm. It
+#            thresholds the RAW gap, not the penalty, so it stays comparable across the knob
+#            (`test_violating_metrics_do_not_move_with_the_knob`). `loss_bb_steric` does NOT:
+#            its scale moves with `depth_gain` by construction, so do not read it cross-arm.
+# THE TRAP:  `terminal_gap_nm` must HOLD near 2.14. The cold arm reached the real median
+#            exactly, and it did so by pushing THROUGH the receptor. If the gap collapses back
+#            toward 0.5 while the clash clears, this arm has not fixed anything -- it has
+#            traded the opening back, which is the conflict the eval already found. Both must
+#            hold at once or the result is null.
+# NEW:       `gradnorm/anchor` and `gradnorm/adversarial`, which this tranche adds. Steric's
+#            0.78 only ever meant something next to what opposes it, and until now NOTHING
+#            logged the opposing terms -- the tug-of-war was inferred, not measured. They are
+#            differentiated at the same head, by the same arithmetic, on the same cadence, and
+#            just before the real backward so all terms share one graph.
+#
+# Do NOT expect the clash to go to zero. 0.464 violating pairs per residue against a 3.59x
+# force is a shifted equilibrium, not a constraint, and the honest prediction is partial. The
+# question this answers is whether the shape is the lever at all; if `steric_min_inter_nm`
+# moves materially, the follow-up is a ladder in `depth_gain`, and if it does not, the shape is
+# eliminated too and the opposing terms are named by the two new gradient norms.
+#
+# Run:
+#   bash scripts/submit_cp2lp_backbone.sh --submit shape
+
+defaults:
+  - /example/training_cp2lp_bb_release_cold
+  - _self_
+
+run_name: cp2lp_bb_shape
+
+cp2lp:
+  losses:
+    # THE WHOLE ARM. Everything else -- representation, discriminator, AE, split, anchor, batch
+    # limits, learning rates, step budget, `preserve_weight: 0.0`, the single milestone at
+    # 10300 -- is inherited from the cold release arm and is not restated, so this file cannot
+    # drift from the baseline it is measured against.
+    steric_depth_gain: 2.0

@@ -118,6 +118,8 @@ from proteinfoundation.cp2lp.bb_losses import (
     NON_INTERFACE_WEIGHT,
     backbone_preservation_loss,
     backbone_reconstruction_loss,
+    DEFAULT_PRESERVE_TERMINAL_EXEMPT_K,
+    DEFAULT_STERIC_DEPTH_GAIN,
     backbone_steric_loss,
     open_backbone_geometry_loss,
     source_interface_weights,
@@ -287,6 +289,21 @@ class CP2LPGenerator(Proteina):
         # make a config silently mean something else depending on the mode.
         self.w_bb_preserve = float(lw.get("preserve_weight", 1.0))
         self.w_bb_steric = float(lw.get("steric_weight", 1.0))
+        # SHAPE, not size. The release arms ended at `steric_min_inter_nm` 0.0705 (cold) and
+        # 0.206 (warm) against real bound LPs' 0.262 -- inside a covalent bond length -- with
+        # `steric_weight` already the largest active weight and its gradient norm at 0.78 of a
+        # total 2.42. A linear hinge sets an equilibrium rather than enforcing a floor, so the
+        # knob that can move this is the one that makes DEEP overlap disproportionately
+        # expensive. 0.0 is the historical hinge, bit-for-bit. See `_overlap_penalty`.
+        self.bb_steric_depth_gain = float(
+            lw.get("steric_depth_gain", DEFAULT_STERIC_DEPTH_GAIN)
+        )
+        # Residues per end that `preserve` does NOT charge for. 0 is historical. Non-zero is
+        # what separates "keep the interface" from "do not open the ring": the preservation
+        # term bills terminal travel, and terminal travel is how a macrocycle opens.
+        self.bb_preserve_exempt_k = int(
+            lw.get("preserve_terminal_exempt_k", DEFAULT_PRESERVE_TERMINAL_EXEMPT_K)
+        )
         self.w_bb_geometry = float(lw.get("bb_geometry_weight", 1.0))
         self.w_bb_open = float(lw.get("open_weight", 0.2))
         self.bb_non_interface_weight = float(lw.get("non_interface_weight", NON_INTERFACE_WEIGHT))
@@ -945,6 +962,7 @@ class CP2LPGenerator(Proteina):
             self._src_atom37(gen_batch, mask), self._src_atom_mask(gen_batch, mask), mask,
             gen_batch["x_target"], gen_batch["target_mask"], gen_batch["seq_target_mask"].bool(),
             cutoff_nm=self.contact_cutoff_nm, non_interface=self.bb_non_interface_weight,
+            terminal_exempt_k=self.bb_preserve_exempt_k,
         )
         atom37, atom_mask = backbone_to_atom37(gen_bb, mask)
         out = {
@@ -952,6 +970,7 @@ class CP2LPGenerator(Proteina):
             "steric": backbone_steric_loss(
                 gen_bb, mask, gen_batch["x_target"], gen_batch["target_mask"],
                 gen_batch["seq_target_mask"].bool(), threshold_nm=self.clash_threshold_nm,
+                depth_gain=self.bb_steric_depth_gain,
             )[0],
             "open": terminal_opening_reward(atom37, mask, self.min_open_gap_nm)[0],
         }
@@ -989,11 +1008,13 @@ class CP2LPGenerator(Proteina):
             self._src_atom37(gen_batch, mask), self._src_atom_mask(gen_batch, mask), mask,
             gen_batch["x_target"], gen_batch["target_mask"], gen_batch["seq_target_mask"].bool(),
             cutoff_nm=self.contact_cutoff_nm, non_interface=self.bb_non_interface_weight,
+            terminal_exempt_k=self.bb_preserve_exempt_k,
         )
         pres, pres_met = backbone_preservation_loss(gen_bb, src_bb, mask, w)
         ster, ster_met = backbone_steric_loss(
             gen_bb, mask, gen_batch["x_target"], gen_batch["target_mask"],
             gen_batch["seq_target_mask"].bool(), threshold_nm=self.clash_threshold_nm,
+            depth_gain=self.bb_steric_depth_gain,
         )
         atom37, _ = backbone_to_atom37(gen_bb, mask)
         opening, open_met = terminal_opening_reward(atom37, mask, self.min_open_gap_nm)
@@ -1107,16 +1128,34 @@ class CP2LPGenerator(Proteina):
             "preserve": self.w_bb_preserve, "steric": self.w_bb_steric,
             "open": self.w_bb_open, "geometry": self.w_bb_geometry,
         }
+        return self._grad_norms_at_head(
+            {k: (v, weights.get(k, 1.0)) for k, v in terms.items()}
+        )
+
+    @torch.enable_grad()
+    def _grad_norms_at_head(
+        self, weighted: dict[str, tuple[torch.Tensor, float]]
+    ) -> dict[str, torch.Tensor]:
+        """`{name: (unweighted_term, weight)}` -> `{gradnorm/<name>: norm}` at the arm's head.
+
+        Factored out so the terms computed OUTSIDE `_backbone_loss_terms` -- the adversarial
+        term and the real-LP anchor -- can be measured against the same parameters, by the same
+        arithmetic, and so be compared with `steric` on the same axis. That comparison is the
+        whole point: steric's 0.78 only means something next to what is opposing it, and until
+        now nothing logged the opposing terms at all.
+        """
         params = [p for p in self._backbone_head_parameters() if p.requires_grad]
         out: dict[str, torch.Tensor] = {}
         if not params:
             return out
-        for name, term in terms.items():
-            if not term.requires_grad:
+        for name, (term, weight) in weighted.items():
+            if term is None or not torch.is_tensor(term) or not term.requires_grad:
                 out[f"gradnorm/{name}"] = torch.zeros(())
                 continue
+            # retain_graph because the caller still has to run the real backward on this graph,
+            # and because the next term in this loop needs it too.
             g = torch.autograd.grad(
-                weights.get(name, 1.0) * term, params, retain_graph=True, allow_unused=True
+                weight * term, params, retain_graph=True, allow_unused=True
             )
             out[f"gradnorm/{name}"] = torch.sqrt(
                 sum((x * x).sum() for x in g if x is not None) + 1e-20
@@ -1287,6 +1326,13 @@ class CP2LPGenerator(Proteina):
 
         # -------------------------------------------------- real LP: flow + D real pool
         g_loss = torch.zeros((), device=batch["mask"].device)
+        # Terms the gradient probe can only reach from here: the anchor is computed in the
+        # real-LP branch above the generation block, and the adversarial term below it, so
+        # neither is in scope inside `_backbone_loss_terms`. Collected as they are built and
+        # differentiated together just before the real backward, while the graph is still
+        # alive. CLEARED EVERY STEP: differentiating last step's tensor would hit a freed
+        # graph, which is a crash on a schedule -- i.e. hours into a run, not at smoke time.
+        self._probe_extra_terms: dict[str, tuple[torch.Tensor, float]] = {}
         real_feats_live = None
         if linear_idx.any():
             lp_batch = slice_batch(batch, linear_idx, bs)
@@ -1360,6 +1406,7 @@ class CP2LPGenerator(Proteina):
             if pending is not None:
                 self._pending_bb_anchor = None
                 anchor_loss, _, anchor_met = self._real_lp_backbone_anchor(pending)
+                self._probe_extra_terms["anchor"] = (anchor_loss, self.bb_anchor_weight)
                 g_loss = g_loss + self.bb_anchor_weight * anchor_loss
                 metrics["loss_bb_anchor"] = anchor_loss.detach()
                 metrics.update(anchor_met)
@@ -1441,6 +1488,7 @@ class CP2LPGenerator(Proteina):
                         # map of the features, so it passes gradient to the generator.
                         scored, level = self._maybe_corrupt(fake_feats)
                         adv = hinge_g_loss(self.discriminator(scored, noise_level=level))
+                    self._probe_extra_terms["adversarial"] = (adv, self.adv_weight)
                     g_loss = g_loss + self.adv_weight * adv
                     metrics["loss_adv_g"] = adv.detach()
 
@@ -1448,6 +1496,19 @@ class CP2LPGenerator(Proteina):
         # A batch can in principle carry no differentiable term (every row filtered out of
         # both branches). `manual_backward` on a graph-less tensor raises, so check rather
         # than let an edge batch kill a two-day run.
+        # The opposing half of the gradient budget, on the SAME schedule and the same
+        # parameters as the backbone terms. Here rather than beside them because `adv` does not
+        # exist yet at that point, and the comparison is worthless if the two halves are
+        # measured at different moments on different graphs.
+        if (
+            self.cp2lp_mode == "backbone"
+            and self.bb_grad_probe_every > 0
+            and int(self.g_updates) % self.bb_grad_probe_every == 0
+            and self._probe_extra_terms
+        ):
+            metrics.update(self._grad_norms_at_head(self._probe_extra_terms))
+        self._probe_extra_terms = {}
+
         if g_loss.requires_grad:
             self.manual_backward(g_loss / accum)
         else:

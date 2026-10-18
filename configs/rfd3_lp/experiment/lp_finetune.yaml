@@ -133,8 +133,14 @@ trainer:
   # An "epoch" is `n_examples_per_epoch` examples, so this is the knob that makes
   # checkpoint and validation cadence meaningful rather than the dataset size.
   n_examples_per_epoch: 2400
-  checkpoint_every_n_epochs: 2
-  # Every 2 epochs, aligned with checkpoint_every_n_epochs, so EVERY saved checkpoint has a
+  # 2.69 GB a checkpoint and ~1.25 h an epoch, so every-2 burned ~26 GB/day and reached
+  # 41 GB before anyone looked. 10 is a MULTIPLE of validate_every_n_epochs, which is the
+  # property that matters: the invariant below ("every saved checkpoint has a measurement")
+  # survives any checkpoint interval that is a multiple of the validation interval, and
+  # would break for an interval like 5. Retention is bounded separately -- foundry never
+  # prunes, so CKPT_KEEP_* in _lpgen_preamble.sh governs what survives.
+  checkpoint_every_n_epochs: 10
+  # Every 2 epochs, a divisor of checkpoint_every_n_epochs, so EVERY saved checkpoint has a
   # generative measurement attached rather than only a training curve. The panel is 64 specs
   # and a validation pass costs roughly a fifth of an epoch, which is a real but worthwhile
   # overhead given that the training metrics have already been shown not to answer the

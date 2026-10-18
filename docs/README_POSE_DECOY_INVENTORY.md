@@ -324,6 +324,30 @@ metric, not a gate**, so the ceiling audit can use it.
 The contact-aware extension move recommended above is **not** added yet. It is downstream
 of the ceiling audit, which may change the coverage target it exists to serve.
 
+**CLOSED (Milestone 1.5).** The ceiling audit did change it, so this item is resolved as
+**not needed as specified, and replaced.**
+
+The extension move existed to manufacture large *terminal* gaps, because terminal gap was
+the coverage axis. Milestone 1.5 routes the 20-45 A band to bridged chemistries, and for a
+bridged macrocycle the bonded atoms are interior side chains -- so the discriminator becomes
+**bridge-span hostability**, not terminal gap (this is section 4.4's point, now load-bearing
+rather than a caveat). Stretching a peptide to open its termini does not make it a harder
+bridged case and can leave hostability untouched, so the move would not serve the target that
+replaced it.
+
+What takes its place: the corruption must **reduce isopeptide hostability to roughly two
+thirds**, matching real linear binders (LNR 71.7%, PepBench 64.7%) against CPSea natives at
+100% by construction. That is a gentler requirement than moving the terminal-gap median from
+14 to 20 A, and it is *currently unmeasured* -- hostability on synthetic open states is not
+reported anywhere. **Measure it on the corrupted states before the pilot**; if the corruption
+turns out to leave hostability near 100%, a contact-aware extension is one candidate fix and
+can be reconsidered then, against the new axis.
+
+One thing the audit did *not* change: global contact retention stays a recorded metric rather
+than a gate, for the reasons above. Note it is also the quantity Milestone 1.5 found to be a
+length-contaminated ratio (`README_M15_RESULTS.md` section 3) -- another reason not to gate
+on it.
+
 ### 4.4 The chain-terminal gap is the wrong discriminator for bridged linkages
 
 For a disulfide or isopeptide macrocycle the bonded atoms are interior side chains, so

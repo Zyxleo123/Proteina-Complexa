@@ -108,8 +108,17 @@ def main() -> int:
         rosetta_rows.extend(_read_jsonl(f))
     print(f"rosetta scored complexes: {len(rosetta_rows)}")
 
+    # compute_rosetta_interface_metrics_single prefixes every term with `binder_rosetta_`; the
+    # interface dG is `binder_rosetta_dG_separated` (NOT `dG_separated`, which is always absent).
+    DG_KEY = "binder_rosetta_dG_separated"
+
     def _dg(rows):
-        return [float(r["dG_separated"]) for r in rows if r.get("dG_separated") is not None]
+        out = []
+        for r in rows:
+            v = r.get(DG_KEY)
+            if v is not None and math.isfinite(float(v)):
+                out.append(float(v))
+        return out
 
     by_type = defaultdict(list)
     for r in rosetta_rows:
@@ -156,7 +165,12 @@ def main() -> int:
         dg_groups = [(t, _dg(rs)) for t, rs in sorted(by_type.items())]
         dg_groups = [(t, d) for t, d in dg_groups if d]
         if dg_groups:
-            axd.boxplot([d for _, d in dg_groups], labels=[t for t, _ in dg_groups], showmeans=True)
+            # showfliers=False: a handful of relax-failure complexes score dG in the thousands and
+            # would flatten every box to a line. The bulk (box + whiskers) is what's informative;
+            # the medians in summary.json are outlier-robust anyway. tick_labels, not labels
+            # (renamed in matplotlib 3.9+, removed by 3.11).
+            axd.boxplot([d for _, d in dg_groups], tick_labels=[t for t, _ in dg_groups],
+                        showmeans=True, showfliers=False)
             axd.axhline(0, color="grey", lw=0.8, ls="--")
             axd.set_ylabel("Rosetta dG_separated (REU)")
             axd.set_title(f"Interface dG by linkage (n={len(rosetta_rows)})")

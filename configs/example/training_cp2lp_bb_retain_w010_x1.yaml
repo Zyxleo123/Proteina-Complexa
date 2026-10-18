@@ -1,0 +1,50 @@
+# @package _global_
+# LOW-WEIGHT RETENTION LADDER: preserve_weight 0.1, terminal exemption k=1.
+#
+# the rung originally in the first ladder and cancelled to make room for the
+# exemption study -- which was the wrong call, since 0.25 turned out to be already past the
+# collapse. Reinstated, now with the exemption.
+#
+# ----------------------------------------------------------------------------------
+# WHY THIS SECOND LADDER EXISTS: THE FIRST ONE WAS MIS-CENTRED. MEASURED on the three
+# `w025` rungs, as quintile medians of a run that STARTED from edit 0.650 / gap 1.957:
+#
+#     k=0   edit  0.975  0.793  0.089  0.054  0.061     gap  2.046  1.821  0.474  0.451  0.471
+#     k=1   edit  1.018  0.918  0.639  0.113  0.064     gap  2.121  1.988  1.617  0.541  0.468
+#     k=2   edit  1.002  0.885  0.513  0.062  0.069     gap  2.122  1.982  1.412  0.451  0.491
+#
+# All three collapse to edit ~0.06 nm with the gap parked on `min_open_gap_nm` = 0.45 -- the
+# near-identity regime, i.e. the ring closed back up. So preserve_weight 0.25 is ALREADY PAST
+# the knee at every exemption level, and the three rungs mostly measured the same collapsed
+# state. The informative range is BELOW 0.25, which is what this ladder scans.
+#
+# WHAT THE EXEMPTION DID AND DID NOT DO, since it is held fixed here at the value that looked
+# best: k=1 and k=2 hold the gap through quintile 3 (1.617 / 1.412) where k=0 has already
+# collapsed (0.474), so the exemption BUYS TIME -- but by quintile 5 all three are identical.
+# Freeing 2 or 4 terminal residues cannot compensate for charging the other ~10 at 0.25.
+#
+# k=1 AND NOT k=2: it held the gap longest (1.617 vs 1.412) AND gives up the least interface
+# coverage (18.5% of contacts vs 42.3%), so it is the better trade on both axes. That ordering
+# rests on one quintile of one run, so it is a reasonable default rather than a settled result
+# -- if the packed retention at the 13300 milestones disagrees, rerun this ladder at k=2.
+#
+# A CAVEAT ON THE 0.45 FLOOR, which is why "collapsed" is read from the EDIT and not the gap:
+# `open_weight` is 0.2 with a hinge flat above `min_open_gap_nm` = 0.45, so a gap resting at
+# exactly 0.45-0.47 is that hinge catching the fall, not a natural equilibrium. Read
+# `preserve_ca_rmsd_nm` as the primary signal and the gap as corroboration.
+#
+# READ: the win is `preserve_ca_rmsd_nm` landing near 0.3 nm -- between the baseline's 0.650 and
+# the collapsed 0.06 -- while `terminal_gap_nm` HOLDS in real LPs' interquartile range
+# (1.575-2.300, p50 2.138). Retention itself needs the packing eval at the milestone.
+
+defaults:
+  - /example/training_cp2lp_bb_retain
+  - _self_
+
+run_name: cp2lp_bb_retain_w010_x1
+
+cp2lp:
+  losses:
+    preserve_weight: 0.1
+    # Fixed at the exemption that delayed the collapse most, so this ladder varies WEIGHT alone.
+    preserve_terminal_exempt_k: 1

@@ -1,0 +1,74 @@
+# The LP arm WITH RFD3's native hotspot conditioning switched back on.
+#
+# One variable against `lpgen_base`: hotspots. Everything else -- the manifest, the
+# condition mixture, the crop budget, the binder protection, the sequence-reveal schedule --
+# is inherited, so a difference between this arm and the base arm cannot be a difference in
+# anything else.
+#
+# WHY THIS ARM EXISTS. `lpgen_base` sets `max_ppi_hotspots_frac_to_provide: 0.0` and
+# `add_ppi_hotspots: 0.0` on the reasoning that the eventual inference input is "target plus
+# CP sequence -- no hotspots", so training with them would condition on information that
+# will not be there. That reasoning is now superseded: WITHOUT a retention objective the
+# paired LP structure is decorative. If the generated peptide is free to bind anywhere on the
+# target, then the LP's binding mode carried no information and the LP's *sequence* alone
+# would have been a sufficient input. Hotspots are the channel that makes "bind where the LP
+# bound" expressible, so they are part of the task, not a leak.
+#
+# NOTHING HERE IS NEW CODE. RFD3 ships the whole path:
+#   * `get_hotspot_atoms`        ppi_transforms.py:44   -- interchain contacts at a cutoff
+#   * `AddPPIHotspotFeature`     ppi_transforms.py:240  -- samples a subset, sets the annot
+#   * `is_atom_level_hotspot: 1` model/components/rfd3_net.yaml:43 -- a real ATOM-LEVEL
+#     INPUT CHANNEL of the released network, so the pretrained weights already have a
+#     trained hotspot embedding and this is a warm start, not a new head.
+#   * `PPIMetrics`               design_metrics.py:382  -- `fraction_hotspots_contacted`
+# The values below are RFD3's own `design_base` defaults, restored. That is what "use its
+# original pipeline" means operationally.
+#
+# INITIALIZE FROM THE RELEASED CHECKPOINT, NOT FROM AN LP CHECKPOINT OF THE BASE ARM.
+# `AddAdditional1dFeaturesToFeats` is constructed with
+# `autofill_zeros_if_not_present_in_atomarray=True` (pipelines.py:521), so with hotspots off
+# the channel is not absent -- it is fed a CONSTANT ZERO on every atom of every example. An
+# LP checkpoint from the base arm has therefore been actively trained to expect that channel
+# dead, which is a worse starting point for this arm than the released weights that were
+# trained with `add_ppi_hotspots: 0.75`.
+
+defaults:
+  - lpgen_base
+  # The hotspot validation panel, ADDED alongside `val/lp_panel` rather than replacing it.
+  # `lpgen_base` already registers `val/lp_panel@val.lp_panel`; keeping it is what makes this
+  # arm's curve comparable to the base arm's on an identical instrument, and the new panel is
+  # what measures the thing this arm changes. Cost is a second 64-spec rollout per validation
+  # epoch (~2/5 of an epoch rather than ~1/5).
+  - val/lp_panel_hotspot@val.lp_panel_hotspot
+  - _self_
+
+global_transform_args:
+  # Stock `design_base` value. Note what the upstream sampler actually does with it
+  # (ppi_transforms.py:279-294): the number provided is
+  #     np.random.randint(0, ceil(n_gt_hotspots * frac))
+  # which is uniform on [0, ceil(n*frac) - 1] -- EXCLUSIVE of the top. Two consequences
+  # worth knowing before reading any number off this arm:
+  #   * the requested fraction is never actually reached; the mean provided is about half
+  #     of it. This is conditioning dropout and is wanted -- it is what trains "obey the
+  #     hotspots WHEN GIVEN" rather than "always expect 20% of the interface".
+  #   * if `ceil(n_gt * frac) == 1` the draw is `randint(0, 1)`, which is always 0, so such
+  #     examples silently get NO hotspots while `add_ppi_hotspots` was true. At frac 0.2
+  #     that is every example with 5 or fewer ground-truth hotspot atoms. Our peptides are
+  #     5-16 residues, so this corner is plausible and is MEASURED rather than assumed --
+  #     `script_utils/lpgen_hotspot_probe.py` reports its rate before any GPU time is spent.
+  max_ppi_hotspots_frac_to_provide: 0.2
+
+  # 4.5 A, heavy atom, interchain. Inherited from `lpgen_base`, which already matched
+  # `design_base`, and restated here because it must agree with the SCORING cutoff:
+  # `PPIMetrics` defaults to 4.5 A as well (design_metrics.py:386). If conditioning were
+  # wider than scoring, a perfectly obedient model could never reach 1.0 -- hotspots
+  # conditioned at 5-7 A would be graded as "not contacted" at 4.5 A, and the shortfall
+  # would read as disobedience. One cutoff, both sides.
+  ppi_hotspot_max_distance: 4.5
+
+  meta_conditioning_probabilities:
+    # Stock `design_base` value. Our `ppi` condition frequency is 8.0 of a 10.0 total, so
+    # the realised rate is ~0.8 * 0.75 ~ 60% of examples carrying a hotspot request. The
+    # remaining ~40% is what keeps the channel OPTIONAL: an arm trained at 1.0 would learn
+    # to require hotspots, and the base task (no hotspots) would regress.
+    add_ppi_hotspots: 0.75

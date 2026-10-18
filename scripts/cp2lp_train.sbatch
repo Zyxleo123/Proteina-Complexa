@@ -55,8 +55,34 @@ if [[ "$SMOKE" == "1" ]]; then
   # A smoke run gets its OWN run_name: three concurrent jobs writing one run_name collide
   # on the checkpoint directory and the last writer wins.
   EXTRA+=("++run_name=${RUN_NAME}_smoke" "++opt.limit_train_batches=20" "++val_generation.enabled=false")
+  # FORCE THE GRADIENT PROBE TO FIRE. It is scheduled on `g_updates % N == 0` with N=200, and
+  # the fork checkpoint arrives carrying g_updates=250, so at 20 batches a smoke run reaches
+  # neither 400 nor any other multiple -- the probe code would never execute and the smoke
+  # would "pass" without touching the thing being smoked. This is exactly the path that logs
+  # the anchor and adversarial terms, which are stashed during the step and differentiated
+  # against a live graph, i.e. the kind of defect that otherwise surfaces hours into a run.
+  EXTRA+=("++cp2lp.backbone.grad_probe_every_n_steps=1")
+  # AND DROP THE ADVERSARIAL WARMUP, for the same reason. The generator's adversarial term is
+  # gated on `g_updates >= cp2lp.adversarial.warmup_g_steps` (300), the fork arrives carrying
+  # g_updates=250, and `accumulate_grad_batches=8` means 20 batches buy only ~2 g-updates per
+  # epoch -- so a smoke crawls from 250 and barely reaches 300, if at all. MEASURED on job
+  # 74076: `gradnorm/anchor_step` logged 520 times while `loss_adv_g` and
+  # `gradnorm/adversarial` were logged ZERO times, i.e. the smoke validated half the probe and
+  # silently skipped the adversarial half. Setting the warmup to 0 makes the branch run from
+  # the first g-update, which is the only way a smoke covers it.
+  EXTRA+=("++cp2lp.adversarial.warmup_g_steps=0")
 else
   EXTRA+=("++run_name=${RUN_NAME}")
+fi
+
+# Hydra overrides appended verbatim, LAST so they win. Space-separated; set it from the
+# submitter with --set. Deliberately not used to carry configuration a job needs to be
+# correct -- that belongs in the env file and in a config -- only one-off probes like
+# forcing a cadence or shortening a budget.
+if [[ -n "${EXTRA_TRAIN_ARGS:-}" ]]; then
+  # shellcheck disable=SC2206  (word splitting is the point: these are separate argv entries)
+  EXTRA+=(${EXTRA_TRAIN_ARGS})
+  echo "EXTRA_TRAIN_ARGS: ${EXTRA_TRAIN_ARGS}"
 fi
 
 # Report this job's peak host RAM on the way out; see `_cp2lp_mem_peak`.

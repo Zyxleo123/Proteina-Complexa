@@ -1,0 +1,24 @@
+# @package _global_
+# RETENTION LADDER, preserve_weight = 0.25 -- the MID rung, and the one most likely to sit at a usable point: a quarter of the
+# original strength against an edit that was 12x larger without it. This is the rung to read
+# first.
+#
+# Differs from `training_cp2lp_bb_retain` in `run_name` and `preserve_weight` and in NOTHING
+# else: the start checkpoint, the budget, the milestone, the noise-adapter flag and the
+# `steric_depth_gain: 0.0` default all come from the shared base, so a rung cannot drift from
+# its siblings. Read the base's header for why this ladder penalises interface EDIT rather than
+# openness -- the gap/retention tension is an edit-size confound (partial corr +0.005).
+#
+# READ: `preserve_ca_rmsd_nm` (edit, baseline 0.650) against `terminal_gap_nm` (baseline tail
+# median 1.957, real p25-p75 1.575-2.300). Retention itself is only computable after all-atom
+# packing at the milestone, so the in-run numbers are the PROXY and the eval is the verdict.
+
+defaults:
+  - /example/training_cp2lp_bb_retain
+  - _self_
+
+run_name: cp2lp_bb_retain_w025
+
+cp2lp:
+  losses:
+    preserve_weight: 0.25

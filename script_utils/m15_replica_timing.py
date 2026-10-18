@@ -74,7 +74,7 @@ def time_one(rec, args, forcefield, platform) -> dict:
            "receptor_length": int(rec.receptor_length)}
 
     t0 = time.perf_counter()
-    fixer, n_added = prepare_complex(Path(rec.path), None, args.pep_chain)
+    fixer, n_added, _ = prepare_complex(Path(rec.path), None, args.pep_chain)
     t_prepare = time.perf_counter() - t0
 
     ref = reference_state(fixer)

@@ -1,0 +1,113 @@
+# @package _global_
+# SHARED BASE for the RETENTION LADDER. NOT AN ARM -- nothing launches from this file. Three
+# thin children differ from it by `run_name` and `cp2lp.losses.preserve_weight`, which is the
+# entire difference between them and the entire experiment.
+#
+# ----------------------------------------------------------------------------------
+# WHAT THIS LADDER IS FOR, AND THE MEASUREMENT THAT REDIRECTED IT.
+#
+# The obvious reading of the release eval was "openness and a usable interface cannot both
+# hold": retention falls monotonically across terminal-gap bins (0.709 / 0.604 / 0.496 / 0.441
+# for gaps [0.45,0.8) / [0.8,1.2) / [1.2,2) / >=2 nm). That reading is WRONG, and the partial
+# correlations say so. Measured on the 192 packed release attempts:
+#
+#     corr(gap, retention)                  -0.641     the apparent tension
+#     corr(gap, edit)                        +0.918     but gap and edit are nearly one variable
+#     PARTIAL corr(gap, retention | edit)    +0.005     <- EXACTLY NULL
+#     PARTIAL corr(edit, retention | gap)    -0.367     <- the real cost
+#
+# And inside narrow edit bands the high-gap half is not consistently worse (-0.077, +0.062,
+# +0.030 for edit bands [0.3,0.6) / [0.6,0.9) / [0.9,1.3)): two of three favour MORE gap.
+#
+# So retention is spent on EDIT MAGNITUDE, not on opening. Openness was a proxy. That is the
+# same error shape as the `d_acc`-reads-openness claim, which also survived as a strong
+# marginal correlation and died under the confound -- do not re-derive it.
+#
+# THEREFORE the lever is a term that charges for interface displacement while leaving the
+# opening free, and `preserve_weight` is exactly that term: interface-weighted backbone
+# displacement from the source, with `non_interface_weight: 0.25` already down-weighting
+# everything away from the interface. It is set to 0.0 in the release arms, so nothing in
+# training tracks the interface at all and retention is unconstrained by construction.
+#
+# ----------------------------------------------------------------------------------
+# WHY A LADDER AND NOT ONE ARM. Both endpoints are already known, and they are far apart:
+#
+#     preserve 0.0   edit 0.650 nm   retention 0.489   (release_cold, measured)
+#     preserve 1.0   edit 0.053 nm   retention ~0.95   (the torsion arm's near-identity
+#                                                       regime; 0 edit measures 0.964)
+#
+# A 12x swing in edit size across one order of magnitude of weight means the interesting
+# behaviour is a CURVE, and a single mid-point cannot tell a monotone trade-off from a knee.
+# The rungs are biased LOW (0.1 / 0.25 / 0.5) because 1.0 already over-constrains by 12x, so
+# the transition is expected below it.
+#
+# WHAT WOULD MAKE THIS A WIN: a rung where `preserve_ca_rmsd_nm` lands near 0.3 nm while
+# `terminal_gap_nm` HOLDS in the real interquartile range (1.575-2.300, p50 2.138). Given the
+# null partial correlation that combination is not forbidden, which is the whole reason to
+# spend the GPU. If instead the gap collapses in lockstep with the edit at every rung, then
+# the two are coupled in a way the partial correlation did not capture, and the finding is
+# that `preserve` cannot separate productive terminal travel from interface damage -- which
+# points at the pairwise source-contact hinge instead, not at a bigger weight.
+#
+# WARM, AND WHY. Every rung starts from the release-COLD endpoint, which is the measured
+# state: edit 0.650 nm, retention 0.489, gap 1.957 nm (tail median). So each rung is a
+# BEFORE/AFTER on a known point rather than a fresh run that has to re-derive everything, and
+# a 3000-update budget is enough to re-equilibrate the edit under a new weight. This is the
+# "ramp the weight back from this checkpoint" step the release tranche named as its follow-up.
+#
+# DELIBERATELY NOT COMBINED WITH THE STERIC SHAPE KNOB. `steric_depth_gain` stays at its
+# default 0.0 here, so every rung is single-variable against the FINISHED and already-evaluated
+# `cp2lp_bb_release_cold`. Folding in an untested second knob would make the ladder
+# uninterpretable against the only baseline that has retention numbers.
+#
+# ----------------------------------------------------------------------------------
+# THE WARM-START BUDGET TRAP. `g_updates` is a `register_buffer(..., persistent=True)`, so it
+# rides in the state_dict; `pretrain_ckpt_path` is "weights only" for the OPTIMIZER but a
+# persistent buffer is a weight to `load_state_dict`. Job 72084 loaded a g=10300 milestone
+# against `max_g_updates: 10300`, logged "reached the budget (global_step=1)" and EXITED 0,
+# releasing every dependent behind a stage that did no work.
+#
+#     release_cold's milestone carries   10300
+#     wanted                              3000 updates per rung
+#     so the budget is                   13300, and eval_checkpoint_g_updates must MATCH it
+#
+# `eval_checkpoint_g_updates` is matched by EQUALITY (`if n not in self.eval_ckpt_g_updates`),
+# not by threshold, so a stale value writes NO milestone and the packing eval has nothing to
+# read.
+#
+# STORAGE, which is a hard constraint and not a preference. Both backbone arms were killed
+# mid-checkpoint-write by `OSError: [Errno 122] Disk quota exceeded` at ~39 GB, and the quota
+# is not queryable on this cluster (`quota` and `lfs` are both absent). Each rung costs ~12.4
+# GB: one milestone (3.6 + 2.9 GB) plus the rolling `last`/`last-EMA` pair (2.9 + 2.9 GB). The
+# ladder is THREE rungs and not four for this reason, and each rung's `last*.ckpt` is redundant
+# once its milestone is written -- prune them before launching anything else.
+#
+# Run:
+#   bash scripts/submit_cp2lp_backbone.sh --submit retain
+
+defaults:
+  - /example/training_cp2lp_bb_release_cold
+  - _self_
+
+run_name: cp2lp_bb_retain_base
+
+# SET BY EACH RUNG, and the only thing they differ in besides `run_name`.
+# `???` forces each child to declare it rather than silently inheriting 0.0 from the release
+# arm, which would make a rung a duplicate of the baseline without saying so.
+cp2lp:
+  losses:
+    preserve_weight: ???
+
+  # Raw milestone, not the `-EMA` sidecar: EMA weights are evaluation weights, and resuming
+  # optimisation from an averaged shadow starts from a point no optimizer step ever stood on.
+  max_g_updates: 13300
+  eval_checkpoint_g_updates: [13300]
+
+  onepass:
+    # Keeps release_cold's trained noise-adapter columns (measured rms 2.001e-02) instead of
+    # re-drawing them at N(0, 0.02). Without this, `train.py` re-randomises on every
+    # `pretrain_ckpt_path` load -- including warm starts -- while this file claims to keep the
+    # loaded generator. Each rung's log must print `LEFT AS LOADED`.
+    preserve_loaded_noise_adapter: true
+
+pretrain_ckpt_path: /zfsauton/scratch/yixiz/Proteina-Complexa/training_runs/store/cp2lp_bb_release_cold/checkpoints/g010300.ckpt

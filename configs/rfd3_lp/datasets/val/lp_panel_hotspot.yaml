@@ -1,0 +1,48 @@
+# In-loop generative validation on the HOTSPOT panel: hs_native and its paired control.
+#
+# Two specs per panel complex, both with the peptide's sequence given and its coordinates
+# generated, differing in exactly one thing:
+#
+#   <id>__hs_native   hotspots requested, drawn from the native interface at 4.5 A
+#   <id>__hs_none     no hotspot request, SAME ori, same everything else
+#
+# THE PAIR IS THE MEASUREMENT. `ppi_metrics.fraction_hotspots_contacted` on `hs_native`
+# alone cannot support a claim of obedience: the hotspots are drawn from the native pocket,
+# and the model would score well by binding the pocket it was going to bind anyway. Only the
+# contrast against `hs_none` attributes anything to the channel. Note that the metric is
+# ABSENT on `hs_none` rather than zero -- `PPIMetrics.compute` skips examples whose hotspot
+# mask is empty and returns `{}` -- so the comparison is between arms on the pose metrics
+# (interface RMSD, clash, contacts), with retention read on the native arm only.
+#
+# THIS PANEL IS ADDED, NOT SUBSTITUTED for `val/lp_panel`. Keeping both roughly doubles a
+# validation pass (two 64-spec rollouts, so about two fifths of an epoch rather than one
+# fifth) and that is worth paying: `lp_panel` is the instrument every earlier LP checkpoint
+# was scored on, so keeping it is what makes this arm's curve comparable to the base arm's
+# instead of starting a new, incomparable series. Drop this panel, not that one, if a
+# validation pass ever costs more than the training it informs.
+
+defaults:
+  - design_validation_base
+  - _self_
+
+dataset:
+  # Built by `./scripts/submit_lpgen.sh --submit hscontigs`, which writes this file and the
+  # 4-arm obedience panel in ONE job so their cutoff, request fraction and ori push cannot
+  # drift apart.
+  #
+  # The ori here is derived from the REQUESTED hotspot patch with this panel's calibrated
+  # 6 A push, not by `infer_ori_strategy: hotspots` (whose push is hard-coded to 10.0 and
+  # measured 5.23 A from the native peptide COM against 3.27 A at 6.0). It is supplied as
+  # an explicit `ori_token`, which also means `infer_ori_strategy` would be ignored if it
+  # were set -- `set_com` gives `ori_token` precedence (utils/inference.py:463).
+  data: /zfsauton/scratch/yixiz/LPData/preprocessed/metadata_lpgen/lpgen_val_contigs_hotspot.json
+  name: lp-panel-hotspot
+
+  # Matches `checkpoint_every_n_epochs`, so every saved checkpoint carries a hotspot
+  # measurement rather than only a training curve.
+  eval_every_n: 2
+
+  # null = all 64 specs (32 complexes x 2 arms). Narrowing this breaks the pairing unless
+  # both arms of a complex are kept, so prefer shrinking the PANEL at build time
+  # (`--set PANEL_SIZE=...`) over subsetting keys here.
+  subset_to_keys: null

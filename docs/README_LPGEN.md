@@ -1340,6 +1340,11 @@ the import before editing either.
 
 ## The first validation curve measured nothing, and why
 
+> **Read this as history, not as findings.** Every number in this section was produced by a
+> broken panel. It is kept because both failure modes are silent and worth recognising again,
+> not because any value here stands. The standing results are in "What the corrected
+> instrument shows" below, where the pose verdict comes out the OPPOSITE way.
+
 The RFD3 arm produced six validation epochs (576–586, 512 models each). **Both halves of that
 curve — pose and sequence — were read through broken instruments.** Recorded here because both
 failures are silent and both would have been quoted as model results.
@@ -1464,16 +1469,197 @@ rewriting it would put two ORI conventions into a single curve. Hence
 `lpgen_val_contigs_pocket.json` alongside the original, with the builder logging the ORI mode,
 the push, and a per-mode count, and warning loudly on any fallback.
 
+## What the corrected instrument shows
+
+**ALL FOUR CHECKPOINTS MEASURED (2026-10-15).** Two separate findings live here and must not
+be conflated: the **level** was badly wrong (this subsection), and the **trend** was wrong in
+the opposite direction (the subsection after it).
+
+Every re-eval was verified independently rather than trusted on exit code — 1024/1024
+structures each, `mse_loss` = 0 (so none of them trained), prevalidation at the checkpoint's
+own epoch, and the copy check reading 1.0000 with **0 of 4,096 models** getting a GIVEN
+identity wrong.
+
+### The level: paired before/after on one checkpoint
+
+Paired comparison, same checkpoint, same 64 specs, same 1024 models (64 x 16). The only
+difference is where the diffusion prior is dropped:
+
+| metric | broken ORI (receptor centroid) | pocket + 6 A |
+|---|---|---|
+| raw CA RMSD | 21.34 A | **8.10 A** |
+| **superposed** CA RMSD | 3.13 A | **2.49 A** |
+| interface RMSD | 20.76 A | **7.51 A** |
+| clashes < 2 A | 2 | **0** |
+| contacts < 5 A | 423 | 300 |
+| poses <= 2 A | 0.021 | **0.115** (5.5x) |
+| targets with any hit | 0.125 | **0.391** (3.1x) |
+| **best-of-16 interface RMSD** | 14.64 A | **2.50 A** |
+| hidden-position accuracy | 4.95% | **9.77%** |
+
+QC is clean: `receptor_rmsd_after_fit` median 0.037 A with 0 of 1024 rows above 0.5 A, so the
+receptor stayed pinned and these RMSDs mean what they say.
+
+### The trend: the fine-tune IS improving, and the broken panel hid it
+
+| epoch | raw | superposed | iface | poses <=2 A | any-hit | clash | contacts | hidden-pos |
+|---|---|---|---|---|---|---|---|---|
+| 572 | 9.41 | 3.16 | 8.98 | 0.038 | 0.203 | 0 | 228 | 0.104 |
+| 578 | 8.69 | 2.87 | 7.98 | 0.062 | 0.234 | 0 | 267 | 0.101 |
+| 582 | 8.34 | 2.69 | 7.65 | 0.084 | 0.281 | 0 | 290 | 0.089 |
+| 586 | 8.10 | 2.49 | 7.51 | **0.115** | **0.391** | 0 | 300 | 0.098 |
+
+Models within a spec are not independent (64 specs x 16 samples), so the statistics aggregate
+to one value per spec first, then test paired across the 64 specs:
+
+| metric | 572 -> 586 | specs improved | Wilcoxon p |
+|---|---|---|---|
+| raw CA RMSD | 9.83 -> 8.60 | 47/64 | **2.6e-5** |
+| **superposed CA RMSD (the FOLD)** | 3.31 -> 2.89 | 42/64 | **9.5e-4** |
+| interface RMSD | 9.22 -> 7.90 | 48/64 | **3.8e-6** |
+| best-of-16 interface RMSD | 3.97 -> 3.19 | 45/64 | **0.0035** |
+| contacts < 5 A | 259 -> 346 | 62/64 | **5.4e-12** |
+| hidden-position accuracy | 0.104 -> 0.098 | 9/32 | 0.66 — **null** |
+
+Per-spec Spearman against epoch gives median rho = **-0.80** on all three RMSDs, i.e. monotone
+over all four points, and the sign test agrees: p = 2.3e-4 (raw), 0.033 (superposed),
+7.7e-5 (interface). Contacts: median rho **+1.000**, 62/64 specs, p = 2.3e-16.
+
+**THIS REVERSES THE EARLIER VERDICT.** The broken panel reported superposed RMSD as
+3.53 -> 3.54 at p=0.63 and the conclusion drawn was "nothing is improving." The same
+checkpoints, measured correctly, give 3.31 -> 2.89 at p=9.5e-4. The instrument was reporting
+obedience to a bad instruction, not the model. **Do not cite the flat curve; it is an artifact
+in both directions.**
+
+**The clash/contact signal inverted its meaning.** Under the broken ORI, contacts and clashes
+rose TOGETHER (p~1e-6) — that was interpenetration, and it was the only "significant" movement
+in the whole broken curve. Corrected, contacts rise 259 -> 346 with clashes pinned at **0 at
+every epoch**. Same metric, opposite interpretation, decided entirely by whether the peptide
+was being built in the right place.
+
+And rising contacts is not runaway burial: the **native** panel interfaces have a median of
+**330** atom pairs under 5 A (IQR 237-391, same definition as the scorer), so epoch 586 at 300
+sits at **0.91x native** and is still approaching from below. That bound is what makes "more
+contacts" readable as better packing rather than over-burial — check it again if the number
+keeps climbing.
+
+**Limit on extrapolation.** 572 -> 586 is 14 epochs x 2,400 examples ~ **1.0 pass** over the
+33k training set. The slope is real and significant; where it plateaus is unknown, and nothing
+here licenses projecting it.
+
+### Three readings, kept separate
+
+1. **Best-of-16 interface RMSD went 14.64 -> 2.50 A.** With 16 samples the median target now
+   gets a pose at roughly 2.5 A interface RMSD. No weights changed; only the origin did.
+
+2. **Superposed RMSD improved as well (3.13 -> 2.49), and a pure translation cannot do that**
+   — it is placement-invariant by construction. So the FOLD was itself being degraded by
+   building in the protein's interior: receptor context genuinely shapes the geometry, and a
+   peptide condensing inside the core has nonsense context to work from. This retires the
+   earlier "superposed RMSD is flat, so the fold is not improving" reading, which was taken
+   in a regime where the fold was suppressed.
+
+3. **Clashes 2 -> 0 and contacts 423 -> 300 both point the same way.** Fewer contacts is the
+   GOOD direction here: the 423 were interpenetration, not binding. This also retires the
+   "clashes and contacts both rising at p~1e-6" trend that was the only significant signal in
+   the broken curve. It was an artifact of the placement, not learned pathology.
+
+### What did NOT rescue
+
+Hidden-position accuracy roughly doubled, 4.95% -> **9.77%**, which confirms the placement
+confound was real — a peptide in the wrong place has no pocket to read an identity from. But
+9.77% sits exactly on the **9.7%** "always guess leucine" prior for this panel. **Still
+chance.**
+
+And across the four checkpoints it does not move at all: 0.104 -> 0.098, paired p=0.66,
+trend p=0.85, improving on only 9 of 32 specs. **Training moves the pose and does not touch
+identity prediction.** That makes dosage the only live explanation left; see the
+masking-frequency table below.
+
+### Residual error is mostly ORIENTATION
+
+8.10 A raw against a 2.49 A superposed fold and a 3.27 A median placement offset does not add
+up to a translation problem. Most of what is left is **rotational**, and no choice of origin
+can fix that. If this arm is pushed further, orientation is the target, not placement.
+
+### Not a comparison with DiffPepBuilder
+
+DPB at k=0 measured 0.066 poses <= 2 A and 0.113 any-hit, but on **80 LNR targets**, not this
+32-complex panel. The two are not comparable and the numbers above must not be quoted against
+it. One common evaluation set remains an open item.
+
+## How often the sequence is actually masked
+
+Both the training schedule and the validation panel mask about half the time, but they do NOT
+mask the same WAY, and the difference is the opposite of what was assumed.
+
+**Training** (`p_full_sequence: 0.5`, `reveal_frac ~ U(0.80, 0.95)`, scaling with length):
+
+| hidden identities | share of all examples |
+|---|---|
+| 0 | 51.7% |
+| 1 | 27.8% |
+| 2 | 16.7% |
+| 3 | 3.9% |
+
+Mean 0.73 per example. The 51.7% exceeds the nominal 50% because `n_reveal = round(frac * n)`
+rounds a short peptide at a high fraction up to FULL reveal — a 7-mer at frac 0.95 gives
+`round(6.65) = 7`, zero hidden despite having drawn the partial branch. So the 0.5 knob is
+slightly optimistic about how often masking happens at all.
+
+Of the examples that DO mask: 57.5% mask exactly one position, **42.5% mask two or three
+jointly**.
+
+**Validation panel** (`n_rel = max(1, round(0.10 * len))`): 28 specs hide 1 position, 4 hide
+2 — **36 hidden positions across 32 masked specs**, 87.5% of them singletons.
+
+### CORRECTION, and it changes the next step
+
+An earlier note in this workstream claimed training "hides ~1 position at a time, so the model
+has essentially no training signal for joint infilling." **That is wrong.** 20.6% of all
+training examples mask 2-3 positions jointly — joint infilling is trained, at roughly one
+example in five. It is the **validation panel** that nearly always tests a single position,
+so the panel under-tests a case the model already practises.
+
+The fix is therefore cheap and comes before any retraining decision: raising `--unfixed-frac`
+on the panel is a contigs rebuild (CPU, seconds) and would measure joint infilling on the
+checkpoints that already exist. Only if that also reads at chance does widening
+`reveal_frac_min` become the indicated move.
+
+The dosage concern itself is unchanged: 0.73 hidden positions against ~121 scored tokens is
+why the sequence loss carries 0.54% hidden signal.
+
 ## Next
 
-1. **RFD3 (lead) — TRAINING NOW.** Staged, installed, preflighted, and the first tranche
-   is running (job 83990 on gpu31, `--submit train`). Watch two things in its `.out`: the
-   effective LR on the first logged step, because a fine-tune inherits the released
-   checkpoint's schedule position and EMA (neither is resettable); and the count of
+1. **RFD3 (lead) — TRAINING, and MEASURED TO BE IMPROVING.** The tranche is running
+   (job 84949 on gpu29). Training was never affected by the ORI bug (`center_option:
+   diffuse` centres on the peptide), so no retraining was needed — only re-measurement.
+   Four spaced checkpoints (572 / 578 / 582 / 586) have been re-scored against the corrected
+   panel via `--submit reval` at ~1 GPU-hour each; the other four are deliberately left
+   unscored because the trend is already unambiguous.
+
+   **The pose task is improving monotonically and significantly** — interface RMSD
+   9.22 -> 7.90 A (48/64 specs, p=3.8e-6), the FOLD itself 3.31 -> 2.89 A (p=9.5e-4),
+   best-of-16 interface RMSD 3.97 -> 3.19 A, and targets-with-a-hit 0.203 -> 0.391. Full
+   tables and the cluster-aware statistics are in "What the corrected instrument shows".
+
+   **The earlier "nothing is improving" verdict was an instrument artifact and is retracted.**
+   It came from a panel that built every peptide inside the receptor; do not cite the flat
+   curve. The sequence task, by contrast, is genuinely flat (0.104 -> 0.098, p=0.66) and sits
+   on the most-common-amino-acid prior — pose and identity are moving differently, and only
+   the pose is learning.
+
+   Next decision on this arm is therefore **not** more pose training: it is whether the
+   sequence half is worth rescuing, and the cheap test (raise `--unfixed-frac` on the panel,
+   a CPU contigs rebuild) runs against the checkpoints that already exist.
+
+   Still open, and unchanged: the count of
    `Transforms failed at stage MaskPolymerResiduesWithUnresolvedFrameAtoms` lines, which
    atomworks swallows via fallback retries — **26 examples in the first ~975 batches**, so
    the run will not fail, but it is the silent-subset-shrink mode this manifest exists to
-   prevent and it needs diagnosing rather than riding.
+   prevent and it needs diagnosing rather than riding. The failure is
+   `operands could not be broadcast (1,) (0,)`, which is NOT missing frame atoms, so the
+   stage name is misleading; cause still unknown.
 2. **DiffPepBuilder (second, and the priority arm).** Staged at `c19eb4f`; weights
    downloading; env recipe written. The next step is deliberately **not** training — it is
    the gating measurement, which needs no training at all: run DiffPepDock at *k=0* (CP
@@ -1497,3 +1683,241 @@ the push, and a per-mode count, and warning loudly on any fallback.
 
 Training-loss values are not comparable across these architectures, and a low LP
 reconstruction loss does not establish success from a CP sequence.
+
+## The hotspot-retention arm (RFD3), built 2026-10-16
+
+### Why the base arm was not enough
+
+`lpgen_base.yaml` trains with `max_ppi_hotspots_frac_to_provide: 0.0` and
+`add_ppi_hotspots: 0.0`, on the reasoning that the eventual inference input is "target plus
+CP sequence -- no hotspots", so hotspots would condition the model on information it will
+not have. That reasoning does not survive contact with the task it serves.
+
+**Without a retention objective the paired LP structure is decorative.** If the generated
+peptide may bind anywhere on the target, then the LP's binding mode carried no information
+and its *sequence alone* would have been a sufficient input -- there would be no reason to
+build paired LP structures at all. This is not speculation: on the CP→LP side, zeroing
+`preserve_weight` did open the gap, but retention never reached 0.9 and retention has no
+relationship to ΔG (r² 0.004). "Transport" with no retention term is conditional generation
+with extra steps. Soft hotspot retention is the term that makes the LP structure
+load-bearing, so hotspots are part of the task, not a leak.
+
+### Nothing new was written on the RFD3 side. The pipeline already exists
+
+| piece | where | what it does |
+|---|---|---|
+| `get_hotspot_atoms` | `ppi_transforms.py:44` | interchain contacts at a cutoff, non-binder side |
+| `AddPPIHotspotFeature` | `ppi_transforms.py:240` | samples a subset, sets `is_atom_level_hotspot` |
+| `is_atom_level_hotspot: 1` | `model/components/rfd3_net.yaml:43` | a real **atom-level input channel** of the released network |
+| `select_hotspots` | `input_parsing.py:473` | the inference-side request, atom- or residue-level |
+| `infer_ori_from_hotspots` | `utils/inference.py:398` | drops the prior above the requested patch |
+
+Because the channel is part of the **released** network and the released weights were
+trained with `add_ppi_hotspots: 0.75`, enabling it is a **warm start, not a new head**. The
+values in `configs/rfd3_lp/datasets/lpgen_hotspot.yaml` are `design_base`'s own defaults,
+restored -- which is what "use its original pipeline" means operationally.
+
+**Initialize from the released checkpoint, never from a base-arm LP checkpoint.**
+`AddAdditional1dFeaturesToFeats` is built with
+`autofill_zeros_if_not_present_in_atomarray=True` (`pipelines.py:521`), so with hotspots off
+the channel is not absent -- it is fed a constant zero on every atom of every example. A
+base-arm checkpoint has therefore been actively trained to expect that channel dead.
+
+### The dosage is healthy here, and that was not safe to assume
+
+`AddPPIHotspotFeature` provides `np.random.randint(0, ceil(n_gt * frac))`, which is uniform
+on `[0, ceil-1]` — **exclusive of the top**. Two consequences: the requested fraction is
+never reached (the mean is about half of it), and when `ceil(n_gt*frac) == 1` the draw is
+`randint(0, 1)`, which is **always 0** — such an example gets no hotspots while
+`add_ppi_hotspots` was true, and upstream's `"No hotspots found"` warning does *not* fire
+(that branch needs the ceiling to be 0). At `frac 0.2` that is every example with
+`n_gt <= 5`.
+
+This mattered because the analogous construction on the CPSea side left **65-78% of examples
+with zero hotspots** — a channel that is wired, passes every assertion, and is almost never
+populated. So it was measured rather than carried over.
+`script_utils/lpgen_hotspot_probe.py` (CPU, `--submit hsprobe`) runs real examples through
+the real transform stack in two passes: `production` for the realised rate, `forced`
+(`add_ppi_hotspots: 1.0`, ppi at frequency 1.0) for the conditional distribution. It needs
+`return_atom_array=True`, which the train pipeline ships as False; that flag is read only to
+extend `keys_to_keep` (`pipelines.py:568`), so it adds and removes no transform and every
+example is built exactly as training builds it — only more of the result survives to be
+inspected.
+
+**Measured, 398 examples (job 86000), all six invariants PASS:**
+
+| | forced | production |
+|---|---|---|
+| ground-truth hotspot atoms at 4.5 Å | median **70** [23, 234], p05 35 | median 68 [27, 220] |
+| `add_ppi_hotspots` meta-condition set | 100% | 73.4% |
+| **asked** (`ppi` AND meta — the real gate) | 100% | **58.3%** |
+| **channel live** (≥1 hotspot provided) | **91.0%** | **55.3% of all**, 94.8% of asked |
+| provided given asked | median 7, mean 7.6, max 39 | median 5, mean 6.6, max 29 |
+| zero despite asking | 9.0% | 5.2% |
+| **degenerate `ceiling == 1`** | **0.0%** | **0.0%** |
+
+**The degenerate corner cannot fire on this data**: the minimum ground-truth count is 23
+atoms, so `ceil(n*0.2) >= 5` always. The 5-9% of asked examples that still get zero are the
+*intended* dropout — with a ceiling near 14, `randint(0, 14)` draws 0 about 7% of the time —
+and that is wanted, because it is what trains "obey the hotspots **when given**" rather than
+"always expect a fifth of the interface".
+
+So the channel is live on **55.3%** of training examples, against **22-35%** for the
+analogous CPSea construction, and the remaining ~45% is what keeps the channel *optional*
+rather than required.
+
+Invariants, all measured rather than assumed: provided hotspots are a subset of the
+ground-truth interface; **never** on the binder (that would leak the answer); the
+`data["feats"]["is_atom_level_hotspot"]` tensor agrees with the annotation atom-for-atom (so
+the channel really reaches the network rather than being autofilled with zeros); hotspots
+survive the spatial crop (they are computed *after* `PadTokensWithVirtualAtoms`, the last
+transform that modulates atom count, so they cannot be cropped away); and upstream's hotspot
+set matches an **independent brute-force recompute on 100.0% of the 319 rows where the
+transform ran**, confirming the cutoff really is the configured 4.5 Å.
+
+Two reading notes the probe's first run (job 85993) produced, both reporting flaws rather
+than data problems, and both fixed above. **The gate is a conjunction**: `ConditionalRoute`
+requires `sampled_condition_name == "ppi"` **and** `conditions["add_ppi_hotspots"]`, while
+the meta-probability is sampled for every example regardless of which condition was drawn —
+30 rows had the meta-condition set with no transform run, and **every one was non-ppi**.
+Reading the meta-probability alone overstates the request rate by 15 points (73.4% against
+the true 58.3%). And `is_hotspot_gt` is **absent**, not zero, on every skipped example, so
+comparing it against a brute-force recompute reported **79 false failures** — the first run
+showed invariant 5 FAILING with "upstream lower on 79 of 79", which looked alarming and was
+entirely an artifact of a default. Scoped to the 319 rows where the transform actually ran,
+upstream agreed on 100.0%.
+
+One ProtFrag example (`protfrag__pdb6epf_292_303`) fails to load in
+`MaskPolymerResiduesWithUnresolvedFrameAtoms`. Unrelated to hotspots, and in training
+`n_fallback_retries` would swap it silently.
+
+### Upstream's hotspot metric reports a hard 0.0 on this panel
+
+`PPIMetrics` (`design_metrics.py:382`) computes `fraction_hotspots_contacted` and is **dead
+code upstream** — defined, in no yaml, in no `_target_`, so as far as the tree shows it has
+never been run. It also cannot work here. It counts contacts only to
+`~get_motif_features(atom_array)["is_motif_atom"]`, and
+
+```python
+is_motif_atom = is_fixed | is_sequence_fixed | is_unindexed   # conditioning_base.py:61
+```
+
+On this panel the peptide's **sequence is given** (it sits in the contig) while its
+**coordinates are released**, so peptide atoms carry `is_motif_atom_with_fixed_seq = True`
+and are therefore `is_motif_atom`. Both chains are motif, the diffused set is empty, the
+mask has shape `(n_hotspots, 0)`, and `np.any(..., axis=1)` over an empty axis is all-False.
+Verified: `np.any(np.zeros((7,0), bool), axis=1).mean() == 0.0`.
+
+**A flat 0.0 is indistinguishable from a model that never obeys the hotspot channel** — the
+exact hypothesis this arm tests — so the arm would have been failed by its own instrument.
+(`redesign_motif_sidechains` does not rescue it: it defaults to False, `input_parsing.py:186`.)
+
+`proteinfoundation.lpgen.rfd3_metrics.LPHotspotMetrics` fixes it with one word of semantics:
+the generated set is `~is_motif_atom_with_fixed_coord` — atoms whose **coordinates** were
+generated, independent of whether the sequence was supplied. It also reports the
+**continuous** distances (`min_dist_to_hotspot`, `com_to_hotspot_com`), without which the
+decoy arm has a floor at 0.0 and cannot distinguish "ignored the request" from "moved
+toward it and fell short". An absent retention column means *nothing was asked*; it is never
+reported as zero.
+
+### The panel: retention alone proves nothing, the contrast does
+
+`fraction_hotspots_contacted` on the native arm cannot support a claim of obedience, because
+the hotspots are drawn **from** the native interface and the model would score well by
+binding the pocket it was going to bind anyway. `--hotspot-mode` therefore builds arms:
+
+| arm | hotspots | ori | what it isolates |
+|---|---|---|---|
+| `hs_native` | native interface | native patch | retention when asked |
+| `hs_none` | **none** | native patch | the paired control — the channel's whole contribution |
+| `hs_decoy` | far-side patch | decoy patch | can the peptide be sent elsewhere at all |
+| `hs_decoy_orinative` | far-side patch | **native** patch | the channel's pull *against* a conflicting prior |
+
+The two decoy arms both exist because neither is conclusive alone: with a decoy-derived ori
+the peptide would land there because the **prior** put it there, not because the hotspots
+asked. And `ori_token` beats `infer_ori_strategy` outright (`set_com`,
+`utils/inference.py:463`), so a decoy arm that kept the native `ori_token` and merely added
+`infer_ori_strategy: hotspots` would silently ignore the strategy and the test would be
+rigged.
+
+**Measured on the 32-complex panel (job 85989):**
+
+* ground-truth hotspot atoms median **61** [37, 126]; requested median **12.5** [8, 26]
+* native-hotspot ORI sits a median **4.06 Å** [2.30, 10.23] from the native peptide COM —
+  against 3.27 Å for the existing pocket panel, so the instrument is sound. The ori is
+  computed here with this panel's calibrated **6 Å** push, *not* by
+  `infer_ori_strategy: hotspots`, whose `DISTANCE_ABOVE_HOTSPOTS` is hard-coded to 10.0 and
+  measured 5.23 Å on this panel.
+* decoy ORI sits a median **42.78 Å** [28.88, 69.65] from the native peptide COM — genuinely
+  the far side.
+* **30 of 32** complexes admit a decoy patch; 2 small receptors cannot satisfy the 15 Å
+  separation. So the decoy and native arms span **different complexes** and must be compared
+  **paired by example id**, not as two independent means.
+
+The validation request is the ceiling `ceil(n*frac)` exactly, every epoch, rather than
+training's random draw: a request that changed between epochs could not be compared across
+checkpoints, and a sometimes-empty request would silently drop specs from the metric. The val
+request is therefore slightly denser than the mean training request, on purpose.
+
+### Running it
+
+```bash
+# 1. the panels (cpu, seconds) -- both files from ONE job so they cannot drift apart
+./scripts/submit_lpgen.sh --submit hscontigs
+
+# 2. the dosage gate (cpu, ~2 min). Read it before spending GPU time.
+./scripts/submit_lpgen.sh --submit hsprobe
+
+# 3. the fine-tune. TRAIN_CKPT_PATH is NOT optional for this arm.
+./scripts/submit_lpgen.sh --submit train \
+    --set TRAIN_EXPERIMENT=lp_finetune_hotspot \
+    --set TRAIN_RUN_NAME=lp_hotspot_v1 \
+    --set TRAIN_CKPT_PATH=/zfsauton/scratch/yixiz/lpgen/weights/foundry/rfd3_latest.ckpt
+
+# 4. the obedience table, off the training path, per saved checkpoint
+./scripts/submit_lpgen.sh --submit reval \
+    --set REVAL_RUN_NAME=lp_hotspot_v1 \
+    --set REVAL_CONTIGS=/zfsauton/scratch/yixiz/LPData/preprocessed/metadata_lpgen/lpgen_val_contigs_hs_obedience.json
+```
+
+The probe is deliberately **not** a dependency of `train`: a low live-hotspot rate is
+information, not an error, so an `afterok` edge would strand the arm on a job that was never
+meant to block it.
+
+### GPU smoke PASSED, and it produced a baseline worth keeping (job 86081)
+
+`lp_preflight_hotspot` exists for the three things the CPU probe cannot reach, because none of
+them happen in the dataloader: that `LPHotspotMetrics` instantiates from this repo, that
+`is_atom_level_hotspot` survives onto `predicted_atom_array_stack`, and that `select_hotspots`
+actually parses (a key matching nothing is skipped *silently* by `apply_selections`, which
+would yield an all-zero mask and an absent metric rather than an error).
+
+All three pass. Exit 0, **0 REINIT**, peak **32.5 GB of 49 GB (66%)**, util peak 100% / mean
+47%. Note the memory: the base arm ran at 46%, so this arm is materially heavier and **still
+cannot use the 24 GB a5000** — keep `gpu28` excluded.
+
+Measured on the `hs_native` arm (4 complexes x 2 epochs, `limit_val_batches: 8`):
+
+| | value |
+|---|---|
+| `n_hotspots_requested` | mean **12.75** [10, 15] — matches the panel's 12.5 median, so the request really arrived |
+| **`fraction_hotspots_contacted`** | **0.451** [0.40, 0.50] |
+| `min_dist_to_hotspot` | 2.78 Å |
+| `com_to_hotspot_com` | 7.51 Å |
+
+**This is the released checkpoint before any LP fine-tuning**, so 0.451 is a *baseline*, not a
+result, and it is 4 complexes — not a number to quote as a capability. What it establishes is
+that the instrument reads a real, non-degenerate value.
+
+And it is the direct confirmation of why the metric had to be replaced: **upstream's
+`PPIMetrics` would have reported 0.000 here instead of 0.451**, and a baseline of exactly zero
+is precisely what "the model ignores hotspots" looks like.
+
+`hs_none`, `fullseq` and `partialseq` are all **NaN** — 24 of the 32 rows — which is the
+designed behaviour: absent means *nothing was asked*. A metric that scored those arms 0.0
+would drag the mean toward zero in proportion to how many arms carry no request.
+
+`val/lp_panel_hotspot` is **added** alongside `val/lp_panel`, not substituted. That roughly
+doubles a validation pass (~2/5 of an epoch rather than ~1/5) and is worth paying: keeping
+`lp_panel` is what makes this arm's curve comparable to the base arm's on an identical
+instrument instead of starting a new, incomparable series.

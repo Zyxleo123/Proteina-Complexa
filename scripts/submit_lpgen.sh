@@ -11,6 +11,9 @@
 #   dpbscore   score those poses against the staged natives (cpu, reads PDBs only)
 #   env        build one venv per arm (cpu, slow: torch is ~2.5 GB per env)
 #   preflight  RFD3 LP arm: a few real optimizer steps on one GPU (plan step 4)
+#   hsprobe    HOTSPOT GATE (cpu): measure the realised hotspot dosage on our LP data
+#              through the real transform stack, before spending GPU time on the arm
+#   hscontigs  build the two hotspot validation panels (cpu, seconds)
 #   train      RFD3 LP arm: one training tranche; resubmit the same TRAIN_RUN_NAME to resume
 #   reval      re-validate ALREADY-SAVED checkpoints against the corrected panel (1 gpu
 #              job per checkpoint, siblings) + one cpu job that assembles the curve
@@ -50,6 +53,11 @@ GPU_PARTITION="${GPU_PARTITION:-general}"
 # for every torch build while its siblings pass -- and myfree still lists it AVAILABLE.
 GPU_EXCLUDE="${GPU_EXCLUDE:-gpu14,gpu28}"
 PREFLIGHT_TIME="${PREFLIGHT_TIME:-01:00:00}"
+# The hotspot gate reads examples through the real transform stack on CPU. 200 examples x
+# 2 passes; generous because the spatial crop is the slow part and runs on every example.
+HSPROBE_TIME="${HSPROBE_TIME:-01:30:00}"
+# Reads 32 PDBs and writes two JSON files.
+HSCONTIGS_TIME="${HSCONTIGS_TIME:-00:20:00}"
 # One tranche per submission. The plan's cap is 24 GPU-hours per arm; the run is bounded by
 # THIS, never by a small trainer.max_epochs (which makes a resumed run a silent no-op).
 TRAIN_TIME="${TRAIN_TIME:-24:00:00}"
@@ -73,7 +81,7 @@ usage() {
   sed -n '2,12p' "$0"
   cat <<'EOF'
 
-  --submit <stage>   manifest | export | stage | weights | dpbstage | dpbdock | dpbscore | env | preflight | train | reval | all
+  --submit <stage>   manifest | export | stage | weights | dpbstage | dpbdock | dpbscore | env | preflight | hsprobe | hscontigs | train | reval | all
   --run-id <id>      override the generated run id
   --set K=V          set any preamble knob (repeatable), e.g. --set PEPBENCH_FRAC=0.8
   --smoke            tiny run: 2000 rows, panel of 8 (writes to a _smoke manifest dir)
@@ -95,7 +103,7 @@ while [[ $# -gt 0 ]]; do
 done
 [[ -n "$STAGE" ]] || { echo "FATAL: --submit <stage> is required" >&2; usage 1 >&2; }
 case "$STAGE" in
-  manifest|export|stage|weights|dpbstage|dpbdock|dpbscore|env|preflight|train|reval|all) ;;
+  manifest|export|stage|weights|dpbstage|dpbdock|dpbscore|env|preflight|hsprobe|hscontigs|train|reval|all) ;;
   *) echo "FATAL: unknown stage '$STAGE'" >&2; usage 1 >&2 ;;
 esac
 
@@ -226,6 +234,22 @@ if [[ "$STAGE" == "train" ]]; then
     scripts/lpgen_rfd3_train.sbatch "$ENV_FILE" >/dev/null
 fi
 
+# The hotspot GATE. CPU, and deliberately not a dependency of `train`: it is a measurement
+# whose verdict a human reads, not a pass/fail the pipeline can act on. A low live-hotspot
+# rate is information, not an error -- so making the fine-tune wait on it with `afterok`
+# would strand the arm on a job that was never meant to block it.
+if [[ "$STAGE" == "hsprobe" ]]; then
+  submit hsprobe \
+    --partition="$CPU_PARTITION" --time="$HSPROBE_TIME" \
+    scripts/lpgen_hotspot_probe.sbatch "$ENV_FILE" >/dev/null
+fi
+
+if [[ "$STAGE" == "hscontigs" ]]; then
+  submit hscontigs \
+    --partition="$CPU_PARTITION" --time="$HSCONTIGS_TIME" \
+    scripts/lpgen_hotspot_contigs.sbatch "$ENV_FILE" >/dev/null
+fi
+
 if [[ "$STAGE" == "reval" ]]; then
   # The checkpoints to re-score. Resolved HERE rather than in the job so the fan-out is
   # visible in the submission and each checkpoint gets its own job, its own output tree and
@@ -251,6 +275,36 @@ if [[ "$STAGE" == "reval" ]]; then
   if [[ -n "${REVAL_LAST_N:-}" ]]; then
     mapfile -t CKPTS < <(printf '%s\n' "${CKPTS[@]}" | sort -r | head -n "$REVAL_LAST_N")
   fi
+  # REVAL_EPOCHS="572,578,582,586" re-scores exactly those epochs. A re-eval costs about a
+  # GPU-hour per checkpoint, so a few SPACED points answer "is anything improving" for a
+  # fraction of a full sweep; fill the gaps in only if something moves. Named epochs are
+  # matched exactly and a miss is fatal, so a typo cannot silently shrink the curve.
+  if [[ -n "${REVAL_EPOCHS:-}" ]]; then
+    SEL=()
+    IFS=',' read -r -a WANT <<< "$REVAL_EPOCHS"
+    for w in "${WANT[@]}"; do
+      w="${w// /}"
+      hit=""
+      for ck in "${CKPTS[@]}"; do
+        e="$(sed -n 's/^epoch-0*\([0-9][0-9]*\)$/\1/p' <<<"$(basename "$ck" .ckpt)")"
+        if [[ "$e" == "$w" ]]; then hit="$ck"; break; fi
+      done
+      if [[ -z "$hit" ]]; then
+        echo "FATAL: REVAL_EPOCHS asked for epoch ${w}, which is not in ${CKPT_DIR}" >&2
+        echo "  available: $(for c in "${CKPTS[@]}"; do basename "$c" .ckpt; done | tr '\n' ' ')" >&2
+        exit 1
+      fi
+      SEL+=("$hit")
+    done
+    CKPTS=("${SEL[@]}")
+  fi
+  # Adopt jobs submitted earlier (e.g. a smoke) so ONE scorer waits on the whole set rather
+  # than running early against a partial curve.
+  PRIOR_JIDS=()
+  if [[ -n "${REVAL_WAIT_FOR:-}" ]]; then
+    IFS=',' read -r -a PRIOR_JIDS <<< "$REVAL_WAIT_FOR"
+    echo "also waiting on already-running reval job(s): ${PRIOR_JIDS[*]}"
+  fi
   echo "re-evaluating ${#CKPTS[@]} checkpoint(s) against $(basename "$CONTIGS")"
   REVAL_JIDS=()
   for ck in "${CKPTS[@]}"; do
@@ -263,7 +317,8 @@ if [[ "$STAGE" == "reval" ]]; then
   done
   # afterANY, not afterok: a single checkpoint that OOMs or hits the time limit must not
   # strand the scorer, which would leave every other checkpoint unscored and unexplained.
-  DEP="--dependency=afterany:$(IFS=:; echo "${REVAL_JIDS[*]}")"
+  ALL_JIDS=("${REVAL_JIDS[@]}" ${PRIOR_JIDS[@]+"${PRIOR_JIDS[@]}"})
+  DEP="--dependency=afterany:$(IFS=:; echo "${ALL_JIDS[*]}")"
   submit reval_score \
     --partition="$CPU_PARTITION" --time="$REVAL_SCORE_TIME" "$DEP" \
     scripts/lpgen_reval_score.sbatch "$ENV_FILE" "REVAL_CONTIGS=${CONTIGS}" >/dev/null

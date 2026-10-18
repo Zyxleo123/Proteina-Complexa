@@ -183,23 +183,91 @@ WEOF
   TRAIN_CKPT_PATH="${TRAIN_CKPT_PATH:-}"
   EXTRA_TRAIN_ARGS="${EXTRA_TRAIN_ARGS:-}"
 
+  # ------------------------------------------------- checkpoint disk retention
+  # foundry NEVER prunes: `save_checkpoint` (trainers/fabric.py:815) writes
+  # epoch-NNNN.ckpt and has no `save_top_k` equivalent, so an unattended run grows
+  # without bound. At 2.69 GB per RFD3 checkpoint that reached 41 GB in 16 checkpoints
+  # on lp_finetune_v1, and a soak-test preflight left at `checkpoint_every_n_epochs: 1`
+  # wrote 20 checkpoints (26 GB) in 55 minutes. The save cadence lives in the experiment
+  # config; these knobs bound what SURVIVES, which is the part the cadence cannot fix
+  # for a run that simply keeps going.
+  #
+  # Deleting checkpoints loses no measurement: per-epoch numbers are in
+  # val_metrics/validation_output_all_epochs.csv and samples in val_structures/. It
+  # costs only the ability to re-sample a deleted epoch, which is what KEEP_EVERY is for.
+  CKPT_KEEP_NEWEST="${CKPT_KEEP_NEWEST:-1}"
+  CKPT_KEEP_EVERY="${CKPT_KEEP_EVERY:-50}"
+  # 0 disables the in-job sweep, leaving only the one at startup.
+  CKPT_PRUNE_INTERVAL_SEC="${CKPT_PRUNE_INTERVAL_SEC:-1800}"
+
   # ------------------------------------------- RFD3 re-evaluation of saved checkpoints
   # Re-scores checkpoints that already exist, so a measurement fix never costs retraining.
   # The mechanism is the epoch-stop behaviour that is normally a TRAP: loading a checkpoint
   # does `current_epoch += 1`, then `current_epoch >= max_epochs` sets should_stop -- but
   # `prevalidate` runs at trainers/fabric.py:447, BEFORE the `while not should_stop` loop at
   # :459. So ckpt + prevalidate + a small max_epochs validates once and trains nothing.
-  REVAL_ROOT="${REVAL_ROOT:-${LPGEN_RUNS_DIR}/${TRAIN_RUN_NAME}_reval}"
+  # ONE run name drives the checkpoint source AND the output root. These were separately
+  # derived at first -- the submitter defaulted the checkpoint dir to `lp_finetune_v1` while
+  # REVAL_ROOT came off TRAIN_RUN_NAME (`lp_scratch_v1`) -- so the GPU jobs wrote to
+  # lp_finetune_v1_reval and the scorer looked in lp_scratch_v1_reval, found nothing, and
+  # would have exited 0 reporting "no checkpoint was re-evaluated". Deliberately NOT
+  # TRAIN_RUN_NAME: a re-eval names the run whose checkpoints it reads, which is not
+  # necessarily the run this submission would train.
+  REVAL_RUN_NAME="${REVAL_RUN_NAME:-lp_finetune_v1}"
+  REVAL_ROOT="${REVAL_ROOT:-${LPGEN_RUNS_DIR}/${REVAL_RUN_NAME}_reval}"
   # The corrected panel. The ORI (where the diffusion prior is dropped) is derived from
   # RECEPTOR pocket atoms, not the native peptide COM: see lpgen_build_val_contigs.py.
   # Default deliberately NOT the in-loop file -- a running job holds that one, and
   # rewriting it in place would put two ORI conventions in one curve.
   REVAL_CONTIGS="${REVAL_CONTIGS:-${MANIFEST_DIR}/lpgen_val_contigs_pocket.json}"
   # Which checkpoints to re-score. Empty = every epoch-*.ckpt in the run's ckpt dir.
-  REVAL_CKPT_DIR="${REVAL_CKPT_DIR:-${LPGEN_RUNS_DIR}/${TRAIN_RUN_NAME}/ckpt}"
+  REVAL_CKPT_DIR="${REVAL_CKPT_DIR:-${LPGEN_RUNS_DIR}/${REVAL_RUN_NAME}/ckpt}"
   REVAL_CKPT="${REVAL_CKPT:-}"
   REVAL_SCORE_WORKERS="${REVAL_SCORE_WORKERS:-16}"
   EXTRA_REVAL_ARGS="${EXTRA_REVAL_ARGS:-}"
+
+  # ------------------------------------------------- RFD3 hotspot arm (retention)
+  # The arm that makes the paired LP structure load-bearing: without a retention objective
+  # the generated peptide may bind anywhere on the target, so the LP's binding mode carried
+  # no information and its sequence alone would have been a sufficient input.
+  #
+  # The probe is a CPU GATE in front of the fine-tune. It measures the realised hotspot
+  # dosage on OUR data through the REAL transform stack, because the stock dosage was chosen
+  # for whole-protein binders and ours is a 5-16 residue peptide. The specific risk it is
+  # looking for: `randint(0, ceil(n_gt*frac))` is EXCLUSIVE of its bound, so a ceiling of 1
+  # always provides zero hotspots and nothing warns. The analogous construction on the CPSea
+  # side left 65-78% of examples with no hotspots at all.
+  HSPROBE_EXPERIMENT="${HSPROBE_EXPERIMENT:-lp_finetune_hotspot}"
+  HSPROBE_N="${HSPROBE_N:-200}"
+  # Two passes: `production` gives the realised rate under the real condition mixture,
+  # `forced` gives the conditional count distribution with usable statistics. One without
+  # the other either hides the dosage or overstates how often the channel is live.
+  HSPROBE_PASSES="${HSPROBE_PASSES:-production,forced}"
+  HSPROBE_SEED="${HSPROBE_SEED:-0}"
+  HSPROBE_DIR="${HSPROBE_DIR:-${LPGEN_RUNS_DIR}/${RUN_ID}_hsprobe}"
+
+  # The hotspot validation panels. TWO files, deliberately:
+  #   * the in-loop panel is `native` mode -- hs_native plus its paired hs_none control,
+  #     64 specs, the same cost as the existing panel;
+  #   * the obedience panel adds the two decoy arms, which quadruples the rollout, so it
+  #     belongs on the reval path where it costs no training time.
+  # Named files rather than overwriting lpgen_val_contigs_pocket.json: a running job holds
+  # that one, and rewriting it in place would put two conventions in one curve.
+  HS_CONTIGS="${HS_CONTIGS:-${MANIFEST_DIR}/lpgen_val_contigs_hotspot.json}"
+  HS_OBEDIENCE_CONTIGS="${HS_OBEDIENCE_CONTIGS:-${MANIFEST_DIR}/lpgen_val_contigs_hs_obedience.json}"
+  # MUST match `ppi_hotspot_max_distance` in configs/rfd3_lp/datasets/lpgen_hotspot.yaml and
+  # `PPIMetrics.distance_cutoff`. Conditioning wider than scoring grades an obedient model
+  # short, and the shortfall reads as disobedience.
+  HS_CUTOFF="${HS_CUTOFF:-4.5}"
+  HS_FRAC="${HS_FRAC:-0.2}"
+  HS_DECOY_RADIUS="${HS_DECOY_RADIUS:-8.0}"
+  # The decoy patch must not brush the native site, or it is partly satisfiable by binding
+  # natively and stops being a negative control.
+  HS_DECOY_MIN_SEP="${HS_DECOY_MIN_SEP:-15.0}"
+  # This panel's calibrated push, NOT rfd3's `infer_ori_strategy: hotspots`, whose
+  # DISTANCE_ABOVE_HOTSPOTS is hard-coded to 10.0 and measured 5.23 A from the native
+  # peptide COM here against 3.27 A at 6.0.
+  HS_ORI_PUSH="${HS_ORI_PUSH:-6.0}"
 
   MANIFEST_WORKERS="${MANIFEST_WORKERS:-16}"
   # >0 processes only the first N rows: a smoke run, and the summary says so.

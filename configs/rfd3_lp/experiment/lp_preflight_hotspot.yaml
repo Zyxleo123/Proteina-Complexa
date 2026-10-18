@@ -1,0 +1,91 @@
+# @package _global_
+# GPU smoke for the HOTSPOT arm: a few real optimizer steps plus one validation pass.
+#
+# `lp_preflight` already proved the LP data path, the model build and the optimizer. This
+# variant exists for the three things the hotspot arm adds, none of which the CPU probe can
+# reach because none of them happen in the dataloader:
+#
+#   1. `LPHotspotMetrics` INSTANTIATES AND RUNS. It is addressed by `_target_` out of this
+#      repository (`proteinfoundation.lpgen.rfd3_metrics`), so it depends on PYTHONPATH
+#      resolving inside the arm's env, on `foundry.metrics.metric.Metric` importing, and on
+#      `MetricManager` accepting its `kwargs_to_compute_args`. A failure in any of those is a
+#      validation-time crash, i.e. hours into a tranche.
+#   2. `is_atom_level_hotspot` SURVIVES TO THE PREDICTED ATOM ARRAY. The metric reads the
+#      annotation off `predicted_atom_array_stack`, which is built from `example["atom_array"]`
+#      via `src_atom_array.copy()` (trainer_utils.py:82). Reading the source says it should
+#      carry through; a validation pass is what shows that it does. If it does not, the metric
+#      returns `{}` and the column is simply ABSENT -- which is quiet, and easy to misread as
+#      "nothing was asked".
+#   3. THE NEW VAL PANEL PARSES. `select_hotspots` is an atom-level selection dict keyed
+#      `"<chain><res_id>"`; a key that matches nothing is skipped silently by
+#      `apply_selections` (it `continue`s), so a wrong key format would produce an all-zero
+#      hotspot mask and, again, an absent metric rather than an error.
+#
+# So the single thing to check in the log is that the validation block reports
+# `ppi_metrics.fraction_hotspots_contacted` AND `ppi_metrics.n_hotspots_requested > 0`. A
+# present-but-zero retention is a real (if early) measurement; an ABSENT column means the
+# request never reached the model and the tranche would measure nothing.
+#
+# Launch:
+#   ./scripts/submit_lpgen.sh --submit preflight \
+#       --set PREFLIGHT_EXPERIMENT=lp_preflight_hotspot \
+#       --set EXTRA_PREFLIGHT_ARGS=ckpt_path=/zfsauton/scratch/yixiz/lpgen/weights/foundry/rfd3_latest.ckpt
+
+defaults:
+  - lp_preflight
+  - override /datasets: lpgen_hotspot
+  - override /trainer/metrics: lp_design_metrics
+  - _self_
+
+name: lpgen-rfd3-lp-preflight-hotspot
+tags: [lpgen, rfd3, lp, hotspot, preflight]
+task_name: lp_preflight_hotspot
+
+trainer:
+  # VALIDATE, and validate FIRST. `lp_preflight` sets `prevalidate: False` because it had no
+  # val datasets wired; here the validation pass IS the point of the job, and running it
+  # before training means the three checks above are answered in the first minutes rather
+  # than after the training steps.
+  prevalidate: True
+
+  # `max_epochs` MUST BE PASSED BY THE LAUNCHER WHEN `ckpt_path` IS SET, and the inherited
+  # value is a trap. MEASURED, job 86002: this experiment inherits `max_epochs: 1` from
+  # `/debug/default` via `lp_preflight`, loading the released checkpoint does
+  # `current_epoch += 1` to 570, so `should_stop` is True before anything runs. `prevalidate`
+  # is NOT enough to save it -- `validation_loop` re-checks `self.should_stop` on EVERY batch
+  # (`if self.should_stop or batch_idx >= limit_batches: break`, foundry/trainers/fabric.py:628),
+  # so it breaks at batch_idx 0. The dataloader still prefetches one item, so the log shows
+  # `load_input` and `Received ori_token` for each panel and looks like validation started.
+  #
+  # Nothing is reported as an error. Both panels ran "64 batches" in about one second each,
+  # produced ZERO rollouts, wrote a 1-byte CSV, and the job then died in an unrelated place --
+  # `pd.concat([])` -> "No objects to concatenate" in metrics_logging.on_validation_epoch_end.
+  # A reader would reasonably blame the new panel; the panel was never evaluated.
+  #
+  # `lpgen_rfd3_reval.sbatch` already solved this for the re-eval path by parsing the epoch
+  # out of the checkpoint filename and setting `max_epochs = ckpt_epoch + 2`. The released
+  # weights are not named `epoch-NNNN.ckpt`, so they cannot be parsed that way -- hence the
+  # launcher passes it.
+  #
+  # MIND THE OFF-BY-ONE, measured twice (jobs 86002 and 86048). The arithmetic is
+  #     current_epoch = E + 1          on load
+  #     should_stop   = (E + 1) >= max_epochs
+  # so `max_epochs` must be at least **E + 2**. The trap is that the log line reads
+  # `Prevalidating with epoch 570`, and that number is `current_epoch - 1` (the block
+  # decrements it first, fabric.py:448) -- so it IS E, not E-1. Reading E=569 off that line
+  # and passing 571 is exactly one short: `571 >= 571` still sets should_stop, and the run
+  # fails in the identical disguised way. For `rfd3_latest.ckpt`, E = 570, so pass 572.
+  #
+  #   --set EXTRA_PREFLIGHT_ARGS='ckpt_path=<ckpt> trainer.max_epochs=572'
+  #
+  # Deliberately NOT hardcoded here: the right value is a property of the checkpoint, and a
+  # stale constant would silently reintroduce exactly this failure against a different one.
+  validate_every_n_epochs: 1
+  # Enough specs to include both arms of at least one complex -- `hs_native` carries the
+  # request and `hs_none` is its control, and a subset that caught only `hs_none` would show
+  # an absent metric for an entirely legitimate reason and prove nothing. The panel is
+  # ordered by complex with both arms adjacent, so 8 covers four complexes.
+  limit_val_batches: 8
+  # Keep the training side short; `lp_preflight` already characterised it.
+  limit_train_batches: 4
+  n_examples_per_epoch: 4
