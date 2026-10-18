@@ -180,6 +180,46 @@ The pinned AE that most CPSea work is anchored to is
 `finetune_full_128/checkpoints/chk_epoch=00000002_step=000000040000-EMA.ckpt`
 (4.1 GB). Without it, cross-run loss curves stop being comparable.
 
+### Home and scratch are not equally forgiving
+
+`/zfsauton2/home` has ZFS snapshots on a two-week retention, visible at
+`/zfsauton2/home/yixiz/.zfs/snapshot/`. Anything deleted from the repo tree
+is recoverable from there for two weeks — including the 27 GB of smoke and
+overfit output removed on 2026-10-18, still readable at
+`.zfs/snapshot/2026-10-16_15.00.00--2w/Proteina-Complexa/`. There is also a
+snapshot named `migration_10_13`, so the admins appear to be snapshotting
+ahead of the shutdown.
+
+`/zfsauton/scratch` has **no snapshots at all**. Everything the prune removed
+there is permanently gone, which is why that script verifies byte-identity
+immediately before each delete rather than trusting a scan.
+
+### The repo tree on home
+
+46 GB of results accumulated under the repo despite the rule that artefacts
+live on `$ZFS`. Almost all of it is bulk structures — 362k PDBs across
+`inference/` and `evaluation_results/` — but the numbers behind every figure
+and table are in the CSV/JSON/JSONL/npz beside them, and those come to only
+**511 MB across 18,461 files**. The manifest builder writes them to
+`$ZFS/migration/tier0_home.files`, with paths relative to the repo rather
+than to `$ZFS`, so they need their own rsync:
+
+```bash
+rsync -avPH --partial --append-verify \
+  --files-from=/tmp/tier0_home.files \
+  yixiz@rhea:/zfsauton2/home/yixiz/Proteina-Complexa/ "$NEWREPO/"
+```
+
+The bulk PDBs were deliberately *not* deleted. They regenerate from the
+checkpoints in principle, but sampling is stochastic and the seeds are not
+recorded everywhere, so they are not reliably reproducible — they are the
+actual designs behind the reported numbers.
+
+One naming trap if you ever clean these by hand: the deleted `cpsea_peptide/`
+directory is unrelated to the run
+`cpsea_peptide_exp_b_frozen_mean_dimnorm_aefix`, which holds the orphaned AE.
+A glob like `rm -rf *cpsea_peptide*` would take out the only copy of that AE.
+
 ## 4. Pull the data from the new cluster
 
 Run the transfer **on the new cluster, pulling from rhea** — not as a job

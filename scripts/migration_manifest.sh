@@ -163,6 +163,34 @@ emit "$ZFS/lpgen/weights/rfd3_released/rfd3_foundry_2025_12_01_remapped.ckpt"
 
 sort -u -o "$FILES" "$FILES"
 
+# ---- the repo tree on home ----------------------------------------------
+# Despite the rule that artefacts live on $ZFS, 46 GB of results accumulated
+# under the repo on home. Almost all of it is bulk structures -- 362k PDBs
+# across inference/ and evaluation_results/ -- which regenerate from the
+# checkpoints we are carrying. The numbers behind every figure and table are
+# in the CSV/JSON/JSONL/npz beside them, and that is only ~500 MB.
+# These paths are relative to the REPO, not $ZFS, so they get their own list
+# and their own rsync invocation.
+REPO="${REPO:-/zfsauton2/home/yixiz/Proteina-Complexa}"
+HFILES="$OUTDIR/tier0_home.files"
+: > "$HFILES"
+if [ -d "$REPO" ]; then
+  echo "collecting results from the repo tree on home ..."
+  for d in evaluation_results inference outputs logs slurm_logs calibration_native assets surfaces; do
+    [ -d "$REPO/$d" ] || continue
+    find "$REPO/$d" -type f \
+      \( -name '*.csv' -o -name '*.json' -o -name '*.jsonl' -o -name '*.npz' \
+         -o -name '*.png' -o -name '*.txt' -o -name '*.log' -o -name '*.fa' \) \
+      -size -200M -print 2>/dev/null \
+    | while read -r f; do printf '%s\n' "${f#"$REPO"/}"; done >> "$HFILES"
+  done
+  sort -u -o "$HFILES" "$HFILES"
+  ( cd "$REPO" && du -ch --files0-from=<(tr '\n' '\0' < "$HFILES") 2>/dev/null | tail -1 ) \
+    > "$OUTDIR/tier0_home.total" || echo "unknown" > "$OUTDIR/tier0_home.total"
+  echo "  home entries : $(wc -l < "$HFILES")"
+  echo "  home total   : $(cat "$OUTDIR/tier0_home.total")"
+fi
+
 echo "sizing ..."
 ( cd "$ZFS" && du -ch --files0-from=<(tr '\n' '\0' < "$FILES") 2>/dev/null | tail -1 ) \
   > "$OUTDIR/tier0.total" || echo "unknown" > "$OUTDIR/tier0.total"
