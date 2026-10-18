@@ -24,6 +24,26 @@ ZFS="${ZFS:-/zfsauton/scratch/yixiz}"
 STORE="$ZFS/Proteina-Complexa/training_runs/store"
 OUTDIR="${OUTDIR:-$ZFS/migration}"
 KEEP_SMOKE="${KEEP_SMOKE:-0}"
+REPO_DIR="${REPO_DIR:-/zfsauton2/home/yixiz/Proteina-Complexa}"
+
+# PROFILE=full     every real run's EMA weights (~205 GB)
+# PROFILE=minimal  only what the sequence-conditioned follow-up needs, plus
+#                  both autoencoders. See RUNS_ONLY below.
+PROFILE="${PROFILE:-full}"
+
+# The minimal set, and why each member is in it:
+#   cpsea_seqcond_v2            the model being followed up
+#   cpsea_bondunroll_from_v4cfg its pretrain_ckpt_path, needed to relaunch
+#   finetune_full_128           the CPSea AE (seqcond's autoencoder_ckpt_path)
+#   shared_ae_lpcp_128          the CPSea+LP AE, via its frozen_ae.ckpt
+#   cpsea_lpmix_from_v4cfg      the flow model that uses that shared AE
+RUNS_ONLY="${RUNS_ONLY:-
+cpsea_seqcond_v2
+cpsea_bondunroll_from_v4cfg
+finetune_full_128
+shared_ae_lpcp_128
+cpsea_lpmix_from_v4cfg
+}"
 
 # Arms still being worked. For these we also carry last.ckpt -- the non-EMA
 # checkpoint holding optimizer state -- so training can resume on the new
@@ -53,13 +73,49 @@ emit() { # path -> append as $ZFS-relative if it exists
   printf '%s\n' "${1#"$ZFS"/}" >> "$FILES"
 }
 
+# Choose the checkpoint with the highest embedded global_step from the globs
+# given. With zero or one match this is free; only a genuine ambiguity costs
+# a read, and even then only of the zip header, not the 2.9 GB of weights.
+PY="${PY:-$REPO_DIR/.venv/bin/python}"
+
+# Three-point content fingerprint: head, middle and tail. Enough to tell two
+# multi-GB checkpoints apart without reading either in full.
+fp() {
+  local f="$1" sz mb
+  sz=$(stat -c%s "$f"); mb=$((sz / 1048576))
+  {
+    dd if="$f" bs=1M count=32 2>/dev/null
+    dd if="$f" bs=1M skip=$((mb / 2)) count=32 2>/dev/null
+    dd if="$f" bs=1M skip=$(( mb > 32 ? mb - 32 : 0 )) count=32 2>/dev/null
+  } | md5sum | cut -d' ' -f1
+}
+pick_latest() {
+  local cands=() f
+  for f in "$@"; do [ -e "$f" ] && cands+=("$f"); done
+  case ${#cands[@]} in
+    0) return 0 ;;
+    1) printf '%s\n' "${cands[0]}"; return 0 ;;
+  esac
+  if [ -x "$PY" ] && [ -f "$REPO_DIR/script_utils/ckpt_step.py" ]; then
+    local best
+    best="$("$PY" -I "$REPO_DIR/script_utils/ckpt_step.py" --max "${cands[@]}" 2>/dev/null || true)"
+    if [ -n "$best" ]; then printf '%s\n' "$best"; return 0; fi
+  fi
+  # Fall back to name order, and say so -- a silent fallback here is how the
+  # wrong checkpoint travels.
+  echo "  !! cannot read steps in $(dirname "${cands[0]}"); falling back to name order" >&2
+  printf '%s\n' "$(printf '%s\n' "${cands[@]}" | sort | tail -1)"
+}
+
 echo "scanning $STORE ..."
 nkept=0; nskip=0
 for run in "$STORE"/*/; do
   run="${run%/}"
   [ -d "$run" ] || continue
   name="$(basename "$run")"
-  if [ "$KEEP_SMOKE" != "1" ] && printf '%s' "$name" | grep -qE "$SKIP_RE"; then
+  if [ "$PROFILE" = "minimal" ]; then
+    printf '%s\n' $RUNS_ONLY | grep -qx "$name" || { nskip=$((nskip + 1)); continue; }
+  elif [ "$KEEP_SMOKE" != "1" ] && printf '%s' "$name" | grep -qE "$SKIP_RE"; then
     nskip=$((nskip + 1)); continue
   fi
 
@@ -70,12 +126,15 @@ for run in "$STORE"/*/; do
   ck="$run/checkpoints"
   [ -d "$ck" ] || continue
 
-  # Highest-step EMA checkpoint. The chk_epoch=...step=... names sort
-  # lexicographically in step order because the digits are zero-padded, so a
-  # plain sort is already numeric order. Fall back to last-EMA, then last.
-  best="$(ls -1 "$ck"/chk_epoch=*-EMA.ckpt 2>/dev/null | sort | tail -1 || true)"
-  [ -n "$best" ] || best="$(ls -1 "$ck"/last-EMA.ckpt 2>/dev/null | tail -1 || true)"
-  [ -n "$best" ] || best="$(ls -1 "$ck"/last.ckpt 2>/dev/null | tail -1 || true)"
+  # Pick the furthest-trained EMA checkpoint. Filenames cannot be trusted for
+  # this: on requeue Lightning writes last.ckpt, then last-v1.ckpt and so on,
+  # and the suffix does not track time. cpsea_seqcond_v2 is the case in point
+  # -- bare last.ckpt is step 2400 while last-v3.ckpt is step 3000, so naming
+  # or mtime would both have carried a stale checkpoint. When more than one
+  # candidate exists, read the step out of each and take the max.
+  best="$(pick_latest "$ck"/chk_epoch=*-EMA.ckpt)"
+  [ -n "$best" ] || best="$(pick_latest "$ck"/last*-EMA.ckpt)"
+  [ -n "$best" ] || best="$(pick_latest "$ck"/last*.ckpt)"
 
   if [ -z "$best" ]; then
     echo "  !! no checkpoint found in $name" >&2
@@ -89,11 +148,23 @@ for run in "$STORE"/*/; do
   # chart instead of starting a second one. 34 bytes.
   emit "$ck/wandb_run_id.txt"
 
-  # Live arms additionally get optimizer state, so they can be resumed.
-  if printf '%s\n' $LIVE_ARMS | grep -qx "$name"; then
-    emit "$ck/last.ckpt"
-    [ "$best" = "$ck/last-EMA.ckpt" ] || emit "$ck/last-EMA.ckpt"
-    echo "  + optimizer state for live arm $name"
+  # Live arms additionally get optimizer state, so they can be resumed. In
+  # the minimal profile every run kept is one we intend to continue.
+  if [ "$PROFILE" = "minimal" ] || printf '%s\n' $LIVE_ARMS | grep -qx "$name"; then
+    nonema=()
+    for f in "$ck"/last*.ckpt; do
+      case "$f" in
+        *-EMA.ckpt) ;;
+        *) [ -e "$f" ] && nonema+=("$f") ;;
+      esac
+    done
+    if [ ${#nonema[@]} -gt 0 ]; then
+      opt="$(pick_latest ${nonema[@]+"${nonema[@]}"})"
+      if [ -n "$opt" ]; then
+        emit "$opt"
+        echo "  + optimizer state for $name: $(basename "$opt")"
+      fi
+    fi
   fi
   nkept=$((nkept + 1))
 done
@@ -110,7 +181,24 @@ declare -A seen_ae
 ndup=0
 for f in "$STORE"/*/frozen_ae.ckpt; do
   [ -e "$f" ] || continue
+  rn="$(basename "$(dirname "$f")")"
+  if [ "$PROFILE" = "minimal" ]; then
+    printf '%s\n' $RUNS_ONLY | grep -qx "$rn" || continue
+  fi
   sz="$(stat -c%s "$f")"
+  # For a pure AE run, frozen_ae.ckpt is often a byte-copy of that run's own
+  # best checkpoint -- shared_ae_lpcp_128 is exactly that. Drop whichever we
+  # already carry, but only on a content match: a size match alone could
+  # silently hand a run the wrong autoencoder, and the flow configs point at
+  # the frozen_ae.ckpt path by name, so we keep that one and drop the twin.
+  for sib in $(grep "^Proteina-Complexa/training_runs/store/$rn/checkpoints/.*\.ckpt\$" "$FILES" 2>/dev/null || true); do
+    [ -e "$ZFS/$sib" ] || continue
+    [ "$(stat -c%s "$ZFS/$sib")" = "$sz" ] || continue
+    if [ "$(fp "$ZFS/$sib")" = "$(fp "$f")" ]; then
+      echo "  $rn: frozen_ae.ckpt is $(basename "$sib"); dropping the twin"
+      grep -vxF "$sib" "$FILES" > "$FILES.tmp" && mv "$FILES.tmp" "$FILES"
+    fi
+  done
   if [ -n "${seen_ae[$sz]:-}" ]; then
     ndup=$((ndup + 1)); continue
   fi

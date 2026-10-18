@@ -138,6 +138,52 @@ Override the resumable set with e.g. `LIVE_ARMS="cpsea_cyc_ringpe_bond_v4
 shared_ae_lpcp_128" bash scripts/migration_manifest.sh`, or pass
 `KEEP_SMOKE=1` to include the smoke runs.
 
+### The minimal profile, for the sequence-conditioning follow-up
+
+If the next work is only the sequence-conditioned model (letting it make more
+sequence mutations) plus both autoencoders, most of the store is irrelevant:
+
+```bash
+OUTDIR=$ZFS/migration_min PROFILE=minimal bash scripts/migration_manifest.sh
+```
+
+**41 GB instead of 205 GB.** It keeps five runs, resolved from the configs
+rather than guessed:
+
+| Run | Why | Size |
+|---|---|---|
+| `cpsea_seqcond_v2` | the model being followed up | 5.4 GB |
+| `finetune_full_128` | **the CPSea AE** — seqcond's `autoencoder_ckpt_path` | 7.6 GB |
+| `shared_ae_lpcp_128` | **the CPSea+LP AE** — `frozen_ae.ckpt`, what the LP-mixing run pins | 7.6 GB |
+| `cpsea_bondunroll_from_v4cfg` | seqcond's `pretrain_ckpt_path`, needed to relaunch | 5.4 GB |
+| `cpsea_lpmix_from_v4cfg` | the flow model that uses the shared AE | 5.4 GB |
+
+Plus lpgen's two trained checkpoints and RFD3 base weights (7.5 GB), the
+CPSea identity files and eval root, and all the results. Trim further with
+`RUNS_ONLY="..."`; dropping lpgen and the two AE `last.ckpt` files would take
+it to roughly 20 GB.
+
+#### The checkpoint this nearly got wrong
+
+`cpsea_seqcond_v2` holds eight checkpoints from requeues, and the filenames
+lie about which is newest:
+
+| Checkpoint | Step |
+|---|---|
+| `last-v1`, `last-v1-EMA` | 1,500 |
+| `last`, `last-EMA`, `last-v2`, `last-v2-EMA` | 2,400 |
+| `last-v3`, `last-v3-EMA` | **3,000** |
+
+The bare `last.ckpt` is *newer by mtime* than `last-v1.ckpt` but older than
+`last-v3.ckpt`, so neither name order nor mtime finds the right one — and the
+earlier manifest picked `last-EMA.ckpt`, i.e. step 2,400, for exactly the arm
+we now want to continue. `script_utils/ckpt_step.py` reads `global_step` out
+of the zip header without loading the 2.9 GB of weights, and the manifest now
+uses it whenever a run has more than one candidate.
+
+(Note the run's last *saved* state is step 3,000, while it was logged as
+reaching ~3,745 before it died on 2026-09-07.)
+
 ### The prune that has already been applied
 
 `scripts/migration_prune.sh` was run on 2026-10-18 and reclaimed
