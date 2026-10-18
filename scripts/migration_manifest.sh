@@ -163,6 +163,36 @@ emit "$ZFS/lpgen/weights/rfd3_released/rfd3_foundry_2025_12_01_remapped.ckpt"
 
 sort -u -o "$FILES" "$FILES"
 
+# ---- CPSea dataset identity ----------------------------------------------
+# The bulk of CPSea (290 GB full + 68 GB CPBind) is public on Zenodo
+# (record 16794716) and is re-downloadable, so it does not cross the network.
+# What is NOT re-derivable is exactly which structures these runs were
+# trained and evaluated on -- and the Zenodo record warns a newer version is
+# coming, so a fresh download may not be the same data. The index and
+# properties files pin that: 2,714,414 rows for ~617 MB.
+echo "collecting CPSea dataset identity ..."
+for f in \
+  "$ZFS/CPSea/CPSea_full/CPSea/CPSea_index.txt" \
+  "$ZFS/CPSea/CPBind/CPBind_index.txt" \
+  "$ZFS/CPSea/CPSea_PDB/CPSea_PDB_index.txt"
+do emit "$f"; done
+for d in \
+  "$ZFS/CPSea/CPSea_full/CPSea/CPSea_properties" \
+  "$ZFS/CPSea/CPBind/CPBind_properties" \
+  "$ZFS/CPSea/CPSea_PDB/CPSea_PDB_properties"
+do
+  [ -d "$d" ] || continue
+  find "$d" -type f -size -200M -print 2>/dev/null \
+    | while read -r f; do printf '%s\n' "${f#"$ZFS"/}"; done >> "$FILES"
+done
+
+# The eval data root is only 1.6 GB in total, so carry it whole rather than
+# re-downloading and re-preprocessing it.
+find "$ZFS/CPSea/CPSea_PDB" -type f -size -200M -print 2>/dev/null \
+  | while read -r f; do printf '%s\n' "${f#"$ZFS"/}"; done >> "$FILES"
+
+sort -u -o "$FILES" "$FILES"
+
 # ---- the repo tree on home ----------------------------------------------
 # Despite the rule that artefacts live on $ZFS, 46 GB of results accumulated
 # under the repo on home. Almost all of it is bulk structures -- 362k PDBs

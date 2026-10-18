@@ -71,16 +71,37 @@ The raw numbers:
 | `Proteina-Complexa/training_runs/store` | ~725 GB, 71 runs | **thin it** — see below |
 | `lpgen/` | 30 GB | thin it — but it holds two trained checkpoints, see below |
 | `LPData/` | 12 GB | 3.9 GB preprocessed worth taking; the rest is re-downloadable archives |
-| `CPSea/` | not measured | raw + preprocessed CPSea; see step 5 |
+| `CPSea/` | 360 GB | **re-download** from Zenodo; carry index/properties only (~2.3 GB) |
 | `*/.venv`, `uv_cache`, `envs` | ~20 GB | **skip** — rebuild from the frozen requirements |
 
-`CPSea/` is the one directory I could not size: `du` over it did not finish,
-which on a filesystem sitting at 100% is not surprising. Measure it in the
-background before you plan that part of the copy:
+### CPSea: download it again, do not carry it
 
-```bash
-du -sh /zfsauton/scratch/yixiz/CPSea/*/ > ~/cpsea_sizes.txt 2>&1 &
-```
+Measured: `CPSea_full` 290 GB, `CPBind` 68 GB, `CPSea_PDB` 1.6 GB,
+`replay_buffers` 1.7 MB. That is ~360 GB, and it is the single biggest item
+in the move — but none of it needs to cross the network.
+
+CPSea is public. It is a NeurIPS 2025 Datasets and Benchmarks paper (Yang et
+al., Tsinghua), the data is on [Zenodo record
+16794716](https://zenodo.org/records/16794716) (~159 GB of archives, v2,
+published 2025-08-15, including a `CPBind` subfolder), with scripts at
+[github.com/YZY010418/CPSea](https://github.com/YZY010418/CPSea) and a Kaggle
+mirror. Our local `CPSea_index.txt` has 2,714,414 rows, matching the paper's
+2.71M complexes exactly.
+
+Two caveats that decide what you still have to carry:
+
+1. **The Zenodo record warns v2 has hydrogen-geometry and chirality issues
+   and says a newer version is coming.** A fresh download may therefore not
+   be the data these checkpoints were trained on. Pin v2 explicitly.
+2. The `preprocessed/` halves are produced locally by
+   `script_utils/preprocess_cpsea.py`, so they regenerate — but it is a long
+   job over 2.71M structures.
+
+So the manifest carries the *identity* of the dataset rather than its bulk:
+`CPSea_index.txt` (109 MB) and `CPSea_properties` (508 MB) for the full set,
+the same two for CPBind (8.5 MB + 104 MB), and all of `CPSea_PDB` (1.6 GB,
+the eval root — too small to be worth re-deriving). That is ~2.3 GB instead
+of 360 GB, and it pins exactly which structures were used.
 
 The store is ~725 GB, and it is worth being precise about why, because the
 obvious explanation is wrong. It is *not* mostly unpruned intermediates —
@@ -109,7 +130,7 @@ real run, the config JSONs and `wandb_run_id.txt`, every
 deduplicated, and `last.ckpt` for the arms listed in `LIVE_ARMS` so those can
 be resumed rather than restarted. Measured output:
 
-- **36,995 entries, 204 GB** (~31 GB live-arm optimizer state, ~7.8 GB lpgen)
+- **61,858 entries, 205 GB** (~31 GB live-arm optimizer state, ~7.8 GB lpgen, ~2.3 GB CPSea identity)
 - 54 runs kept, 14 smoke/overfit runs dropped
 - 19 of the 23 frozen-AE copies dropped as byte-identical duplicates
 
@@ -234,7 +255,7 @@ mkdir -p "$NEW"
 # bring the file list over first
 rsync -avP yixiz@rhea:/zfsauton/scratch/yixiz/migration/tier0.files /tmp/
 
-# then the 204 GB, resumable
+# then the 205 GB, resumable
 rsync -avPH --partial --append-verify \
   --files-from=/tmp/tier0.files \
   yixiz@rhea:/zfsauton/scratch/yixiz/ "$NEW/"
