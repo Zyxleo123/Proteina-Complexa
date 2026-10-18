@@ -90,6 +90,32 @@ for f in "$STORE"/*/frozen_ae.ckpt; do
   freed=$((freed + sz))
 done
 
+# ---- 1b. the duplicated RFD3 base weights --------------------------------
+# foundry/rfd3_latest.ckpt and rfd3_released/..._remapped.ckpt are the same
+# 2.6 GB file under two names. Keep the released name -- that is the one the
+# manifest carries and the one whose filename records the revision.
+echo
+echo "== duplicated RFD3 base weights -> hardlink =="
+RFD3_KEEP="$ZFS/lpgen/weights/rfd3_released/rfd3_foundry_2025_12_01_remapped.ckpt"
+RFD3_DUP="$ZFS/lpgen/weights/foundry/rfd3_latest.ckpt"
+if [ -e "$RFD3_KEEP" ] && [ -e "$RFD3_DUP" ] \
+   && [ "$(stat -c%i "$RFD3_KEEP")" != "$(stat -c%i "$RFD3_DUP")" ] \
+   && [ "$(stat -c%s "$RFD3_KEEP")" = "$(stat -c%s "$RFD3_DUP")" ] \
+   && [ "$(fp "$RFD3_KEEP")" = "$(fp "$RFD3_DUP")" ]; then
+  if protected "$RFD3_DUP"; then
+    echo "  SKIP (protected) $RFD3_DUP"
+  else
+    sz=$(stat -c%s "$RFD3_DUP")
+    say "link foundry/rfd3_latest.ckpt -> rfd3_released/..._remapped.ckpt"
+    if [ "$APPLY" = 1 ]; then
+      ln "$RFD3_KEEP" "$RFD3_DUP.hltmp" && mv -f "$RFD3_DUP.hltmp" "$RFD3_DUP"
+    fi
+    freed=$((freed + sz))
+  fi
+else
+  echo "  nothing to do (missing, already linked, or content differs)"
+fi
+
 # ---- 2. ignore*.ckpt that duplicate last*.ckpt ----------------------------
 echo
 echo "== ignore*.ckpt duplicates -> delete =="

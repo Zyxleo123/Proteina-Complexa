@@ -69,7 +69,7 @@ The raw numbers:
 | Path | Size | Verdict |
 |---|---|---|
 | `Proteina-Complexa/training_runs/store` | ~725 GB, 71 runs | **thin it** — see below |
-| `lpgen/` | 30 GB | thin it (11 GB is re-downloadable weights, 7.6 GB venvs, 4.2 GB uv cache) |
+| `lpgen/` | 30 GB | thin it — but it holds two trained checkpoints, see below |
 | `LPData/` | 12 GB | 3.9 GB preprocessed worth taking; the rest is re-downloadable archives |
 | `CPSea/` | not measured | raw + preprocessed CPSea; see step 5 |
 | `*/.venv`, `uv_cache`, `envs` | ~20 GB | **skip** — rebuild from the frozen requirements |
@@ -109,7 +109,7 @@ real run, the config JSONs and `wandb_run_id.txt`, every
 deduplicated, and `last.ckpt` for the arms listed in `LIVE_ARMS` so those can
 be resumed rather than restarted. Measured output:
 
-- **36,992 entries, 196 GB** (of which ~31 GB is live-arm optimizer state)
+- **36,995 entries, 204 GB** (~31 GB live-arm optimizer state, ~7.8 GB lpgen)
 - 54 runs kept, 14 smoke/overfit runs dropped
 - 19 of the 23 frozen-AE copies dropped as byte-identical duplicates
 
@@ -120,7 +120,7 @@ shared_ae_lpcp_128" bash scripts/migration_manifest.sh`, or pass
 ### The prune that has already been applied
 
 `scripts/migration_prune.sh` was run on 2026-10-18 and reclaimed
-**146.2 GB** (scratch went from 100% to 99% free-space-wise, 310 GB → 454 GB
+**148.7 GB** (scratch went from 100% to 99%, 310 GB → 453 GB
 available). It is idempotent, so re-running it is harmless. What it did:
 
 - Hardlinked 19 byte-identical `frozen_ae.ckpt` copies onto one inode
@@ -131,15 +131,43 @@ available). It is idempotent, so re-running it is harmless. What it did:
 - Deleted 16 periodic non-best `chk_epoch=*` checkpoints. One of them,
   `shared_ae_lpcp_128/.../step=000000050000.ckpt`, was a 1.1 GB truncated
   write (unreadable as a zip) from the job that got killed mid-save.
+- Hardlinked `lpgen/weights/foundry/rfd3_latest.ckpt` onto the identical
+  `rfd3_released/..._remapped.ckpt` (2.5 GB).
 
 The script defaults to a dry run, re-verifies byte-identity at run time
 rather than trusting an earlier scan, and refuses to touch anything listed in
-`tier0.files`. After the run, all 36,992 manifest entries were confirmed
+`tier0.files`. After the run, all 36,995 manifest entries were confirmed
 still present.
 
 Because of the hardlinking, **use `rsync -H`** if you ever sync whole
 directories instead of the manifest; without it the 19 links expand back into
 19 separate 4.1 GB copies on the destination.
+
+### lpgen trains outside the store
+
+The LP generator writes to `$ZFS/lpgen/runs`, not to
+`training_runs/store`, so the loop over the store misses it entirely. Two
+checkpoints there are real trained output and nothing else reproduces them:
+
+- `lpgen/runs/lp_finetune_v1/ckpt/epoch-0602.ckpt` (2.6 GB)
+- `lpgen/runs/lp_hotspot_v1/ckpt/epoch-0580.ckpt` (2.6 GB)
+
+Both are now in the manifest. Preflight and `_hsprobe` runs are skipped.
+
+The base weights split two ways. The DiffPepBuilder weights (4.9 GB) have
+URLs and md5s in `scripts/_lpgen_preamble.sh` and are listed as `verified` in
+`weights_manifest.json`, so they are re-downloadable — skip them. The RFD3
+weights are not: **`weights_manifest.json` covers only DiffPepBuilder**, no
+URL for RFD3 appears anywhere in the repo, and foundry is a private registry.
+So one copy of `rfd3_foundry_2025_12_01_remapped.ckpt` is carried.
+
+`foundry/rfd3_latest.ckpt` turned out to be the same 2.6 GB file under a
+second name; it is now a hardlink to the released copy.
+
+The local edits in `lpgen/upstream/{foundry,diffpepbuilder}` need no action:
+`script_utils/lpgen_patch_upstream.py` regenerates exactly those lazy-import
+patches, and no upstream clone has unpushed commits. Only `foundry/.env`
+differs by one line, which you will be rewriting on the new cluster anyway.
 
 ### One irreplaceable file to not lose
 
@@ -166,7 +194,7 @@ mkdir -p "$NEW"
 # bring the file list over first
 rsync -avP yixiz@rhea:/zfsauton/scratch/yixiz/migration/tier0.files /tmp/
 
-# then the 196 GB, resumable
+# then the 204 GB, resumable
 rsync -avPH --partial --append-verify \
   --files-from=/tmp/tier0.files \
   yixiz@rhea:/zfsauton/scratch/yixiz/ "$NEW/"

@@ -140,6 +140,27 @@ done
 # records WHICH revision was fetched is not.
 emit "$ZFS/lpgen/weights/weights_manifest.json"
 
+# ---- lpgen ---------------------------------------------------------------
+# The LP generator arm trains into $ZFS/lpgen/runs, not into the store above,
+# so none of it is picked up by the loop over $STORE.
+echo "collecting lpgen checkpoints ..."
+for run in $ZFS/lpgen/runs/*/; do
+  run="${run%/}"; name="$(basename "$run")"
+  # Preflight and smoke runs exist to prove a job launches; their checkpoints
+  # are not worth 1.3 GB each.
+  printf '%s' "$name" | grep -qE '(_preflight$|_hsprobe$|smoke|^_)' && continue
+  newest="$(ls -1 "$run"/ckpt/*.ckpt 2>/dev/null | sort | tail -1 || true)"
+  [ -n "$newest" ] || continue
+  emit "$newest"
+  echo "  + $name/$(basename "$newest")"
+done
+
+# RFD3 base weights. Unlike the DiffPepBuilder weights -- which have URLs and
+# md5s in scripts/_lpgen_preamble.sh and are listed in weights_manifest.json
+# -- these two have no recorded provenance anywhere, and foundry is a private
+# registry. Carry one copy; the pair are byte-identical.
+emit "$ZFS/lpgen/weights/rfd3_released/rfd3_foundry_2025_12_01_remapped.ckpt"
+
 sort -u -o "$FILES" "$FILES"
 
 echo "sizing ..."
