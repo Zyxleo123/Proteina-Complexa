@@ -60,6 +60,10 @@ Everything real lives under `/zfsauton/scratch/yixiz`. The `store/` directory
 inside the repo on home looks like a second copy but is a 512-byte symlink
 farm pointing back into scratch — ignore it.
 
+Note that `/zfsauton/scratch` is at **100% (36T used, ~317G free)**, so there
+is no room to stage a tarball here. Transfer file-by-file over the network;
+do not try to `tar` anything up first.
+
 The raw numbers:
 
 | Path | Size | Verdict |
@@ -67,8 +71,16 @@ The raw numbers:
 | `Proteina-Complexa/training_runs/store` | ~700 GB, 71 runs | **thin it** — see below |
 | `lpgen/` | 30 GB | thin it (11 GB is re-downloadable weights, 7.6 GB venvs, 4.2 GB uv cache) |
 | `LPData/` | 12 GB | 3.9 GB preprocessed worth taking; the rest is re-downloadable archives |
-| `CPSea/` | large, still measuring | raw + preprocessed CPSea; see step 5 |
+| `CPSea/` | not measured | raw + preprocessed CPSea; see step 5 |
 | `*/.venv`, `uv_cache`, `envs` | ~20 GB | **skip** — rebuild from the frozen requirements |
+
+`CPSea/` is the one directory I could not size: `du` over it did not finish,
+which on a filesystem sitting at 100% is not surprising. Measure it in the
+background before you plan that part of the copy:
+
+```bash
+du -sh /zfsauton/scratch/yixiz/CPSea/*/ > ~/cpsea_sizes.txt 2>&1 &
+```
 
 The store is 700 GB because nothing ever prunes it: each run keeps every
 periodic checkpoint *and* its EMA twin, and 23 runs additionally hold a full
@@ -139,9 +151,15 @@ Judgement call per dataset:
 - `LPData/preprocessed` (3.9 GB) — take it; cheap and annoying to rebuild.
 - `LPData/{PepMerge_release.zip, ProtFrag.tar.gz, PepPC-F_raw_data.tar.gz,
   La-Proteina_AFDB_IDs.zip}` — skip, these are public downloads.
-- `CPSea/CPSea_PDB` — this is `CPSEA_DATA_PATH`, the raw + preprocessed CPSea
-  set. Preprocessing it is a long job. If the new cluster has room, take the
-  preprocessed half and leave the raw PDBs.
+- `CPSea/CPSea_PDB` — this is `CPSEA_DATA_PATH`, split into
+  `CPSea_PDB_pdb` (raw), `preprocessed`, `CPSea_PDB_properties` and an index.
+  Preprocessing is a long job, so take `preprocessed` + `CPSea_PDB_properties`
+  + `CPSea_PDB_index.txt` and leave the raw PDBs if space is tight.
+- `CPSea/replay_buffers` — **skip.** These were collected before the
+  2026-08-04 fix for replay silently zeroing the receptor, so they have to be
+  recollected regardless; copying them moves known-bad data.
+- `CPSea/CPBind`, `CPSea/CPSea_full` — needed by the `full` data mode and the
+  eval target set. Take them if you intend to re-run evals.
 - `lpgen/weights/{rfd3_released, diffpepbuilder, unimomo}` — skip the weights,
   **take `weights_manifest.json`** (already in the manifest) so you can
   re-fetch the exact revisions.
