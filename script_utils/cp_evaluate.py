@@ -299,6 +299,15 @@ def evaluate_candidate(
     row["per_residue_ca_dev_A"] = dev
     row["interior_max_ca_dev_A"] = round(
         max((d for li, d in enumerate(dev) if li not in released), default=0.0), 3)
+    # RMSD over the residues the search did NOT release. This is the pose criterion that gates
+    # acceptance: terminal travel is the intended edit, and any binding it actually costs is
+    # charged by contact retention instead. An arm that releases the whole peptide (SDEdit) has
+    # an EMPTY interior, and the metric is NaN rather than 0 -- there is no preserved region to
+    # vouch for, so it must not read as a perfect score.
+    interior_pos = [bp[li] for li in range(target.length) if li not in released]
+    row["n_interior_residues"] = len(interior_pos)
+    row["interior_ca_rmsd_A"] = (round(C.ca_rmsd(pose, target.pose, interior_pos), 3)
+                                 if interior_pos else float("nan"))
 
     heavy = C.heavy_atom_contacts(pose, bp, target.receptor_pos)
     ca = C.ca_contacts(pose, bp, target.receptor_pos)
@@ -330,6 +339,14 @@ def evaluate_candidate(
 
     row.update(C.accept(row))
     row.update(C.tier_flags(row))
+    # Both verdicts on every row. The pose criterion was revised mid-experiment (terminal travel
+    # is the intended edit, not damage), and the honest way to carry that is to keep the original
+    # contract computed alongside rather than to relabel results under the new one. A reader can
+    # always recover the pre-revision table from `accepted_legacy_pose`.
+    legacy = C.accept(row, C.LEGACY_THRESHOLDS)
+    row["accepted_legacy_pose"] = legacy["accepted"]
+    row["fail_reasons_legacy_pose"] = legacy["fail_reasons"]
+    row["pose_gate"] = C.DEFAULT_THRESHOLDS.pose_gate
     return row
 
 
@@ -349,18 +366,29 @@ def shortlist_key(row: dict) -> tuple:
             return default
         return default if v != v else v
 
+    # Gates and tie-breaks both follow the POSE GATE in force. Ranking on whole-peptide RMSD
+    # while acceptance is decided on the interior would shortlist the wrong candidates -- and
+    # that matters here, because the two are only weakly related (corr -0.518 with retention),
+    # so the best-RMSD candidate is often not the best-binding one.
+    interior_gate = C.DEFAULT_THRESHOLDS.pose_gate == "interior"
+    pose_ok = (f("interior_ca_rmsd_A", 99.0) <= C.MAX_INTERIOR_CA_RMSD_A if interior_gate
+               else (f("ca_rmsd_A", 99.0) <= C.MAX_CA_RMSD_A
+                     and f("interface_ca_rmsd_A", 99.0) <= C.MAX_INTERFACE_CA_RMSD_A))
     gates = (
         bool(row.get("bond_ok")),
         bool(row.get("clashes_ok")),
         bool(row.get("stereochem_ok")),
-        f("ca_rmsd_A", 99.0) <= C.MAX_CA_RMSD_A,
-        f("interface_ca_rmsd_A", 99.0) <= C.MAX_INTERFACE_CA_RMSD_A,
+        pose_ok,
         f("contact_retention_heavy45", 0.0) >= C.MIN_CONTACT_RETENTION,
     )
+    pose_metric = (f("interior_ca_rmsd_A", 99.0) if interior_gate
+                   else f("interface_ca_rmsd_A", 99.0))
     return (
         -sum(gates),
+        # Retention first: with the pose gate narrowed to the interior, contact retention IS the
+        # binding-preservation criterion, so it should drive selection rather than sit behind a
+        # displacement number.
         -f("contact_retention_heavy45", 0.0),
-        f("interface_ca_rmsd_A", 99.0),
-        f("ca_rmsd_A", 99.0),
+        pose_metric,
         f("n_substitutions", 99),
     )
