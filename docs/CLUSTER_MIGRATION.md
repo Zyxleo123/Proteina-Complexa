@@ -68,7 +68,7 @@ The raw numbers:
 
 | Path | Size | Verdict |
 |---|---|---|
-| `Proteina-Complexa/training_runs/store` | ~700 GB, 71 runs | **thin it** — see below |
+| `Proteina-Complexa/training_runs/store` | ~725 GB, 71 runs | **thin it** — see below |
 | `lpgen/` | 30 GB | thin it (11 GB is re-downloadable weights, 7.6 GB venvs, 4.2 GB uv cache) |
 | `LPData/` | 12 GB | 3.9 GB preprocessed worth taking; the rest is re-downloadable archives |
 | `CPSea/` | not measured | raw + preprocessed CPSea; see step 5 |
@@ -82,9 +82,20 @@ background before you plan that part of the copy:
 du -sh /zfsauton/scratch/yixiz/CPSea/*/ > ~/cpsea_sizes.txt 2>&1 &
 ```
 
-The store is 700 GB because nothing ever prunes it: each run keeps every
-periodic checkpoint *and* its EMA twin, and 23 runs additionally hold a full
-4.1 GB copy of the AE they were frozen against.
+The store is ~725 GB, and it is worth being precise about why, because the
+obvious explanation is wrong. It is *not* mostly unpruned intermediates —
+only three runs still carry periodic checkpoints. Measured breakdown:
+
+| Category | Size |
+|---|---|
+| non-EMA checkpoints (optimizer state, = resumability) | 328 GB |
+| EMA checkpoints (what evals and sampling load) | 309 GB |
+| `frozen_ae.ckpt` copies, 23 runs | 88 GB |
+| periodic `chk_epoch=*` non-best | 58 GB |
+
+So most of the store is a legitimate two-checkpoint-per-run footprint. The
+saving comes from carrying EMA weights everywhere and optimizer state only
+where you actually intend to resume.
 
 Run the manifest builder to cut that down:
 
@@ -93,14 +104,42 @@ bash scripts/migration_manifest.sh
 ```
 
 It writes `$ZFS/migration/tier0.files` — one highest-step EMA checkpoint per
-real run, the config JSONs, every `frozen_ae_source.txt`, all JSON/JSONL/CSV
-results, and the frozen AEs deduplicated by size. Measured output:
+real run, the config JSONs and `wandb_run_id.txt`, every
+`frozen_ae_source.txt`, all JSON/JSONL/CSV results, the frozen AEs
+deduplicated, and `last.ckpt` for the arms listed in `LIVE_ARMS` so those can
+be resumed rather than restarted. Measured output:
 
-- **36,932 entries, 165 GB** (down from ~700 GB)
+- **36,992 entries, 196 GB** (of which ~31 GB is live-arm optimizer state)
 - 54 runs kept, 14 smoke/overfit runs dropped
 - 19 of the 23 frozen-AE copies dropped as byte-identical duplicates
 
-Pass `KEEP_SMOKE=1` if you want the smoke runs too.
+Override the resumable set with e.g. `LIVE_ARMS="cpsea_cyc_ringpe_bond_v4
+shared_ae_lpcp_128" bash scripts/migration_manifest.sh`, or pass
+`KEEP_SMOKE=1` to include the smoke runs.
+
+### The prune that has already been applied
+
+`scripts/migration_prune.sh` was run on 2026-10-18 and reclaimed
+**146.2 GB** (scratch went from 100% to 99% free-space-wise, 310 GB → 454 GB
+available). It is idempotent, so re-running it is harmless. What it did:
+
+- Hardlinked 19 byte-identical `frozen_ae.ckpt` copies onto one inode
+  (72.6 GB). Every path still resolves; no run was broken.
+- Deleted 4 `ignore*.ckpt` files verified byte-identical to the `last*.ckpt`
+  beside them. It *skipped* `from_scratch_full/ignore*.ckpt`, where the
+  content genuinely differed — worth knowing those two are a real state.
+- Deleted 16 periodic non-best `chk_epoch=*` checkpoints. One of them,
+  `shared_ae_lpcp_128/.../step=000000050000.ckpt`, was a 1.1 GB truncated
+  write (unreadable as a zip) from the job that got killed mid-save.
+
+The script defaults to a dry run, re-verifies byte-identity at run time
+rather than trusting an earlier scan, and refuses to touch anything listed in
+`tier0.files`. After the run, all 36,992 manifest entries were confirmed
+still present.
+
+Because of the hardlinking, **use `rsync -H`** if you ever sync whole
+directories instead of the manifest; without it the 19 links expand back into
+19 separate 4.1 GB copies on the destination.
 
 ### One irreplaceable file to not lose
 
@@ -127,8 +166,8 @@ mkdir -p "$NEW"
 # bring the file list over first
 rsync -avP yixiz@rhea:/zfsauton/scratch/yixiz/migration/tier0.files /tmp/
 
-# then the 165 GB, resumable
-rsync -avP --partial --append-verify \
+# then the 196 GB, resumable
+rsync -avPH --partial --append-verify \
   --files-from=/tmp/tier0.files \
   yixiz@rhea:/zfsauton/scratch/yixiz/ "$NEW/"
 ```
@@ -137,7 +176,7 @@ If it dies partway, re-run the same command — `--partial --append-verify`
 picks up where it stopped. Verify with:
 
 ```bash
-rsync -avn --files-from=/tmp/tier0.files \
+rsync -avnH --files-from=/tmp/tier0.files \
   yixiz@rhea:/zfsauton/scratch/yixiz/ "$NEW/" | tail -5
 ```
 

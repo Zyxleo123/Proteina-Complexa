@@ -25,6 +25,21 @@ STORE="$ZFS/Proteina-Complexa/training_runs/store"
 OUTDIR="${OUTDIR:-$ZFS/migration}"
 KEEP_SMOKE="${KEEP_SMOKE:-0}"
 
+# Arms still being worked. For these we also carry last.ckpt -- the non-EMA
+# checkpoint holding optimizer state -- so training can resume on the new
+# cluster rather than restart. Everything else gets EMA weights only, which
+# is enough to evaluate and sample but not to continue training.
+LIVE_ARMS="${LIVE_ARMS:-
+cpsea_cyc_ringpe_bond_v4
+shared_ae_lpcp_128
+finetune_full_128
+cpsea_lpmix_from_v4cfg
+cpsea_seqcond_v2
+cp2lp_bb_torsion
+cp2lp_bb_cartesian
+surface_receptor_full_v2
+}"
+
 mkdir -p "$OUTDIR"
 FILES="$OUTDIR/tier0.files"
 : > "$FILES"
@@ -70,6 +85,16 @@ for run in "$STORE"/*/; do
   emit "$best"
   # Configs are a few KB each and make the checkpoint reloadable.
   for j in "$ck"/*.json; do emit "$j"; done
+  # The wandb run id is what lets a resumed run keep logging to the same
+  # chart instead of starting a second one. 34 bytes.
+  emit "$ck/wandb_run_id.txt"
+
+  # Live arms additionally get optimizer state, so they can be resumed.
+  if printf '%s\n' $LIVE_ARMS | grep -qx "$name"; then
+    emit "$ck/last.ckpt"
+    [ "$best" = "$ck/last-EMA.ckpt" ] || emit "$ck/last-EMA.ckpt"
+    echo "  + optimizer state for live arm $name"
+  fi
   nkept=$((nkept + 1))
 done
 echo "  kept $nkept runs, skipped $nskip smoke/overfit runs"
