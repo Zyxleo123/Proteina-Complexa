@@ -6,6 +6,23 @@ cluster at your own pace, as long as rhea is reachable.
 
 ---
 
+## Where each step runs
+
+| Step | Machine | Must happen before rhea goes down? |
+|---|---|---|
+| 1. Push the code | **rhea** | **Yes** |
+| 2. Copy `.env` | **rhea** → your machine | **Yes** |
+| 3. Build the manifests | **rhea** (scans `$ZFS`) | **Yes** |
+| 4. Pull the data | **babel** (pulls from rhea) | Needs rhea reachable |
+| 5. Dataset decisions | — | — |
+| 6. Rebuild the environment | **babel** | No |
+| 7. Smoke-test | **babel** | No |
+
+Steps 1–3 are the time-critical ones: they read rhea's disk. Everything from
+4 onwards only needs rhea to still answer ssh.
+
+Every code block below is labelled with the machine it runs on.
+
 ## 0. What is already committed
 
 Every working tree was dirty when this started. All of it is now committed
@@ -24,6 +41,8 @@ pushed anywhere. If this disk goes away before step 1, they are gone.
 
 ## 1. Push the code — do this first
 
+**Run on rhea (old cluster).**
+
 ```bash
 cd /zfsauton2/home/yixiz/Proteina-Complexa
 git push origin cpsea
@@ -33,7 +52,7 @@ git push -u origin dflow-lp2cp
 git push -u origin flowedit-lp2cp
 ```
 
-Then confirm nothing is left behind:
+Then confirm nothing is left behind, still **on rhea**:
 
 ```bash
 git for-each-ref --format='%(refname:short) %(upstream:track)' refs/heads/
@@ -129,7 +148,8 @@ So most of the store is a legitimate two-checkpoint-per-run footprint. The
 saving comes from carrying EMA weights everywhere and optimizer state only
 where you actually intend to resume.
 
-Run the manifest builder to cut that down:
+Run the manifest builder to cut that down. **On rhea** — it scans `$ZFS`,
+so it must run while the old cluster is still up:
 
 ```bash
 bash scripts/migration_manifest.sh
@@ -152,7 +172,8 @@ shared_ae_lpcp_128" bash scripts/migration_manifest.sh`, or pass
 ### The minimal profile, for the sequence-conditioning follow-up
 
 If the next work is only the sequence-conditioned model (letting it make more
-sequence mutations) plus both autoencoders, most of the store is irrelevant:
+sequence mutations) plus both autoencoders, most of the store is irrelevant.
+**On rhea:**
 
 ```bash
 OUTDIR=$ZFS/migration_min PROFILE=minimal bash scripts/migration_manifest.sh
@@ -302,6 +323,8 @@ and table are in the CSV/JSON/JSONL/npz beside them, and those come to only
 `$ZFS/migration/tier0_home.files`, with paths relative to the repo rather
 than to `$ZFS`, so they need their own rsync:
 
+**On babel:**
+
 ```bash
 rsync -avPH --partial --append-verify \
   --files-from=/tmp/tier0_home.files \
@@ -318,15 +341,27 @@ directory is unrelated to the run
 `cpsea_peptide_exp_b_frozen_mean_dimnorm_aefix`, which holds the orphaned AE.
 A glob like `rm -rf *cpsea_peptide*` would take out the only copy of that AE.
 
-## 4. Pull the data from the new cluster
+## 4. Pull the data — on babel
 
-Run the transfer **on the new cluster, pulling from rhea** — not as a job
-here. The transfer then lives on the machine that is not going down, and
-`rsync` resumes cleanly if the link drops.
+Run the transfer **on babel, pulling from rhea** — not as a job on rhea. The
+transfer then lives on the machine that is not going down, and `rsync`
+resumes cleanly if the link drops.
+
+**Check this first, on babel.** The whole plan assumes babel can reach rhea
+over ssh; if it cannot, the direction has to invert into a push from rhea
+while it is still up, and that is not something you want to discover at
+138 GB:
 
 ```bash
-# on the NEW cluster, inside tmux/screen
-NEW=/path/to/new/scratch/yixiz
+ssh yixiz@rhea hostname && echo "reachable — pull plan is fine"
+```
+
+If that fails, run the same `rsync` lines **from rhea** instead, with the
+babel path as the destination, inside `tmux` there.
+
+```bash
+# on babel, inside tmux/screen
+NEW=/path/to/babel/scratch/yixiz
 mkdir -p "$NEW"
 
 # bring the file list over first
@@ -376,6 +411,8 @@ is the only record of the versions the current results were produced with.
 It was frozen from the working `.venv` on 2026-10-18 — 236 packages,
 Python 3.12.13.
 
+**On babel:**
+
 ```bash
 uv venv --python 3.12.13 .venv
 uv pip install -r env/requirements-frozen-20261018.txt
@@ -388,6 +425,8 @@ Then rewrite `.env` for the new paths — at minimum `ZFS`,
 
 Recreate the store symlink farm, or checkpoints will land on the home
 filesystem instead of scratch:
+
+**On babel:**
 
 ```bash
 mkdir -p "$PROTEINA_ZFS_PATH/training_runs/store"
