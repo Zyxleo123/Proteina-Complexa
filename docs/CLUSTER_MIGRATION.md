@@ -39,13 +39,14 @@ see step 4. 2.7M small files through that relay is the thing to avoid.
 | 1. Push the code | **rhea** | **Yes** |
 | 2. Copy `.env` | **rhea** → your machine | **Yes** |
 | 3. Build the manifests | **rhea** (scans `$ZFS`) | **Yes** |
-| 4. Pull the data | **babel** (pulls from rhea) | Needs rhea reachable |
+| 3b. **Push the data to B2** | **rhea** | **Yes** |
+| 4. Fetch from B2 | **babel** | No — B2 keeps it |
 | 5. Dataset decisions | — | — |
 | 6. Rebuild the environment | **babel** | No |
 | 7. Smoke-test | **babel** | No |
 
-Steps 1–3 are the time-critical ones: they read rhea's disk. Everything from
-4 onwards only needs rhea to still answer ssh.
+Steps 1–3b are the time-critical ones: they read rhea's disk. Nothing after
+that has a deadline, which is the entire reason for routing through B2.
 
 Every code block below is labelled with the machine it runs on.
 
@@ -367,7 +368,70 @@ directory is unrelated to the run
 `cpsea_peptide_exp_b_frozen_mean_dimnorm_aefix`, which holds the orphaned AE.
 A glob like `rm -rf *cpsea_peptide*` would take out the only copy of that AE.
 
-## 4. Pull the data — on babel
+## 3b. Push the data to B2 — the actual deadline
+
+Pulling rhea → babel directly does not work under the real constraints:
+
+- babel's `/data/user_data` is **not mounted on its login node**, so the
+  destination only exists inside a job;
+- the only partition available is `preempt`, which is sbatch-only and was
+  sitting in `PENDING (Priority)` for an unbounded time;
+- babel's `/home` is 100 GB and snapshotted, so it cannot be a staging area;
+- access to rhea ends today.
+
+Together those mean the deadline is on getting data **off rhea**, and the
+destination cannot be babel. Measured on 2026-10-18:
+
+| Path | Throughput |
+|---|---|
+| rhea → internet | **85.3 MB/s** |
+| rhea → bastion → babel | 16 MB/s |
+
+So the cloud hop is also the faster one. B2 was chosen over Box or Drive for
+one reason: it authenticates with a key pair typed into a config file, with
+no browser OAuth step, which matters on a login node with no browser.
+
+```bash
+rclone config create b2 b2 account <keyID> key <applicationKey>
+rclone lsd b2:
+bash scripts/rhea_push_b2.sh b2:<bucket>/cpsea
+```
+
+~140 GB at 85 MB/s is roughly half an hour; the 41 GB core alone is ~10
+minutes, and `bash scripts/rhea_push_b2.sh b2:<bucket>/cpsea core` does just
+that part if time runs short. Storage runs about $6/TB/month, so the whole
+set is well under a dollar a month, and egress is free up to 3x stored.
+
+The script is resumable: it checks each object for existence first, so an
+interrupted run can simply be restarted.
+
+### Why the preprocessed tree goes up as 55 tar.zst objects
+
+2.7M individual PUTs would be dominated by per-object overhead, and scratch
+is 99% full so no tarball can be staged on disk first. Instead `tar` streams
+through `zstd` straight into `rclone rcat`, so nothing touches local storage,
+and the PDBs compress 4.5x. It is chunked rather than one stream because the
+*download* side runs on a preemptible partition, where a single 17 GB
+object with no resume point would be lost on preemption.
+
+## 4. Fetch from B2 — on babel, whenever a node frees up
+
+```bash
+sbatch scripts/babel_fetch_b2.sbatch b2:<bucket>/cpsea
+```
+
+Resubmit the identical line after a preemption; `rclone copy` skips what
+arrived and each extracted chunk leaves a marker. The job checks that
+`/data` is writable and that B2 is reachable **before** moving anything, and
+says which of the two failed — a compute node may have no outbound internet
+even where the login node does. If that is the case, fetch to `/home` on
+login in pieces instead.
+
+## 4b. Direct rhea → babel pull (superseded)
+
+Kept for reference; only usable while rhea is still up.
+
+### Pull the data — on babel
 
 Run the transfer **on babel, pulling from rhea** — not as a job on rhea. The
 transfer then lives on the machine that is not going down, and `rsync`
