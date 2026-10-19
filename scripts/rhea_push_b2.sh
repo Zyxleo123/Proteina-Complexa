@@ -79,7 +79,11 @@ if [ "$WHAT" = "all" ] || [ "$WHAT" = "processed" ]; then
 
   existing="$(rclone lsf "$DEST/chunks" 2>/dev/null || true)"
   n=0; skipped=0
-  for L in $(ls -1 "$CH"/val_*.list "$CH"/test_*.list "$CH"/train_*.list 2>/dev/null); do
+  # Deliberate order, and it must be built by concatenation rather than by
+  # one ls: `ls -1 val_* test_* train_*` sorts the COMBINED list, which puts
+  # val dead last behind 49 train chunks. val is what validates a resumed
+  # run, so it is the worst thing to lose to a timeout.
+  for L in $(ls -1 "$CH"/val_*.list 2>/dev/null; ls -1 "$CH"/test_*.list 2>/dev/null; ls -1 "$CH"/train_*.list 2>/dev/null); do
     name="$(basename "$L" .list)"
     if printf '%s\n' "$existing" | grep -qx "$name.tar.zst"; then
       skipped=$((skipped + 1)); continue
