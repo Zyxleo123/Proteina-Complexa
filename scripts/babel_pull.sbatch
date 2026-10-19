@@ -5,7 +5,7 @@
 #SBATCH --mem=16G
 #SBATCH --time=2-00:00:00
 #SBATCH --requeue
-#SBATCH --output=/data/user_data/yixiz/logs/cpsea_pull_%j.out
+#SBATCH --output=/home/yixiz/cpsea_pull_%j.out
 #
 # Pull the migration set from rhea onto babel. Built to be preempted.
 #
@@ -24,10 +24,14 @@
 # compress 4.5x, and 2.7M per-file round trips through a relay is the thing
 # to avoid.
 #
-# PREREQUISITE: mkdir -p /data/user_data/yixiz/logs
-# Slurm resolves --output before the script runs and cannot create the
-# directory itself, so without this the job dies instantly with no log to
-# say why -- which reads exactly like a scheduler problem.
+# The log goes to /home deliberately, against the usual rule of keeping job
+# output off the home filesystem. /data/user_data is not mounted on the login
+# node, so the directory cannot exist at submit time -- and Slurm resolves
+# --output before the script runs and will not create it. Pointing the log at
+# /data would make the job die instantly with no log to say why, which reads
+# exactly like a scheduler fault. /home always exists, and the rsyncs below
+# are deliberately quiet so this stays a few KB rather than a per-file dump
+# of 61,749 lines.
 #
 # Submit:   sbatch scripts/babel_pull.sbatch
 # Resume:   sbatch scripts/babel_pull.sbatch        (same command; skips done work)
@@ -58,7 +62,13 @@ DST="$NEW/CPSea/CPSea_full/CPSea/preprocessed/processed"
 STATE="$NEW/.transfer_state"
 CHUNKS="$NEW/.transfer_chunks"
 
+# /data/user_data is not mounted on the login node, so this is very likely
+# the first time any of this exists. Create it here, not as a prerequisite.
 mkdir -p "$NEW" "$NEWREPO" "$DST" "$STATE" "$CHUNKS" "$NEW/logs"
+if [ ! -d "$NEW" ]; then
+  echo "FATAL: cannot create $NEW on $(hostname) -- is /data mounted here?" >&2
+  exit 1
+fi
 
 echo "=== $(date) job ${SLURM_JOB_ID:-none} on $(hostname) ==="
 echo "cpus=${SLURM_CPUS_PER_TASK:-?} mem=${SLURM_MEM_PER_NODE:-?} dest=$NEW"
@@ -83,11 +93,12 @@ rsync -avP "$REMOTE:$RZFS/migration_min/tier0.files" /tmp/tier0_nonproc.files
 # Checkpoints dominate here and do not compress, so no -z. -H matters: 19
 # frozen AEs are hardlinks to one inode and would otherwise expand into 19
 # separate 4.1 GB copies.
-rsync -avPH --partial --append-verify --files-from=/tmp/tier0_nonproc.files \
-  "$REMOTE:$RZFS/" "$NEW/"
+rsync -aH --partial --append-verify --info=stats2 \
+  --files-from=/tmp/tier0_nonproc.files "$REMOTE:$RZFS/" "$NEW/"
 
 # The repo-tree results are CSV/JSON, so -z earns its keep here.
-rsync -avPHz --partial --append-verify --files-from=/tmp/tier0_home.files \
+rsync -aHz --partial --append-verify --info=stats2 \
+  --files-from=/tmp/tier0_home.files \
   "$REMOTE:/zfsauton2/home/yixiz/Proteina-Complexa/" "$NEWREPO/"
 
 echo "Part A done"
