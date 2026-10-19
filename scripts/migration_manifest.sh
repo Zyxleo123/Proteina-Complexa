@@ -303,6 +303,31 @@ if [ "${WITH_PREPROCESSED:-0}" = "1" ] && [ -d "$PRE/processed" ]; then
   echo "  including preprocessed/processed (~97 GB) ..."
   find "$PRE/processed" -type f -print 2>/dev/null \
     | while read -r f; do printf '%s\n' "${f#"$ZFS"/}"; done >> "$FILES"
+
+  # Also emit chunked file lists for scripts/babel_pull.sbatch. These 2.7M
+  # files must not go over rsync -- per-file round trips through the bastion
+  # would take days -- but a single streamed tar of train is ~97 GB with no
+  # resume point, which is fatal on a preemptible partition. 50k-file chunks
+  # make a preemption cost one chunk, and the lists are relative to
+  # processed/ so the remote `tar -C ... -T -` can read them on stdin.
+  CH="$OUTDIR/chunks"
+  mkdir -p "$CH"
+  find "$CH" -maxdepth 1 -name '*.list' -delete 2>/dev/null || true
+  rel="CPSea/CPSea_full/CPSea/preprocessed/processed/"
+  grep "^$rel" "$FILES" | sed "s|^$rel||" > "$CH/.all"
+  # val and test first so the job proves the pipe before train's 2.46M.
+  for s in val test train; do
+    grep "^$s/" "$CH/.all" | split -l "${CHUNK_SIZE:-50000}" -d -a 3 - "$CH/${s}_" || true
+  done
+  for f in "$CH"/*; do
+    case "$f" in *.list|*/.all) ;; *) mv "$f" "$f.list" ;; esac
+  done
+  nch=$(ls -1 "$CH"/*.list 2>/dev/null | wc -l)
+  nin=$(cat "$CH"/*.list 2>/dev/null | wc -l)
+  ntot=$(wc -l < "$CH/.all")
+  rm -f "$CH/.all"
+  echo "  wrote $nch chunk lists covering $nin of $ntot files"
+  [ "$nin" = "$ntot" ] || echo "  !! chunk coverage mismatch -- do not trust these lists" >&2
 fi
 
 sort -u -o "$FILES" "$FILES"
