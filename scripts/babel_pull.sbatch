@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 #SBATCH --job-name=cpsea_pull
 #SBATCH --partition=preempt
+#SBATCH --account=bapoczos
+# preempt_cpu_qos, not preempt_qos: this is a CPU-only transfer, and the
+# partition rejects a submission that names no QoS at all with the
+# unhelpful 'Invalid qos specification'.
+#SBATCH --qos=preempt_cpu_qos
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=16G
 #SBATCH --time=2-00:00:00
