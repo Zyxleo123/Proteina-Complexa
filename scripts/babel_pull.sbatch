@@ -24,6 +24,11 @@
 # compress 4.5x, and 2.7M per-file round trips through a relay is the thing
 # to avoid.
 #
+# PREREQUISITE: mkdir -p /data/user_data/yixiz/logs
+# Slurm resolves --output before the script runs and cannot create the
+# directory itself, so without this the job dies instantly with no log to
+# say why -- which reads exactly like a scheduler problem.
+#
 # Submit:   sbatch scripts/babel_pull.sbatch
 # Resume:   sbatch scripts/babel_pull.sbatch        (same command; skips done work)
 # Override: sbatch scripts/babel_pull.sbatch NEW=/somewhere/else
