@@ -391,14 +391,20 @@ So the cloud hop is also the faster one. B2 was chosen over Box or Drive for
 one reason: it authenticates with a key pair typed into a config file, with
 no browser OAuth step, which matters on a login node with no browser.
 
+The bucket is `proteina` (private, us-east-005). Keys are typed straight
+into rclone and are deliberately not recorded here or anywhere in the repo.
+
 ```bash
 rclone config create b2 b2 account <keyID> key <applicationKey>
-rclone lsd b2:
-bash scripts/rhea_push_b2.sh b2:<bucket>/cpsea
+rclone lsd b2:proteina          # not `rclone lsd b2:` -- a bucket-scoped
+                                # key cannot list all buckets, and the
+                                # permissions error looks like a misconfig
+bash scripts/rhea_push_b2.sh b2:proteina/cpsea core   # the 41 GB that cannot be rebuilt
+bash scripts/rhea_push_b2.sh b2:proteina/cpsea        # then the rest
 ```
 
 ~140 GB at 85 MB/s is roughly half an hour; the 41 GB core alone is ~10
-minutes, and `bash scripts/rhea_push_b2.sh b2:<bucket>/cpsea core` does just
+minutes, and `bash scripts/rhea_push_b2.sh b2:proteina/cpsea core` does just
 that part if time runs short. Storage runs about $6/TB/month, so the whole
 set is well under a dollar a month, and egress is free up to 3x stored.
 
@@ -417,7 +423,7 @@ object with no resume point would be lost on preemption.
 ## 4. Fetch from B2 — on babel, whenever a node frees up
 
 ```bash
-sbatch scripts/babel_fetch_b2.sbatch b2:<bucket>/cpsea
+sbatch scripts/babel_fetch_b2.sbatch b2:proteina/cpsea
 ```
 
 Resubmit the identical line after a preemption; `rclone copy` skips what
