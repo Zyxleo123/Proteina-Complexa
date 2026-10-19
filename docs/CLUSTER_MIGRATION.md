@@ -76,9 +76,20 @@ The raw numbers:
 
 ### CPSea: download it again, do not carry it
 
-Measured: `CPSea_full` 290 GB, `CPBind` 68 GB, `CPSea_PDB` 1.6 GB,
-`replay_buffers` 1.7 MB. That is ~360 GB, and it is the single biggest item
-in the move — but none of it needs to cross the network.
+Measured in full:
+
+| Path | Size | Origin |
+|---|---|---|
+| `CPSea_full/CPSea/CPSea_pdb` | 193 GB | Zenodo (raw structures) |
+| `CPSea_full/CPSea/preprocessed` | 97 GB | **ours**, from `preprocess_cpsea.py` |
+| `CPSea_full/CPSea/CPSea_properties` | 508 MB | Zenodo |
+| `CPSea_full/CPSea/CPSea_index.txt` | 109 MB | Zenodo (2,714,414 rows) |
+| `CPBind` | 68 GB | Zenodo |
+| `CPSea_PDB` (eval root) | 1.6 GB | derived subset |
+| `replay_buffers` | 1.7 MB | stale, see above |
+
+~360 GB in total, the single biggest item in the move. Everything sourced
+from Zenodo can be fetched again; only the 97 GB of `preprocessed/` is ours.
 
 CPSea is public. It is a NeurIPS 2025 Datasets and Benchmarks paper (Yang et
 al., Tsinghua), the data is on [Zenodo record
