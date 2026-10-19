@@ -279,6 +279,32 @@ done
 find "$ZFS/CPSea/CPSea_PDB" -type f -size -200M -print 2>/dev/null \
   | while read -r f; do printf '%s\n' "${f#"$ZFS"/}"; done >> "$FILES"
 
+# The preprocessed tree is OUR format, written by script_utils/preprocess_cpsea.py,
+# so unlike the raw structures it cannot be re-downloaded -- only regenerated.
+# Split it by what regeneration would and would not reproduce:
+#
+#   metadata/ (147 MB)  cpsea_train/val/test.parquet -- the split assignment
+#                       itself. cpsea_seqcond_v2 trained against these exact
+#                       files. Re-preprocessing could land a different split,
+#                       which would quietly contaminate any evaluation of the
+#                       existing checkpoint. Always carried.
+#   manifest/ (222 MB)  audit CSVs, rejected.csv, preprocess_stats.json -- the
+#                       record of what was dropped and why. Always carried.
+#   processed/ (~97 GB) the tensors. Regenerable from the Zenodo raw given a
+#                       long job over 2.71M structures. Opt in with
+#                       WITH_PREPROCESSED=1 to carry them instead.
+PRE="$ZFS/CPSea/CPSea_full/CPSea/preprocessed"
+for d in metadata manifest; do
+  [ -d "$PRE/$d" ] || continue
+  find "$PRE/$d" -type f -size -200M -print 2>/dev/null \
+    | while read -r f; do printf '%s\n' "${f#"$ZFS"/}"; done >> "$FILES"
+done
+if [ "${WITH_PREPROCESSED:-0}" = "1" ] && [ -d "$PRE/processed" ]; then
+  echo "  including preprocessed/processed (~97 GB) ..."
+  find "$PRE/processed" -type f -print 2>/dev/null \
+    | while read -r f; do printf '%s\n' "${f#"$ZFS"/}"; done >> "$FILES"
+fi
+
 sort -u -o "$FILES" "$FILES"
 
 # ---- the repo tree on home ----------------------------------------------

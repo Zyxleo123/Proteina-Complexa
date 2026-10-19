@@ -163,6 +163,26 @@ CPSea identity files and eval root, and all the results. Trim further with
 `RUNS_ONLY="..."`; dropping lpgen and the two AE `last.ckpt` files would take
 it to roughly 20 GB.
 
+#### The training data is the bigger question
+
+`cpsea_seqcond_v2` trained against
+`CPSea_full/CPSea/preprocessed/metadata/cpsea_{train,val}.parquet`, so
+continuing it needs that preprocessed tree, which splits into:
+
+| Part | Size | Re-derivable? |
+|---|---|---|
+| `metadata/` | 147 MB | the train/val/test split itself — **always carried** |
+| `manifest/` | 222 MB | audit CSVs, `rejected.csv`, stats — **always carried** |
+| `processed/` | ~97 GB | yes, from the Zenodo raw, via a long job over 2.71M structures |
+
+Carry the tensors too with `WITH_PREPROCESSED=1`, taking the minimal profile
+to ~138 GB. Recommended, for two reasons beyond the compute saved: Zenodo
+warns v2 has chirality and hydrogen problems **and that a new version is
+coming**, so a later download may not be this data at all; and a fresh
+preprocessing pass could assign a different train/val split, which would
+quietly contaminate any evaluation of the checkpoint you are continuing.
+Carrying `metadata/` guards the split even if you do regenerate the tensors.
+
 #### The checkpoint this nearly got wrong
 
 `cpsea_seqcond_v2` holds eight checkpoints from requeues, and the filenames
