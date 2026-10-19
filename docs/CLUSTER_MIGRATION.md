@@ -6,6 +6,32 @@ cluster at your own pace, as long as rhea is reachable.
 
 ---
 
+## The two clusters
+
+| | rhea (old) | babel (new) |
+|---|---|---|
+| code | `/zfsauton2/home/yixiz/Proteina-Complexa` | `/home/yixiz/Proteina-Complexa` |
+| data (`$ZFS`) | `/zfsauton/scratch/yixiz` | `/data/user_data/yixiz` |
+
+rhea sits behind a bastion, so babel needs this in `~/.ssh/config` before
+anything else works:
+
+```
+Host rhea
+        HostName rhea.int.autonlab.org
+        User yixiz
+        ProxyCommand ssh -q yixiz@upload.autonlab.org -W %h:22
+        ServerAliveInterval 60
+        ServerAliveCountMax 120
+        ControlMaster auto
+        ControlPath ~/.ssh/cm-%r@%h:%p
+        ControlPersist 10m
+```
+
+Because every byte is relayed through `upload.autonlab.org` over a single
+`ssh -W` stream, the transfer is split by file count rather than by size --
+see step 4. 2.7M small files through that relay is the thing to avoid.
+
 ## Where each step runs
 
 | Step | Machine | Must happen before rhea goes down? |
