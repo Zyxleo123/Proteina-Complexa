@@ -120,3 +120,12 @@ calibration_native/
 # ~2.5 MB each because plotly.js is inlined so they open offline.
 surfaces/
 .venv_openmm/
+
+# babel: these are symlinks into /data/user_data/yixiz (data stays off /home)
+/.venv
+/calibration_native
+/evaluation_results
+/inference
+/logs
+/outputs
+/surfaces

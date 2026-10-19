@@ -529,6 +529,40 @@ mkdir -p "$PROTEINA_ZFS_PATH/training_runs/store"
 ln -s "$PROTEINA_ZFS_PATH/training_runs/store" store
 ```
 
+### What actually happened on babel (2026-10-19)
+
+The venv lives on `/data`, not in the repo, and `.venv` is a symlink to it,
+because `/home` is for code. The same goes for `ckpts`, `wandb`,
+`community_models/ckpts` and the result directories (`evaluation_results`,
+`inference`, `logs`, `outputs`, `surfaces`, `calibration_native`). All of them
+point into `/data/user_data/yixiz/Proteina-Complexa`, which means none of
+them resolve on the login node.
+
+```bash
+# on a babel compute node; uv comes from miniforge base
+export UV_CACHE_DIR=/data/user_data/yixiz/uv_cache
+uv venv --python 3.12.13 /data/user_data/yixiz/envs/complexa/.venv
+grep -vE '^-e |^pymol-open-source==|^pyrosetta==' env/requirements-frozen-20261018.txt > req.txt
+uv pip install --no-deps --index-strategy unsafe-best-match \
+  --extra-index-url https://download.pytorch.org/whl/cu126 \
+  -f https://data.pyg.org/whl/torch-2.7.0+cu126.html \
+  -f https://storage.googleapis.com/jax-releases/jax_cuda_releases.html -r req.txt
+uv pip install --no-deps -e community_models/colabdesign -e .
+```
+
+`--no-deps` is deliberate: the freeze is complete, and resolving it again
+fails on pins like `torchaudio==2.11.0` next to `torch==2.7.0`. Two packages
+cannot come from the freeze on babel:
+
+- `pymol-open-source==3.2.0a0` ships only `manylinux_2_35` wheels, and babel
+  (RHEL 9) has glibc 2.34; 3.1.0a0 has no cp312 wheel. It is **not
+  installed**, so `proteinfoundation/surface/peptide_surface.py` and the
+  scripts that render with pymol will not import.
+- `pyrosetta` is not on PyPI. It was installed with `pyrosetta-installer`,
+  which only offers the latest release, so babel has **2026.39** where rhea had
+  2026.3. Put the venv's `bin` first on `PATH` before running the installer,
+  or its `pip` subprocess installs into whatever Python is found first.
+
 ## 7. Before you trust the new setup
 
 - `myfree` is an autonlab shell function; it will not exist on the new
