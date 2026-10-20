@@ -1,0 +1,23 @@
+# @package _global_
+# Same as training_cpsea_seqcond_trans_closure but with w_dihedral 5x.
+#
+# WHY A SECOND ARM. The geometry term has to push the model AWAY from its training
+# distribution: 41% of native CPSea head-to-tail closures are cis amides. At the shipped
+# defaults the term's contribution to the total loss is small -- the smoke measured
+# loss_cyclization_geometry ~0.45 against a loss_weight of 0.05, i.e. ~0.02 of an O(1)
+# objective -- which may simply be too weak to overcome the data.
+#
+# So: the default arm answers "does enabling it change anything", and this one answers
+# "does it need to be stronger". Raising w_dihedral rather than loss_weight is deliberate;
+# proteina.py warns loss_weight is applied at the top level and must not be double-counted,
+# and the angle term is already nearly satisfied (0.135 vs the dihedral's 0.291), so the
+# torsion is where the extra weight belongs.
+defaults:
+  - training_cpsea_seqcond_trans_closure
+  - _self_
+
+run_name: cpsea_seqcond_trans_closure_w5
+cyclization:
+  bond_loss:
+    geometry:
+      w_dihedral: 5.0
