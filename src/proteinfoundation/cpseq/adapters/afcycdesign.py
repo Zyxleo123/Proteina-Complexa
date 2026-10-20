@@ -37,14 +37,24 @@ rather than papered over:
   differently. AfCycDesign itself uses the monomer _ptm params. Recorded as
   `use_multimer=False`.
 
-Sampling
---------
-Four samples per candidate come from AF2's four distinct parameter sets (models 0-3),
-one `run` each, recorded per sample. AF2 is deterministic given (params, seed,
-recycles), so re-seeding one parameter set would not give four independent draws the way
-a diffusion model's samples are -- different params is the real sample control AF2
-offers. Each sample's model index is recorded so a per-model effect stays visible
-instead of averaging away.
+Sampling: this arm gives TWO samples, not four
+----------------------------------------------
+Both halves of this were measured, not assumed.
+
+ColabDesign loads `model_{1,2}_ptm` only when `use_templates=True`, and
+`[1,2,3,4,5]` only when it is False (`af/model.py:110-117`) -- because those are the
+monomer-ptm parameter sets with template weights. The binder protocol here *is*
+templated (the target structure), so exactly 2 parameter sets exist for it. Asking for
+models 2 or 3 raised `IndexError`, and no `num_models` argument changes it.
+
+Re-seeding does not substitute. With a fixed sequence, no MSA and dropout off, the
+forward pass is deterministic: the same parameter set at seed 42 and seed 777 produced
+peptide CA coordinates identical to 0.000000 A. So seeds are not a sample control for
+this arm.
+
+`SAMPLE_CEILING = 2` therefore, and a caller asking for 4 gets 2 with
+`sample_ceiling_reason` recorded. Best-of-2 and best-of-4 are different statistics and
+the summaries have to keep them apart rather than quietly comparing them.
 """
 
 from __future__ import annotations
@@ -76,11 +86,17 @@ FIXED_SEQ_LOGIT_SCALE = 1e9
 AF2_ALPHABET = "ARNDCQEGHILKMFPSTWYV"
 
 
+# Templated monomer-ptm AF2 has exactly two parameter sets. See the module docstring --
+# this is a property of AF2, not a configuration choice.
+SAMPLE_CEILING = 2
+
+
 @dataclass
 class AfCycConfig:
     num_recycles: int = 3
-    # Models 0-3 of the 5 AF2 parameter sets: four samples, one per parameter set.
-    model_nums: tuple[int, ...] = (0, 1, 2, 3)
+    # One sample per available parameter set. Not (0,1,2,3): models 2+ do not exist on
+    # the templated path and asking for them raised IndexError.
+    model_nums: tuple[int, ...] = (0, 1)
     use_multimer: bool = False
     seed: int = 42
 
@@ -205,17 +221,12 @@ def predict(
     samples: list[dict] = []
     model = None
     try:
-        # num_models is NOT optional. ColabDesign loads only its default number of
-        # parameter sets (2 here) and `models=[k]` indexes into that loaded list, so
-        # asking for model 2 or 3 raised `IndexError: list index out of range` and two
-        # of every four samples failed -- while all five params_model_*_ptm.npz files
-        # were sitting in the directory unused. Load as many as the highest requested
-        # index needs.
+        # No num_models here: it is accepted into **kwargs and changes nothing. The
+        # loaded set is fixed at model_{1,2}_ptm by use_templates (af/model.py:110-117).
         model = mk_afdesign_model(
             protocol="binder",
             use_multimer=config.use_multimer,
             num_recycles=config.num_recycles,
-            num_models=max(config.model_nums) + 1,
             data_dir=af2_params_dir,
         )
         for sample_idx, model_num in enumerate(config.model_nums):
@@ -298,6 +309,12 @@ def predict(
     return {
         "status": "ok" if n_ok else "all_samples_failed",
         "n_samples_ok": n_ok,
+        "sample_ceiling": SAMPLE_CEILING,
+        "sample_ceiling_reason": (
+            "templated monomer-ptm AF2 has 2 parameter sets, and re-seeding is "
+            "bit-identical (measured: 0.000000 A CA deviation), so this arm yields 2 "
+            "independent samples regardless of the requested count"
+        ),
         "pocket_conditioning": "none",
         "conditioning_note": (
             "AF2 has no forward-pass pocket mechanism; ColabDesign's hotspot enters the "

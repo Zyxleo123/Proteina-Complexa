@@ -180,7 +180,13 @@ def run_afcycdesign(task: dict, out_dir: Path, args) -> dict:
         predict,
     )
 
-    cfg = AfCycConfig(seed=args.seed, model_nums=tuple(range(args.samples)))
+    # Clamp to what the arm can actually deliver. Requesting 4 here would ask for
+    # parameter sets that do not exist on the templated path (IndexError), and seeds are
+    # not an alternative -- see the adapter's module docstring.
+    from proteinfoundation.cpseq.adapters.afcycdesign import SAMPLE_CEILING
+
+    n = min(args.samples, SAMPLE_CEILING)
+    cfg = AfCycConfig(seed=args.seed, model_nums=tuple(range(n)))
     result = predict(
         sequence=task["sequence"],
         template_path=Path(task["target_template_pdb"]),
@@ -235,6 +241,7 @@ def main() -> None:
     ).hexdigest()[:12]
 
     tasks = build_task_list(args.dataset_dir, args.predictor, cfg_hash)
+    print(f"[predict] config hash {cfg_hash} is part of every output path")
     if args.chemistries:
         keep = {c.strip() for c in args.chemistries.split(",")}
         tasks = [t for t in tasks if t["chemistry"] in keep]
@@ -252,7 +259,11 @@ def main() -> None:
 
     n_done = n_skipped = n_unsupported = n_failed = 0
     for k, task in enumerate(tasks):
-        out_dir = pred_root / task["parent_id"] / task["candidate_id"]
+        # The config hash is part of the PATH, not just the task_id. Without it a run at
+        # a different sample count or seed finds the old record.json and skips, so the
+        # dataset silently mixes settings -- two candidates scored at 2 samples and the
+        # rest at 4, with nothing on disk saying so.
+        out_dir = pred_root / task["parent_id"] / f"{task['candidate_id']}__{cfg_hash}"
         record_path = out_dir / "record.json"
         if record_path.exists() and not args.force:
             n_skipped += 1
