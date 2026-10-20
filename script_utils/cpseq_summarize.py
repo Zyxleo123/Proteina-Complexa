@@ -93,6 +93,7 @@ def load_rows(dataset_dir: Path) -> pd.DataFrame:
         clo = geo.get("closure") or {}
         cl = geo.get("clashes") or {}
         deform = ros.get("deformation") or {}
+        rest = ros.get("restraints") or {}
         disp = ros.get("refinement_displacement") or {}
         conf = r.get("predictor_confidence") or {}
         out = {
@@ -135,6 +136,12 @@ def load_rows(dataset_dir: Path) -> pd.DataFrame:
             # refinement displacement
             "refine_binder_ca_rmsd_A": disp.get("binder_ca_rmsd_A"),
             "refine_receptor_ca_rmsd_A": disp.get("receptor_ca_rmsd_A"),
+            # What was restrained during refinement. Surfaced into the CSV because that
+            # is what a reader opens; an energy is only interpretable alongside it.
+            "closure_restraint_applied": rest.get("applied"),
+            "closure_restraint_atoms": rest.get("atoms"),
+            "closure_restraint_target_A": rest.get("target_length_A"),
+            "relax_restraint_protocol": (r.get("protocol") or {}).get("relax_restraint"),
         }
         for c in COMPONENTS:
             out[f"raw_{c}"] = raw.get(c)
