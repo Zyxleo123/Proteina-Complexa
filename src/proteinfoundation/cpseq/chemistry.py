@@ -300,23 +300,33 @@ CAPABILITIES: dict[tuple[str, str], Capability] = {
     # ---- HighFold3 (upstream/highfold3 2ff1ea31) ----
     ("highfold3", MAINCHAIN): Capability(
         status=SUPPORTED,
-        control="`--head_to_tail 1`",
+        control="`--head_to_tail 1`, with the PEPTIDE AS THE FIRST CHAIN",
         note=(
-            "run_alphafold.py:74,829 -> featurisation.py:45 -> pipeline.py:156 -> "
-            "features.py:914 -> calc_cyclic_matrix_af3(residue_index, head_to_tail=...). "
-            "A GLOBAL bool with no chain argument: which chain receives the ring is "
-            "inferred inside calc_cyclic_matrix_af3 from where res_id restarts, and that "
-            "module ships only as a cpython-311 .pyc. Which chain it affects therefore "
-            "needs a behavioural test before any number is used."
+            "A global bool with no chain argument. Probed directly against the "
+            "cpython-311 bytecode (the only form the module ships in): "
+            "calc_cyclic_matrix_af3 sizes its matrix from where residue_index returns "
+            "to 1, so the ring lands on the FIRST chain. Peptide first + receptor "
+            "second gives a correct 5x5 ring on a 5-mer; receptor first gives an 8x8 "
+            "matrix and rings the RECEPTOR, leaving the peptide linear. AF3's own "
+            "examples list the protein first, so the natural ordering is the wrong one. "
+            "The adapter writes the peptide first."
         ),
+        verified=True,
     ),
     ("highfold3", DISULFIDE): Capability(
         status=SUPPORTED,
-        control="`--disulfide_chain_res [[chain, i, j]]` (1-based residue positions)",
+        control="`--disulfide_chain_res [[1, i, j]]` (1-based), peptide as the first chain",
         note=(
-            "run_alphafold.py:63. Unlike --head_to_tail this one IS chain-scoped. "
-            "Passed through as `list_cid_ss`."
+            "Documented as [[chain, Cys_i, Cys_j]], but the CHAIN FIELD IS IGNORED: "
+            "[[1,1,6]] and [[2,1,6]] return bit-identical matrices on both the "
+            "residue-wise and token-wise paths. The crosslink always applies to the "
+            "first chain's block, so correctness depends on peptide-first ordering, not "
+            "on the chain id. Residue indices are 1-based (probed: [[1,2,5]] puts the "
+            "+/-1 offset between 0-based rows 1 and 4). Unlike the AF2 offset wrap this "
+            "encodes a SIDE-CHAIN crosslink as a graph shortest path, which is why "
+            "highfold3 can express a disulfide ring that afcycdesign cannot."
         ),
+        verified=True,
     ),
     ("highfold3", ISOPEPTIDE): Capability(
         status=UNSUPPORTED,
