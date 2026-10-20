@@ -40,7 +40,11 @@ set -a; source "$REPO/.env"; set +a
 : "${PREDICTOR:?PREDICTOR not set}"
 DATASET_DIR="${DATASET_DIR:-$ZFS/cpseq/tranche1}"
 SHARD_COUNT="${SHARD_COUNT:-1}"
-SHARD_INDEX="${SLURM_ARRAY_TASK_ID:-0}"
+# An array task id wins when present; otherwise an explicit SHARD_INDEX lets a single
+# non-array job take a specific shard. Without that fallback every non-array submission
+# silently claimed shard 0 -- which, with a shard already running elsewhere, means two
+# writers appending to one rows file.
+SHARD_INDEX="${SLURM_ARRAY_TASK_ID:-${SHARD_INDEX:-0}}"
 LIMIT="${LIMIT:-0}"
 PY="${PYTHON_EXEC:-$REPO/.venv/bin/python}"
 

@@ -4,20 +4,22 @@
 #SBATCH --account=bapoczos
 #SBATCH --qos=preempt_qos
 #SBATCH --gres=gpu:1
-#SBATCH --cpus-per-task=4
-#SBATCH --mem=48G
-#SBATCH --time=4:00:00
+#SBATCH --cpus-per-task=2
+#SBATCH --mem=32G
+#SBATCH --time=2:00:00
 #SBATCH --requeue
 #SBATCH --open-mode=append
 #SBATCH --output=/home/yixiz/slurm_logs/cpseq_predict_%x_%A_%a.out
 #
 # Stage 1: structure prediction for candidate sequences, one predictor per submission.
 #
-# Memory is 48G on purpose. The interactive node-hold job this was developed in has
-# 8 GiB, and boltz-2 was OOM-killed there at exactly that ceiling (cgroup oom_kill=2,
-# memory.peak 8589303808) after successfully processing its inputs. 48G is the first
-# request with real headroom over that; trim it once `sacct -o MaxRSS` says what the
-# arm actually peaks at.
+# Memory is 32G, sized from measurement rather than guessed. The interactive node-hold
+# job this was developed in has 8 GiB and boltz-2 was OOM-killed there at exactly that
+# ceiling (cgroup oom_kill=2, memory.peak 8589303808) after processing its inputs fine.
+# `sacct -j 10861003 -o MaxRSS` then put the successful step at 11524620K ~ 11.0 GiB on a
+# 133-token complex, so 48G was oversized. 32G leaves room for this tranche's largest
+# receptor (527 residues) while being a small enough ask to backfill on preempt, where
+# the 48G/4-CPU version sat PENDING on Priority for over an hour.
 #
 # The log goes to /home because /data/user_data is not mounted on the login node and
 # Slurm resolves --output before the job body runs.
@@ -50,7 +52,11 @@ set -a; source "$REPO/.env"; set +a
 : "${PREDICTOR:?PREDICTOR not set (boltz2 | afcycdesign | highfold3)}"
 DATASET_DIR="${DATASET_DIR:-$ZFS/cpseq/tranche1}"
 SHARD_COUNT="${SHARD_COUNT:-1}"
-SHARD_INDEX="${SLURM_ARRAY_TASK_ID:-0}"
+# An array task id wins when present; otherwise an explicit SHARD_INDEX lets a single
+# non-array job take a specific shard. Without that fallback every non-array submission
+# silently claimed shard 0 -- which, with a shard already running elsewhere, means two
+# writers appending to one rows file.
+SHARD_INDEX="${SLURM_ARRAY_TASK_ID:-${SHARD_INDEX:-0}}"
 SAMPLES="${SAMPLES:-4}"
 SEED="${SEED:-42}"
 LIMIT="${LIMIT:-0}"

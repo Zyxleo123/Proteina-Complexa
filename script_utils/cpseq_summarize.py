@@ -71,6 +71,20 @@ def load_rows(dataset_dir: Path) -> pd.DataFrame:
     if not rows:
         return pd.DataFrame()
 
+    # Deduplicate on (predictor, task_id, sample_index), keeping the last write. Each
+    # shard owns its own rows file so there is normally one writer per sample, but shards
+    # have been reassigned between local runs and sbatch jobs during this tranche, and a
+    # sample counted twice would inflate every count and skew every mean. Cheap
+    # insurance; a no-op when the partition was clean.
+    before = len(rows)
+    seen: dict[tuple, int] = {}
+    for i, r in enumerate(rows):
+        seen[(r.get("predictor"), r.get("task_id"), r.get("sample_index"))] = i
+    rows = [rows[i] for i in sorted(seen.values())]
+    if len(rows) != before:
+        print(f"[summarize] dropped {before - len(rows)} duplicate sample row(s) "
+              "(same predictor/task/sample scored twice)")
+
     flat = []
     for r in rows:
         ros = r.get("rosetta") or {}
