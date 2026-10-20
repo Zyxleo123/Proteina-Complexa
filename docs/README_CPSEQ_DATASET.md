@@ -656,13 +656,22 @@ The project's own CPSea sequence-conditioned flow model (`cpsea_seqcond_v2`,
 identical evaluator — same tolerances, same closure constraint, same Rosetta protocol.
 
 **Sequence conditioning works.** `cond_recovery` median **1.000** (min 0.818), exact
-sequence match on **24/32** attributed samples. Its own training notes set >0.9 recovery
+sequence match on **40/48** samples (83 %), all 12 parents attributed. Its own training notes set >0.9 recovery
 as the bar that separates "honoured the sequence" from "designed its own peptide"; at step
 3000 it is there. So its energies describe the requested peptide.
 
-**Its interface energies are in range** — refined `dG_separated` of −16 to −25 on `2v8x`,
-against Boltz-2's valid-sample median of about −24. But **0/32 pass validity**, 27 of them
-on the closure torsion alone.
+**It docks reliably and buries more interface than Boltz-2.** `dSASA_int` median
+**1022 Å²** with a real interface in **100 %** of samples, against Boltz-2's 933 Å² / 99.5 %
+and AfCycDesign's 41 Å² / 51 %. Refined `dG_separated` median **−19.44**, IQR
+[−27.78, −9.66].
+
+But **0/48 pass validity**, and the closure torsion is why: median deviation **48.5°**,
+only **14.6 %** inside the ±8.44° window. Those dG values are therefore energies of
+molecules whose closing bond is geometrically wrong, and are **not** reported as
+comparable binding scores.
+
+So the two halves of the task separate cleanly for this model: **placement works, closure
+does not.**
 
 That looked like a generator defect. It is not. Measuring the closure torsion by source,
 mainchain only:
@@ -671,7 +680,7 @@ mainchain only:
 |---|---|---|---|---|---|---|
 | experimental crystals | 4 | 175.0° | 100 % | 0 % | 5.04° | **100 %** |
 | **native CPSea** (this model's training data) | 80 | 144.6° | 45 % | **41.2 %** | 35.36° | **20.0 %** |
-| **seq-cond generator** | 32 | 142.5° | 50 % | 9.4 % | 37.55° | **15.6 %** |
+| **seq-cond generator** | 48 | 142.9° | 50 % | 9.4 % | **48.5°** | **14.6 %** |
 | Boltz-2 | 84 | **176.9°** | **92.9 %** | 4.8 % | **3.06°** | **76.2 %** |
 | AfCycDesign | 214 | 141.8° | 41 % | 4.7 % | 38.24° | 20.6 % |
 
@@ -700,10 +709,30 @@ Two consequences:
 say it is not constraining the data that reaches it. The actionable options are to weight
 that ω term during training, or to re-cyclize CPSea enforcing trans closure.
 
-Caveat on scope: 32 of 48 generated samples are reported here. Attribution is by receptor
-sequence, and the four largest targets (527, 413, 300, 250 residues) are cropped by the
-loader at `crop_size: 256`, so their dumped receptors are substrings; containment matching
-was added and the remainder were re-scoring at hand-off.
+All 48 generated samples over all 12 parents are included. Attribution is by receptor
+sequence, which needed care: `CroppingTransform2` selects receptor residues by proximity to
+the binder, so a target past `crop_size: 256` is dumped as a **discontiguous** subset that
+neither equality nor substring matching finds. That silently dropped the four largest
+targets (527, 413, 300, 250 residues) — 16 of 48 samples — biasing the comparison toward
+small receptors until 8-mer containment matching was added (0.941 for the correct parent
+against 0.000 for the runner-up).
+
+### The fix, configured and launched
+
+`configs/example/training_cpsea_seqcond_trans_closure.yaml` enables
+`cyclization.bond_loss.geometry` and warm-starts from `cpsea_seqcond_v2`'s own weights, so
+the run only has to learn closure geometry rather than relearning sequence conditioning
+alongside it. Weights stay at the shipped defaults (`loss_weight` 0.05, `w_angle` 1.0,
+`w_dihedral` 1.0) so any change is attributable to **enabling** the term rather than to
+tuning it.
+
+Smoke submitted as job `10869553`. The decisive check is that `geom_dihedral_loss` and
+`geom_angle_loss` are non-zero from step 1 — absent those, the flag did not take and
+nothing downstream means anything. `val_gen_seqcond/seq/cond_recovery` must also stay
+~1.0: if geometry supervision costs sequence compliance, that is a trade to report rather
+than hide. `script_utils/cpseq_score_seqcond.py` re-measures the same closure-torsion
+distribution, so a new checkpoint is directly comparable to the table above on the
+identical 12 parents and evaluator.
 
 ### Honest scope
 
