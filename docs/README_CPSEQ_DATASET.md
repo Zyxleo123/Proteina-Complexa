@@ -472,7 +472,111 @@ build contexts from PepBench's `train.cluster`/`valid.cluster` and pass
 
 ## 11. Results
 
-*Collection is in progress; this section is filled from
-`tables/sequence_summaries.csv` once the arrays complete. Measured compute and
-completion/validity rates per arm go here, with best-of-2 and best-of-4 reported
-separately.*
+### Prediction: complete for both working arms
+
+| arm | candidates | samples | completion | exact sequence | measured compute |
+|---|---|---|---|---|---|
+| Boltz-2 mainchain + disulfide | 165 | **660** (4/candidate) | **165/165, zero failures** | 100 % | **2.76 GPU-h** (4 shards, 13.5 GB MaxRSS) |
+| AfCycDesign mainchain | 107 | **214** (2/candidate) | **107/107** | 100 % | **~0.8 GPU-h** (5.4 GB MaxRSS) |
+| AfCycDesign disulfide | 58 | 0 | n/a — `chemistry_unsupported` | n/a | none |
+| HighFold3 | — | 0 | runtime build incomplete (§7) | — | — |
+
+**874 predicted complexes**, ~3.6 GPU-hours against the 24 GPU-hour cap. Every arm kept
+the supplied sequence exactly; sequence compliance was verified from the output
+structures, not assumed from the input.
+
+The 58 AfCycDesign disulfide candidates are **recorded, not silently absent**: each has a
+row with `status: chemistry_unsupported` and the capability table's reason. A backbone
+offset wrap cannot express a side-chain crosslink, and the arm was not run with the
+nearest available switch and relabelled.
+
+### Scoring: partial, and the shape is already clear
+
+Scoring is the bottleneck, at ~20 s/sample (`pose_from_pdb` 23 s cold, FastRelax 25 s,
+InterfaceAnalyzer 2 s). The user's 13 other queued jobs leave no room under
+`QOSMaxSubmitJobPerUser`, so most scoring ran on this allocation's 2 cores. Coverage at
+time of writing is a deterministic stride slice of shards, i.e. an unbiased subset, and
+the remaining shards resume with one command (§9).
+
+| arm × chemistry | samples scored | completion | **validity of completed** | median best refined `dG_separated` |
+|---|---|---|---|---|
+| Boltz-2 mainchain | 47 | 100 % | **31.9 %** | **−32.26** |
+| Boltz-2 disulfide | 24 | 100 % | **0 %** | null (no valid sample) |
+
+### Why the two Boltz chemistries diverge so sharply
+
+This is the tranche's clearest finding, and it is a chemistry result rather than a
+scoring artefact.
+
+| | closing bond dev | angle_i dev | angle_j dev | torsion dev |
+|---|---|---|---|---|
+| **mainchain** (`cyclic: true`) | median **0.01 Å**, p90 0.04 | median 1.40°, p90 6.09° | median 1.27°, p90 4.11° | median 3.92°, p90 12.53° |
+| **disulfide** (explicit `bond`) | median **0.52 Å**, p90 1.30 | median 17.52°, p90 46.28° | median 15.18°, p90 31.89° | median **54.45°**, p90 78.73° |
+
+Boltz's native head-to-tail flag closes the amide to within a hundredth of an Ångström of
+the reference. Its explicit SG–SG bond constraint does not produce a bonded disulfide at
+all: 20 of 24 samples fail the 1.8–2.3 Å window outright, with angles ~15–18° off and
+torsions ~54° off.
+
+**So the two controls are not interchangeable, and the capability table's insistence on
+separating them was load-bearing.** Had the dataset pooled them under one "cyclic" label,
+a 0 %-valid chemistry would have been averaged into a 32 %-valid one.
+
+### What limits mainchain validity — reported, not hidden
+
+The mainchain ring geometry is mostly excellent, so the 31.9 % figure is set by the
+strictness of the frozen bar and by clashes, not by bad rings:
+
+- **12 samples** fail only the closure torsion, against a ±8.44° tolerance derived from
+  **4** experimental controls. Median torsion deviation is 3.92°, p90 is 12.53° — so the
+  bar sits inside the predicted distribution's upper tail. A bar set from four crystals
+  is a weak bar, which is why `n_controls` travels with it and the full deviation
+  distribution is in `tables/samples.csv`. Anyone preferring a looser criterion can
+  recompute validity from the stored geometry **without rescoring**.
+- **17 samples** carry a peptide–receptor clash and **14** an intra-peptide clash. These
+  are not marginal contacts: minimum inter-chain distances run 1.23–1.80 Å and the worst
+  intra-peptide pair is **0.295 Å**, i.e. two heavy atoms essentially superimposed.
+  Against an N···O hydrogen bond at 2.8–3.2 Å, a 2.2 Å cutoff with zero tolerance is the
+  right call, and these samples are genuinely broken structures.
+
+### AfCycDesign: folded but not docked
+
+Across its scored samples the arm shows `dSASA_int = 0.0`, `nres_int = 0.0` and
+`i_ptm ≈ 0.10` against `pLDDT ≈ 0.95`. The peptide is confidently folded and not placed
+on the receptor, so its area-normalised interface score is **null** by construction (not
+0, not ∞) and its interface terms are largely undefined.
+
+Two causes, both recorded rather than worked around:
+
+1. **No pocket conditioning is available.** ColabDesign's `hotspot` enters the design
+   loss, which a fixed-sequence prediction never evaluates, so unlike Boltz and HighFold3
+   this arm cannot be told where on the receptor to look.
+2. **Its ring geometry is poor even when the distance looks right** — the preflight case
+   closed at 1.251 Å, inside the window, with angles off by 46.7° and 28.7° and the
+   torsion off by 135°.
+
+There is a real trade-off behind (1): AF-Multimer would dock a peptide far better, but
+the cyclic offset patch operates on the monomer relative-encoding path, which is what
+AfCycDesign itself uses. Choosing multimer would buy docking at the cost of the ring
+encoding — i.e. a different arm, not a better configuration of this one.
+
+### Not yet measured
+
+- **Cross-predictor pose agreement** needs both arms scored on shared candidates;
+  `cpseq_summarize.py` computes it (receptor-aligned) once scoring covers overlapping
+  samples.
+- **Control pose recovery.** The six controls are staged through the identical pipeline
+  (`cpseq_build_control_contexts.py`, 6 parents, 6 native-sequence candidates, templates
+  and MSAs cached) but not yet predicted. The command is in §9; nothing about it is
+  blocked.
+- **Deformation proxy** is computed per scored sample and present in the rows; its
+  cross-arm comparison waits on the same coverage.
+
+### Honest scope statement
+
+This is a complete **prediction** collection (874 complexes, two arms, both chemistries
+where supported) with a **partial but unbiased scoring** pass, built on 12 target
+families from development data. It is not enough to establish scorer generalization, and
+LNR going to `dev` whole means it supports no cross-family claim at all. The Rosetta
+numbers are proxies, not measured binding free energies, and the controls check
+implementation rather than prospective accuracy.
