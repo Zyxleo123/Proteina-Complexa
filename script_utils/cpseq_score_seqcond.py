@@ -94,7 +94,34 @@ def _match_parent(rec_seq: str, index: dict[str, dict]) -> dict | None:
     if len(rec_seq) < 30:
         return None
     cands = [v for k, v in index.items() if rec_seq in k or k in rec_seq]
-    return cands[0] if len(cands) == 1 else None
+    if len(cands) == 1:
+        return cands[0]
+
+    # The crop is not a contiguous window. `CroppingTransform2` selects receptor residues
+    # by proximity to the binder, so for a target longer than `crop_size: 256` the dumped
+    # receptor is a DISCONTIGUOUS subset and neither equality nor substring matching finds
+    # it -- which silently dropped the four largest targets (527, 413, 300, 250 residues),
+    # 16 of 48 samples, biasing the comparison toward small receptors.
+    #
+    # 8-mer containment separates them unambiguously: measured 0.941 for the correct
+    # parent against 0.000 for the runner-up. A match is accepted only when it clears an
+    # absolute floor AND beats the runner-up decisively, so an ambiguous crop is still
+    # reported unattributed rather than guessed.
+    def kmers(seq: str, k: int = 8) -> set[str]:
+        return {seq[i : i + k] for i in range(len(seq) - k + 1)}
+
+    probe = kmers(rec_seq)
+    if not probe:
+        return None
+    scored = sorted(
+        ((len(probe & kmers(k)) / len(probe), v) for k, v in index.items()),
+        key=lambda t: t[0],
+        reverse=True,
+    )
+    best, runner = scored[0], (scored[1] if len(scored) > 1 else (0.0, None))
+    if best[0] >= 0.5 and best[0] >= 5 * max(runner[0], 1e-9):
+        return best[1]
+    return None
 
 
 def recovery(requested: str, got: str) -> float | None:

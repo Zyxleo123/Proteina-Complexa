@@ -1,0 +1,73 @@
+# @package _global_
+# TURN ON THE LINKAGE-GEOMETRY LOSS. Identical to training_cpsea_seqcond_from_v4cfg except
+# for `cyclization.bond_loss.geometry.enabled` and a warm start from that arm's own trained
+# checkpoint.
+#
+# WHY. `cyclization/linkage_geometry.py` supervises the closing bond's ANGLES and TORSION,
+# which `bond_loss` alone does not: bond_loss constrains one distance, and a bond can sit at
+# exactly 1.33 A while pointing in a chemically impossible direction. The module has been in
+# the tree, wired into `proteina.py` (both the single-pass and unroll paths) behind
+# `cyclization.bond_loss.geometry.enabled`, which defaults to False via `getattr` -- and
+# grepping configs/ finds NO config that ever set it. So the term was written, connected,
+# and never switched on in any shipped run.
+#
+# WHAT THAT COST, measured. Scoring native CPSea head-to-tail structures with this project's
+# own geometry code (docs/README_CPSEQ_DATASET.md):
+#
+#   source                        median |omega|   trans-like   CIS-like   pass +/-8.44 deg
+#   experimental crystals (n=4)       175.0 deg        100%          0%          100%
+#   native CPSea      (n=80)          144.6 deg         45%       41.2%           20%
+#   cpsea_seqcond_v2  (n=32)          142.5 deg         50%        9.4%           16%
+#   boltz-2           (n=84)          176.9 deg         93%        4.8%           76%
+#
+# 41% of CPSea's own head-to-tail closures are CIS amides, while every crystal macrocycle
+# control is tightly trans. CPSea's computational cyclization never enforced trans omega at
+# the ring junction, and a model fit to it reproduces that: seqcond_v2's torsion statistics
+# are indistinguishable from its training data's. Nothing in the objective ever pushed back,
+# because the term that would have was off.
+#
+# WHAT THIS RUN TESTS. Whether enabling the angle/dihedral term moves the model's closure
+# torsion toward trans AGAINST a training distribution that is 41% cis. The weights are left
+# at the shipped defaults (loss_weight 0.05, w_angle 1.0, w_dihedral 1.0) on purpose, so a
+# change is attributable to ENABLING the term rather than to a tuned weight. If the metric
+# moves but plateaus short, w_dihedral is the next knob -- not loss_weight, which the
+# docstring in proteina.py warns is applied at the top level and must not be double-counted.
+#
+# METRICS TO WATCH, in order:
+#   geom_dihedral_loss / geom_angle_loss    must be non-zero from step 1. If they are absent
+#                                           the flag did not take and nothing else matters.
+#   val_gen/cyc/mainchain_success           closure under the project's own windows.
+#   val_gen_seqcond/seq/cond_recovery       MUST STAY ~1.0. seqcond_v2 already reaches 1.000;
+#                                           if adding geometry supervision costs sequence
+#                                           compliance, that is a trade to report, not hide.
+#
+# The external check is `script_utils/cpseq_score_seqcond.py`, which measures the same
+# closure-torsion distribution as the table above, so this run can be compared against
+# seqcond_v2 on the identical 12 LNR parents and the identical evaluator.
+#
+# Run:
+#   CONFIG_NAME=example/training_cpsea_seqcond_trans_closure \
+#     RUN_NAME=cpsea_seqcond_trans_closure \
+#     bash scripts/submit_replay_ablation_train.sh
+
+defaults:
+  - training_cpsea_seqcond_from_v4cfg
+  - _self_
+
+run_name: cpsea_seqcond_trans_closure
+
+# Warm start from the seq-cond arm's own trained weights, NOT from bondunroll. Sequence
+# conditioning already works there (cond_recovery 1.000 at step 3000), so this run only has
+# to learn closure geometry; starting from bondunroll would relearn both at once and confound
+# the result. Non-EMA, because this is a training warm start -- the EMA copy is the inference
+# artefact.
+pretrain_ckpt_path: /data/user_data/yixiz/Proteina-Complexa/training_runs/store/cpsea_seqcond_v2/checkpoints/last-v3.ckpt
+
+cyclization:
+  bond_loss:
+    geometry:
+      # The one line this whole config exists to set.
+      enabled: true
+      loss_weight: 0.05
+      w_angle: 1.0
+      w_dihedral: 1.0
