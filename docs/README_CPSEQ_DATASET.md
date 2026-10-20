@@ -577,6 +577,28 @@ having a valid sample) — 238 of them Boltz mainchain. Incomparable pairs are r
 with a null delta and a reason rather than dropped, so a ranker is not trained on a set
 biased toward sequences that happened to work.
 
+### Cross-predictor pose agreement (receptor-aligned)
+
+210 comparisons between Boltz-2 and AfCycDesign on shared candidates:
+
+| | value |
+|---|---|
+| peptide CA RMSD, median | **32.89 Å** (min 1.86, max 80.95) |
+| receptor alignment residual, median | **0.660 Å** |
+| pairs where **both** samples are valid | 7, median **9.60 Å** |
+
+The 0.66 Å receptor residual is the sanity check that matters: both structures contain
+the same receptor, so a near-zero residual after superposition confirms the frame is
+right and the peptide RMSD is a genuine pose disagreement rather than an alignment
+artefact.
+
+The 32.9 Å median is mostly AfCycDesign's docking failure re-measured through a second
+route, not two docked solutions disagreeing. Even restricting to the 7 pairs where both
+sides produced a *valid* ring, the median disagreement is **9.60 Å** — still far beyond
+any sense in which the two arms can be said to agree on a binding pose. **So this tranche
+provides no usable cross-model pose consensus**, and a future scorer should not treat
+agreement between these two arms as evidence of correctness.
+
 ### Not measured
 
 - **Boltz control pose recovery** — the control job needed 32 GB (it was OOM-killed at
