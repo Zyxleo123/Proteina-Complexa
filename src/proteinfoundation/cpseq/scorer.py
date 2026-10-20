@@ -80,7 +80,12 @@ def _init_flags_record() -> dict:
     return {
         "scorefunction": SCOREFUNCTION,
         "relax_repeats": RELAX_REPEATS,
-        "relax_restraint": "constrain_relax_to_start_coords",
+        "relax_restraint": (
+            "constrain_relax_to_start_coords + closure AtomPairConstraint "
+            "(harmonic, sd 0.05 A, on both the complex and the isolated peptide)"
+        ),
+        # The restraints are carried by a separate scorefunction; every reported energy
+        # is read with plain ref2015, whose constraint weights are zero.
         "constraint_weights_in_reported_energy": 0.0,
         "init_flags": (
             "-mute all -use_input_sc -ignore_unrecognized_res -ignore_zero_occupancy false "
