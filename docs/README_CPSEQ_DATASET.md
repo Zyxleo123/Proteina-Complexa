@@ -492,10 +492,13 @@ with the §9 command.
 
 | arm × chemistry | samples | completion | **validity of completed** | median best `dG_separated` |
 |---|---|---|---|---|
-| **Boltz-2 mainchain** (`cyclic: true`) | 418 | 100 % | **40.4 %** | **−26.30** |
+| **Boltz-2 mainchain** (`cyclic: true`) | 418 | 100 % | **40.4 %** | −26.30 † |
 | **Boltz-2 disulfide** (explicit `bond`) | 228 | 100 % | **0 %** | null |
-| **AfCycDesign mainchain** (offset wrap) | 214 | 100 % | **6.1 %** | −23.00 |
+| **AfCycDesign mainchain** (offset wrap) | 214 | 100 % | **6.1 %** | −23.00 † |
 | AfCycDesign disulfide | 58 | 0 % | — | null |
+
+† pre-fix refined energy, superseded — see the note below. Validity percentages are
+computed on **raw** geometry and are unaffected.
 
 Closure geometry, which is where the difference lives:
 
@@ -530,6 +533,12 @@ cyclic offset patch operates on the monomer relative-encoding path that AfCycDes
 itself uses — that is a different arm, not a better configuration of this one.
 
 ### Interface, quality and strain on valid Boltz mainchain samples (n = 169)
+
+> **These refined values are superseded.** They were produced before the closure
+> constraint was added, i.e. with refinement opening the mainchain ring (median bond
+> deviation 1.149 Å after relax). They are retained here, and the rows at
+> `scores_unconstrained_relax/`, as the before/after evidence for that bug. Raw-geometry
+> validity is unaffected. Corrected values land in `tables/samples.csv` from the rescore.
 
 | metric | median | IQR |
 |---|---|---|
