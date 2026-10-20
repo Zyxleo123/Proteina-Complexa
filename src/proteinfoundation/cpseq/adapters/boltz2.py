@@ -185,9 +185,12 @@ def build_input_yaml(
         # Target-only template. `chain_id` lists the receptor chains ONLY; the peptide is
         # absent from both the template file and this list.
         tmpl_chains = ", ".join(yaml_chain_of[c] for c in chain_ids)
+        # CIF, not PDB: the entity sequence boltz aligns the template against has to
+        # match the template's own coordinates, and that only survives the trip in a CIF
+        # built by `targets.write_target_template_cif` (see its docstring).
         lines += [
             "templates:",
-            f"  - pdb: {target_template_path}",
+            f"  - cif: {target_template_path}",
             f"    chain_id: [{tmpl_chains}]",
         ]
 

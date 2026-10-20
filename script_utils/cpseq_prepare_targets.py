@@ -34,6 +34,7 @@ from proteinfoundation.cpseq.targets import (  # noqa: E402
     receptor_msa_path,
     sequence_key,
     write_target_only_template,
+    write_target_template_cif,
 )
 
 
@@ -60,6 +61,11 @@ def main() -> None:
     rows, msa_records = [], {}
     for ctx in contexts:
         rec = write_target_only_template(ctx, tmpl_dir / f"{ctx.parent_id}_target.pdb")
+        cif = write_target_template_cif(
+            Path(rec["template_path"]),
+            tmpl_dir / f"{ctx.parent_id}_target.cif",
+            args.boltz_python,
+        )
         chain_map = receptor_chain_map(ctx)
         pocket = pocket_contacts_for(ctx)
 
@@ -92,6 +98,8 @@ def main() -> None:
                 # Chain spec in the predictors' own ids, comma separated.
                 "target_chain_spec": ",".join(chain_map[c] for c in sorted(ctx.receptor_chains)),
                 "target_template_path": rec["template_path"],
+                "target_template_cif": cif["cif_path"],
+                "target_template_cif_entity_lengths": json.dumps(cif["written"]),
                 "template_n_atoms": rec["n_atoms"],
                 "template_n_residues": json.dumps(rec["n_residues_per_chain"]),
                 "peptide_chain_excluded_from_template": rec["peptide_chain_excluded"],

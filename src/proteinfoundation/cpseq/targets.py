@@ -67,6 +67,14 @@ def write_target_only_template(ctx: ParentContext, out_path: Path) -> dict:
         fh.write(
             f"REMARK   1 PEPTIDE CHAIN {ctx.peptide_chain} DELIBERATELY EXCLUDED\n"
         )
+
+        # No SEQRES. Boltz needs an entity sequence to align its template against, but
+        # routing one through PDB SEQRES does not survive the trip: gemmi 0.6.5 read a
+        # spec-correct 128-token SEQRES block back as 129 residues (one extra LYS
+        # appended), while reading the original deposited 1elr.pdb exactly right. Rather
+        # than ship a record that is provably misread downstream, the entity sequence is
+        # carried by the CIF companion (`write_target_template_cif`), where it is derived
+        # from the model and verified to match the polymer length.
         for orig in sorted(ctx.receptor_chains):
             if orig == ctx.peptide_chain:
                 raise AssertionError(
@@ -80,8 +88,13 @@ def write_target_only_template(ctx: ParentContext, out_path: Path) -> dict:
                 for atom, (x, y, z) in residues[key].items():
                     serial += 1
                     element = atom[0]
+                    # PDB reserves column 13 for the first character of a two-character
+                    # element symbol, so a one-letter element's name starts in column 14.
+                    # Left-justifying from 13 writes "CA  ", which a strict reader takes
+                    # as CALCIUM rather than an alpha carbon.
+                    name_field = atom if len(atom) >= 4 else f" {atom:<3s}"
                     fh.write(
-                        f"ATOM  {serial:5d} {atom:<4s}{resname:>4s}{new_chain:>2s}"
+                        f"ATOM  {serial:5d} {name_field}{resname:>4s}{new_chain:>2s}"
                         f"{new_resseq:4d}    {x:8.3f}{y:8.3f}{z:8.3f}"
                         f"  1.00  0.00          {element:>2s}\n"
                     )
@@ -123,6 +136,76 @@ def write_target_only_template(ctx: ParentContext, out_path: Path) -> dict:
 # rather than "this exact pose".
 POCKET_CONDITIONING_MAX_CONTACTS = 6
 POCKET_CONDITIONING_MAX_DIST_A = 5.0
+
+
+_CIF_CONVERT_SCRIPT = """
+import json, sys
+import gemmi
+
+pdb_path, cif_path = sys.argv[1], sys.argv[2]
+st = gemmi.read_structure(pdb_path)
+st.setup_entities()
+
+# Derive each polymer entity's sequence FROM THE MODEL, so the CIF's _entity_poly_seq
+# and its coordinates cannot disagree. Boltz aligns the entity sequence against the
+# polymer, so a sequence that is longer than the coordinates silently introduces
+# unresolved template residues -- and one that is shorter crashes the alignment.
+report = {}
+for ent in st.entities:
+    if ent.entity_type != gemmi.EntityType.Polymer:
+        continue
+    names = []
+    for ch in st[0]:
+        if ch.name in ent.subchains or any(r.subchain in ent.subchains for r in ch):
+            names = [r.name for r in ch.get_polymer()]
+            break
+    ent.full_sequence = names
+    report[ent.name] = len(names)
+
+st.make_mmcif_document().write_file(cif_path)
+
+# Verify the round trip rather than trusting it.
+back = gemmi.read_structure(cif_path)
+checks = {}
+for ent in back.entities:
+    if ent.entity_type != gemmi.EntityType.Polymer:
+        continue
+    poly = 0
+    for ch in back[0]:
+        if ch.name in ent.subchains or any(r.subchain in ent.subchains for r in ch):
+            poly = len(ch.get_polymer())
+            break
+    checks[ent.name] = {"entity_seq": len(ent.full_sequence), "polymer": poly}
+print(json.dumps({"written": report, "verified": checks}))
+"""
+
+
+def write_target_template_cif(pdb_path: Path, cif_path: Path, python_exec: str) -> dict:
+    """Convert a target-only PDB into a CIF whose entity sequence matches its coordinates.
+
+    Runs in the boltz interpreter because gemmi lives there, not in the complexa venv.
+    Raises if the round-trip check finds the entity sequence and the polymer disagreeing,
+    since that is precisely the condition that makes boltz's template alignment either
+    crash or silently invent unresolved residues.
+    """
+    import subprocess
+
+    cif_path.parent.mkdir(parents=True, exist_ok=True)
+    proc = subprocess.run(
+        [python_exec, "-I", "-c", _CIF_CONVERT_SCRIPT, str(pdb_path), str(cif_path)],
+        capture_output=True,
+        text=True,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(f"CIF conversion failed for {pdb_path}: {proc.stderr[-2000:]}")
+    report = json.loads(proc.stdout.strip().splitlines()[-1])
+    for name, c in report["verified"].items():
+        if c["entity_seq"] != c["polymer"]:
+            raise AssertionError(
+                f"{cif_path}: entity {name} sequence length {c['entity_seq']} != "
+                f"polymer length {c['polymer']}"
+            )
+    return {"cif_path": str(cif_path), **report}
 
 
 def pocket_contacts_for(
