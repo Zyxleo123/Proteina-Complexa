@@ -63,6 +63,17 @@ run_name: cpsea_seqcond_trans_closure
 # artefact.
 pretrain_ckpt_path: /data/user_data/yixiz/Proteina-Complexa/training_runs/store/cpsea_seqcond_v2/checkpoints/last-v3.ckpt
 
+# The inherited config's dataset metadata still points at /zfsauton, the pre-move cluster
+# -- the same stale-path class that blocked the seq-cond eval, just in the data config
+# rather than the checkpoint config. The first smoke died on it AFTER successfully
+# initialising the geometry loss (proteina.py:405 logged it), so the flag itself was fine.
+# Resolved from the environment so this config does not hard-code a cluster.
+dataset:
+  unified:
+    datamodule:
+      metadata_file: ${oc.env:CPSEA_FULL_DATA_PATH}/preprocessed/metadata/cpsea_train.parquet
+      val_metadata_file: ${oc.env:CPSEA_FULL_DATA_PATH}/preprocessed/metadata/cpsea_val.parquet
+
 cyclization:
   bond_loss:
     geometry:
