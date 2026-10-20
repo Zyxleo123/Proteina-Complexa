@@ -307,22 +307,26 @@ def score_structure(
         except (ImportError, AttributeError, TypeError):
             return InterfaceAnalyzerMover(interface)
 
-    def analyze(p) -> dict:
+    def analyze(p, *, with_packstat: bool) -> dict:
         mover = _make_mover()
         mover.set_pack_separated(True)
-        # Both packing metrics are requested explicitly. Without this, `packstat` comes
-        # back as a flat 0.0 for every structure -- not a computed value but an
-        # uncomputed default, which would read as "perfectly unpacked interface" across
-        # the entire dataset. `sc_value` (shape complementarity) is computed either way;
-        # asking for it explicitly keeps the pair symmetric.
-        mover.set_compute_packstat(True)
+        # packstat must be asked for: left off it returns a flat 0.0 for every
+        # structure -- an uncomputed default, not a value, which would read dataset-wide
+        # as a perfectly unpacked interface. It is computed on BOTH poses: measured at
+        # 1.5s vs 2.2s without it on a 220-residue complex, i.e. free. (It was briefly
+        # restricted to the refined pose on the assumption that a Monte-Carlo SASA
+        # calculation would dominate; timing said otherwise.)
+        mover.set_compute_packstat(bool(with_packstat))
         mover.set_compute_interface_sc(True)
         mover.apply(p)
-        return {k: float(p.scores[k]) for k in ROSETTA_INTERFACE_SCORE_KEYS if k in p.scores}
+        out = {k: float(p.scores[k]) for k in ROSETTA_INTERFACE_SCORE_KEYS if k in p.scores}
+        if not with_packstat:
+            out.pop("packstat", None)
+        return out
 
     try:
         raw_pose = pyrosetta.Pose(pose)
-        raw_scores = analyze(pyrosetta.Pose(pose))
+        raw_scores = analyze(pyrosetta.Pose(pose), with_packstat=True)
         rec["raw"] = {
             "total_score": round(float(sf(raw_pose)), 3),
             **{k: round(v, 3) for k, v in raw_scores.items()},
@@ -351,7 +355,7 @@ def score_structure(
         return rec
 
     try:
-        ref_scores = analyze(pyrosetta.Pose(pose))
+        ref_scores = analyze(pyrosetta.Pose(pose), with_packstat=True)
         rec["refined"] = {
             # `sf` carries zero constraint weights, so the restraint term used during
             # relax contributes nothing to this reported energy.
