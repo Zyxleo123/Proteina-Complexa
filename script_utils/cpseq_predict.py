@@ -106,31 +106,45 @@ def run_boltz2(task: dict, out_dir: Path, args) -> dict:
         input_hash,
         predict,
     )
-    from proteinfoundation.cpseq.contexts import load_lnr_contexts
+    from proteinfoundation.cpseq.contexts import chain_sequence, parse_structure
 
     cfg = Boltz2Config(diffusion_samples=args.samples, seed=args.seed)
 
-    # Receptor sequences come from the parent context. Cached per process so a shard of
-    # 100 tasks parses LNR once, not 100 times.
-    if not hasattr(run_boltz2, "_ctx_cache"):
-        ctxs, _ = load_lnr_contexts(Path(args.lnr_root))
-        run_boltz2._ctx_cache = {c.parent_id: c for c in ctxs}
-    ctx = run_boltz2._ctx_cache[task["parent_id"]]
+    # Receptor sequences are read from the TARGET-ONLY TEMPLATE, not from a parent
+    # context. The first version resolved them by parsing LNR and indexing by parent_id,
+    # which meant this adapter could only ever run on LNR: the experimental controls
+    # failed all six with `KeyError: 'ctrl_7k2m'`. The template is the receptor the
+    # predictor is actually given, it exists for every dataset built by
+    # cpseq_prepare_targets / cpseq_build_control_contexts, and reading it here keeps the
+    # YAML sequence and the template coordinates guaranteed consistent.
+    #
+    # Cached per template path: a shard of 100 tasks over 12 parents parses 12 files.
+    if not hasattr(run_boltz2, "_tmpl_cache"):
+        run_boltz2._tmpl_cache = {}
+    tmpl = task["target_template_pdb"]
+    if tmpl not in run_boltz2._tmpl_cache:
+        parsed = parse_structure(Path(tmpl))
+        run_boltz2._tmpl_cache[tmpl] = {
+            ch: chain_sequence(parsed, ch) for ch in sorted(parsed["atoms"])
+        }
+    # Keyed by the PREDICTOR's chain ids (what the template uses), so pocket contacts
+    # must be remapped from original ids to match.
+    receptor_sequences = run_boltz2._tmpl_cache[tmpl]
 
     msa_paths = json.loads(task["receptor_msa_paths"])
     chain_map = json.loads(task["chain_map"])
-    # One MSA per receptor chain; all our tranche parents are single-chain, but the
-    # multi-chain path must not silently drop a chain's alignment.
     first_msa = next(
-        (msa_paths[chain_map[c]] for c in sorted(ctx.receptor_chains) if msa_paths.get(chain_map[c])),
-        None,
+        (msa_paths[c] for c in sorted(receptor_sequences) if msa_paths.get(c)), None
     )
+    pocket = [
+        (chain_map.get(ch, ch), idx) for ch, idx in json.loads(task["pocket_contacts"])
+    ]
 
     yaml_text = build_input_yaml(
         peptide_sequence=task["sequence"],
-        receptor_sequences=ctx.receptor_sequences,
+        receptor_sequences=receptor_sequences,
         chemistry=task["chemistry"],
-        pocket_contacts=[tuple(x) for x in json.loads(task["pocket_contacts"])],
+        pocket_contacts=pocket,
         receptor_msa_path=first_msa,
         target_template_path=task["target_template_cif"],
     )
