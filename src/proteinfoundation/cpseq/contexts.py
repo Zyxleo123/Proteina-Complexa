@@ -79,6 +79,10 @@ class ParentContext:
     pocket_residues: dict[str, tuple[int, ...]] = field(default_factory=dict)
     # PDB-numbered pocket residues, which is what the predictors' inputs actually name.
     pocket_resseq: dict[str, tuple[int, ...]] = field(default_factory=dict)
+    # Min heavy-atom distance from each pocket residue to the peptide, aligned with the
+    # two above. Ranks the pocket so a small, satisfiable CONDITIONING set can be drawn
+    # from it; the full set stays descriptive.
+    pocket_min_dist: dict[str, tuple[float, ...]] = field(default_factory=dict)
     receptor_sequences: dict[str, str] = field(default_factory=dict)
     family_id: str | None = None
     split: str | None = None
@@ -90,6 +94,7 @@ class ParentContext:
         d["receptor_chains"] = ",".join(self.receptor_chains)
         d["pocket_residues"] = json.dumps({k: list(v) for k, v in self.pocket_residues.items()})
         d["pocket_resseq"] = json.dumps({k: list(v) for k, v in self.pocket_resseq.items()})
+        d["pocket_min_dist"] = json.dumps({k: list(v) for k, v in self.pocket_min_dist.items()})
         d["receptor_sequences"] = json.dumps(self.receptor_sequences)
         d["n_pocket_residues"] = sum(len(v) for v in self.pocket_residues.values())
         return d
@@ -148,8 +153,12 @@ def pocket_for(
     receptor_chains: tuple[str, ...],
     peptide_chain: str,
     radius_A: float = POCKET_RADIUS_A,
-) -> tuple[dict[str, tuple[int, ...]], dict[str, tuple[int, ...]]]:
-    """Receptor residues lining the peptide site, as (0-based per chain, PDB resSeq)."""
+) -> tuple[dict[str, tuple[int, ...]], dict[str, tuple[int, ...]], dict[str, tuple[float, ...]]]:
+    """Receptor residues lining the peptide site.
+
+    Returns (0-based index per chain, PDB resSeq per chain, min heavy-atom distance to
+    the peptide per chain), the three aligned element-for-element.
+    """
     pep = parsed["atoms"].get(peptide_chain, {})
     pep_xyz = np.array([xyz for res in pep.values() for xyz in res.values()], dtype=np.float64)
     if pep_xyz.size == 0:
@@ -157,19 +166,26 @@ def pocket_for(
 
     local: dict[str, tuple[int, ...]] = {}
     resseq: dict[str, tuple[int, ...]] = {}
+    mindist: dict[str, tuple[float, ...]] = {}
     r2 = radius_A * radius_A
     for chain in receptor_chains:
         keys = list(parsed["atoms"].get(chain, {}))
-        hits_local, hits_resseq = [], []
+        hits_local, hits_resseq, hits_d = [], [], []
         for idx, key in enumerate(keys):
             xyz = np.array(list(parsed["atoms"][chain][key].values()), dtype=np.float64)
             d2 = ((xyz[:, None, :] - pep_xyz[None, :, :]) ** 2).sum(-1)
-            if d2.min() <= r2:
+            dmin2 = float(d2.min())
+            if dmin2 <= r2:
                 hits_local.append(idx)
                 hits_resseq.append(key[0])
+                # Kept because the *conditioning* pocket has to be a small, satisfiable
+                # set of genuine contacts, which needs a ranking -- see
+                # `targets.pocket_contacts_for`.
+                hits_d.append(round(float(np.sqrt(dmin2)), 3))
         local[chain] = tuple(hits_local)
         resseq[chain] = tuple(hits_resseq)
-    return local, resseq
+        mindist[chain] = tuple(hits_d)
+    return local, resseq, mindist
 
 
 def contacting_chains(
@@ -256,7 +272,7 @@ def load_lnr_contexts(
             rejected.append({"pdb_id": pdb_id, "reason": "no receptor chain contacts the peptide"})
             continue
 
-        local, resseq = pocket_for(parsed, rec_chains, pep_chain)
+        local, resseq, mindist = pocket_for(parsed, rec_chains, pep_chain)
         contexts.append(
             ParentContext(
                 parent_id=f"lnr_{pdb_id}",
@@ -269,6 +285,7 @@ def load_lnr_contexts(
                 peptide_length=len(seq),
                 pocket_residues=local,
                 pocket_resseq=resseq,
+                pocket_min_dist=mindist,
                 receptor_sequences={c: chain_sequence(parsed, c) for c in rec_chains},
                 note=note,
             )
