@@ -648,6 +648,63 @@ recovery demonstrates a working pipeline, **not** prospective accuracy.
   hand-off; the pre-fix scores are kept at `scores_unconstrained_relax/` for the
   before/after comparison.
 
+### The sequence-conditioned generator, and where the closure failure actually comes from
+
+The project's own CPSea sequence-conditioned flow model (`cpsea_seqcond_v2`,
+`last-v3-EMA.ckpt`, **step 3000**) was run on the same 12 parents, fed each parent's
+**unmutated** LP sequence, conditioned `mainchain`, 4 samples each, and scored through the
+identical evaluator — same tolerances, same closure constraint, same Rosetta protocol.
+
+**Sequence conditioning works.** `cond_recovery` median **1.000** (min 0.818), exact
+sequence match on **24/32** attributed samples. Its own training notes set >0.9 recovery
+as the bar that separates "honoured the sequence" from "designed its own peptide"; at step
+3000 it is there. So its energies describe the requested peptide.
+
+**Its interface energies are in range** — refined `dG_separated` of −16 to −25 on `2v8x`,
+against Boltz-2's valid-sample median of about −24. But **0/32 pass validity**, 27 of them
+on the closure torsion alone.
+
+That looked like a generator defect. It is not. Measuring the closure torsion by source,
+mainchain only:
+
+| source | n | median \|ω\| | trans-like (>150°) | **cis-like (<30°)** | median dev | pass ±8.44° |
+|---|---|---|---|---|---|---|
+| experimental crystals | 4 | 175.0° | 100 % | 0 % | 5.04° | **100 %** |
+| **native CPSea** (this model's training data) | 80 | 144.6° | 45 % | **41.2 %** | 35.36° | **20.0 %** |
+| **seq-cond generator** | 32 | 142.5° | 50 % | 9.4 % | 37.55° | **15.6 %** |
+| Boltz-2 | 84 | **176.9°** | **92.9 %** | 4.8 % | **3.06°** | **76.2 %** |
+| AfCycDesign | 214 | 141.8° | 41 % | 4.7 % | 38.24° | 20.6 % |
+
+**41 % of native CPSea head-to-tail closures are cis amides**, while all four crystal
+macrocycle controls are tightly trans (ω 172–179°). CPSea's computational cyclization
+never enforced trans ω at the ring junction, and a model trained on it reproduces that
+distribution: the generator's torsion statistics are indistinguishable from its training
+data's. **The same failure would therefore appear when generating from CPSea CP sequences
+— it is inherited from the training data, not a property of the LP→CP task.**
+
+Two consequences:
+
+- **A torsion criterion cannot be calibrated from CPSea.** Applying the project's own
+  worst-case-plus-margin method (`derive_cyclic_thresholds.py`) to native CPSea gives a
+  mainchain torsion tolerance of **±188.73°** — wider than 180°, i.e. vacuous, accepting
+  every possible torsion. The frozen set is saved at
+  `manifest/geometry_tolerances_cpsea_native.json` precisely so this is inspectable, but
+  it cannot be used as a bar. The crystal-derived bar is the only meaningful one, and it
+  says CPSea-trained generation does not produce physical ring closure.
+- **Boltz-2 is the outlier in the good direction.** 92.9 % trans, median torsion
+  deviation 3.06° — better ring stereochemistry than the generator's training data
+  contains. Its 40.4 % overall validity is limited by **clashes**, not closure.
+
+`cyclization/linkage_geometry.py` already defines `dihedral_ref = π`,
+`dihedral_symmetric: False` for mainchain, so the supervision term exists; these numbers
+say it is not constraining the data that reaches it. The actionable options are to weight
+that ω term during training, or to re-cyclize CPSea enforcing trans closure.
+
+Caveat on scope: 32 of 48 generated samples are reported here. Attribution is by receptor
+sequence, and the four largest targets (527, 413, 300, 250 residues) are cropped by the
+loader at `crop_size: 256`, so their dumped receptors are substrings; containment matching
+was added and the remainder were re-scoring at hand-off.
+
 ### Honest scope
 
 A complete **prediction** collection (874 complexes, two arms, both chemistries where

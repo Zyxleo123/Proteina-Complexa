@@ -90,6 +90,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--keep-frac", type=float, default=1.0,
                    help="Fraction of the binder sequence revealed under --seq-cond (default 1.0 = the "
                         "whole sequence). Ignored without --seq-cond.")
+    p.add_argument("--num-workers", type=int, default=None,
+                   help="Override the training config's dataloader worker count. The stored "
+                        "config asks for 8, which forks 8 copies of the dataset and OOM-killed "
+                        "this eval inside an 8 GiB allocation; 0 keeps it in-process.")
+    p.add_argument("--batch-size", type=int, default=None,
+                   help="Override the training config's batch size (stored runs use 16).")
     p.add_argument("--device", default="cuda")
     p.add_argument("--dry-run", action="store_true", help="Build the subset, print plan, no GPU.")
     return p.parse_args()
@@ -154,6 +160,47 @@ def _done_batches(out_dir: Path) -> set[int]:
     return done
 
 
+# Checkpoint paths recorded by runs trained before the cluster move. The same
+# substitution `script_utils/rebase_metadata_paths.py` applies to the split metadata: the
+# training configs carry the old prefix too, so a pre-move run dir is otherwise unusable
+# here -- `cpsea_seqcond_v2` died on its autoencoder_ckpt_path pointing at /zfsauton.
+_CKPT_PATH_KEYS = ("autoencoder_ckpt_path", "pretrain_ckpt_path", "ckpt_path")
+_MOVED_PREFIXES = (("/zfsauton/scratch/yixiz", "/data/user_data/yixiz"),)
+
+
+def _rebase_moved_ckpt_paths(cfg) -> None:
+    """Rewrite pre-move checkpoint prefixes, but only where that actually helps.
+
+    Deliberately conservative: a path is rewritten only when the configured one does NOT
+    exist and the rebased one DOES. So this is a no-op on any run trained here, it cannot
+    redirect a path that already resolves, and it never invents a file -- a genuinely
+    missing checkpoint still fails loudly with its original path in the message.
+    """
+    from omegaconf import DictConfig
+
+    def walk(node, prefix=""):
+        if not isinstance(node, DictConfig):
+            return
+        for key in list(node.keys()):
+            val = node.get(key)
+            if isinstance(val, DictConfig):
+                walk(val, f"{prefix}{key}.")
+            elif key in _CKPT_PATH_KEYS and isinstance(val, str) and val:
+                if Path(val).exists():
+                    continue
+                for old, new in _MOVED_PREFIXES:
+                    if val.startswith(old):
+                        cand = val.replace(old, new, 1)
+                        if Path(cand).exists():
+                            node[key] = cand
+                            logger.warning(
+                                "rebased {}{} onto this cluster: {} -> {}", prefix, key, val, cand
+                            )
+                        break
+
+    walk(cfg)
+
+
 def main() -> int:
     args = parse_args()
     load_dotenv(".env")
@@ -196,6 +243,7 @@ def main() -> int:
 
     cfg_exp = OmegaConf.create(json.load(cfg_file.open()))
     OmegaConf.set_struct(cfg_exp, False)
+    _rebase_moved_ckpt_paths(cfg_exp)
 
     # Point BOTH metadata files at the subset: we only ever call val_dataloader, and this avoids
     # StructureDataModule.setup() reading the 2.71M-row train parquet just to build an unused
@@ -203,6 +251,16 @@ def main() -> int:
     dm = cfg_exp.dataset.unified.datamodule
     dm.metadata_file = str(subset_parquet)
     dm.val_metadata_file = str(subset_parquet)
+    if args.num_workers is not None:
+        for node in (cfg_exp.dataset.datamodule, dm):
+            if node is not None and "num_workers" in node:
+                node.num_workers = args.num_workers
+        logger.warning("dataloader num_workers overridden to {}", args.num_workers)
+    if args.batch_size is not None:
+        for node in (cfg_exp.dataset.datamodule, dm):
+            if node is not None and "batch_size" in node:
+                node.batch_size = args.batch_size
+        logger.warning("batch_size overridden to {}", args.batch_size)
 
     # Rebuild the model exactly as it trained; only the val-generation sampler bookkeeping moves.
     vg = cfg_exp.val_generation
