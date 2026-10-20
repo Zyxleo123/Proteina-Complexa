@@ -34,12 +34,34 @@ import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+from proteinfoundation.cpseq.contexts import parse_structure  # noqa: E402
 from proteinfoundation.cpseq.geometry import read_chain  # noqa: E402
 
 PRED_PEPTIDE_CHAIN = "B"
 
 
-def ca_of(path: str | Path, chains: list[str]) -> np.ndarray:
+def ca_of(path: str | Path, chains: list[str], *, reference: bool = False) -> np.ndarray:
+    """CA coordinates for `chains`, in residue order.
+
+    `reference=True` parses with `contexts.parse_structure`, which is the SAME parser
+    that built the target-only template, so the reference receptor and the predicted
+    receptor correspond residue-for-residue.
+
+    This matters: `geometry.read_chain` accepts HETATM records (filtered to standard
+    residues) while `parse_structure` takes ATOM only, and on 5TU6 that one-record
+    difference gave 297 reference residues against the template's 296 -- enough to make
+    every comparison for that control fail as a length mismatch. Two parsers disagreeing
+    by one residue is exactly the kind of thing that silently kills a comparison, so the
+    reference side now uses the template's own convention.
+    """
+    if reference:
+        parsed = parse_structure(Path(path))
+        out = []
+        for ch in chains:
+            for _, atoms in parsed["atoms"].get(ch, {}).items():
+                if "CA" in atoms:
+                    out.append(np.asarray(atoms["CA"], dtype=np.float64))
+        return np.asarray(out, dtype=np.float64)
     out = []
     for ch in chains:
         for _, atoms in read_chain(path, ch):
@@ -58,8 +80,10 @@ def receptor_aligned_rmsd(
     ref_peptide: str,
 ) -> dict:
     """Peptide CA RMSD after superposing on the receptor. Chain ids may differ per file."""
-    ra, rb = ca_of(pred_path, pred_receptor), ca_of(ref_path, ref_receptor)
-    pa, pb = ca_of(pred_path, [pred_peptide]), ca_of(ref_path, [ref_peptide])
+    ra = ca_of(pred_path, pred_receptor)
+    rb = ca_of(ref_path, ref_receptor, reference=True)
+    pa = ca_of(pred_path, [pred_peptide])
+    pb = ca_of(ref_path, [ref_peptide], reference=True)
     if ra.size == 0 or rb.size == 0:
         return {"status": "no_receptor_ca", "n_pred_rec": len(ra), "n_ref_rec": len(rb)}
     if ra.shape != rb.shape:

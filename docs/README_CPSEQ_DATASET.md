@@ -599,18 +599,45 @@ any sense in which the two arms can be said to agree on a binding pose. **So thi
 provides no usable cross-model pose consensus**, and a future scorer should not treat
 agreement between these two arms as evidence of correctness.
 
+### Control pose recovery: the pipeline is wired correctly
+
+Receptor-aligned peptide CA RMSD against the deposited complexes. All six controls are
+comparable; the peptide is never templated and its crystal coordinates never enter a
+prediction.
+
+| arm × chemistry | n | median | best | worst |
+|---|---|---|---|---|
+| **Boltz-2 mainchain** | 16 | **1.42 Å** | 0.40 Å | 6.99 Å |
+| **Boltz-2 disulfide** | 8 | **1.18 Å** | 0.83 Å | 1.87 Å |
+| AfCycDesign mainchain | 8 | 34.67 Å | 23.35 Å | 48.95 Å |
+
+Best sample per control, Boltz-2: **1SFI 0.40 Å**, 7K2M 0.72, 1SLD 0.83, 5TU6 1.26,
+1SLE 1.31, 7K2F 2.13 — every one within 2.13 Å, including 1SFI, the 14-mer bicyclic
+sunflower trypsin inhibitor.
+
+Two things follow:
+
+- **The implementation is sound end to end.** Target-only templates, chain mapping,
+  cached MSAs, the conditioning pocket, the chemistry controls and the receptor-aligned
+  comparison all work: a known cyclic peptide is put back where the crystal has it, to
+  about an Ångström.
+- **Boltz docks disulfide peptides correctly while failing to form the S–S bond.** Pose
+  recovery is 1.18 Å median for the disulfide controls, yet 0 % of disulfide samples pass
+  the closure window. The *placement* is right and the *bond* is not — which is a sharper
+  statement than "disulfide does not work", and it is only visible because pose and
+  closure are measured separately.
+
+These controls predate the predictors' training data and may sit inside it, so ~1 Å
+recovery demonstrates a working pipeline, **not** prospective accuracy.
+
 ### Not measured
 
-- **Boltz control pose recovery** — the control job needed 32 GB (it was OOM-killed at
-  8 GB locally, `returncode -9`) and was still running at hand-off. AfCycDesign's control
-  numbers are above.
-- **Cross-predictor pose agreement** on the full set. The machinery is in
-  `cpseq_summarize.py` (receptor-aligned) and both arms are now scored, but given
-  AfCycDesign places the peptide 23–49 Å away on controls, the agreement number will
-  mostly re-measure that arm's docking failure rather than a genuine disagreement
-  between two docked solutions.
 - **HighFold3 predictions.** Its capability is fully verified by probing (§7); the
   runtime build is the remaining blocker.
+- **Corrected refined energies across the full tranche.** The closure-constraint fix
+  (above) invalidated the previous refined numbers and rescoring was still in flight at
+  hand-off; the pre-fix scores are kept at `scores_unconstrained_relax/` for the
+  before/after comparison.
 
 ### Honest scope
 
