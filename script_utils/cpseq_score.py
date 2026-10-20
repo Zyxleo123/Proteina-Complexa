@@ -210,9 +210,12 @@ def main() -> None:
                     },
                     "rosetta": {
                         k: sc.get(k)
+                        # `restraints` belongs here: the task requires recording what
+                        # was restrained during refinement, and the scorer produces it,
+                        # but this fixed key list was silently dropping it.
                         for k in ("status", "raw", "refined", "refinement_displacement",
                                   "deformation", "ring_declared_complex", "refined_pdb_path",
-                                  "scorer_chemistry_status", "reason")
+                                  "scorer_chemistry_status", "reason", "restraints")
                     },
                     "protocol": sc.get("protocol"),
                     "scoring_status": sc.get("status"),
