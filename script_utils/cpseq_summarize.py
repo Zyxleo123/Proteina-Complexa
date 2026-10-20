@@ -139,7 +139,16 @@ def load_rows(dataset_dir: Path) -> pd.DataFrame:
         for c in COMPONENTS:
             out[f"raw_{c}"] = raw.get(c)
             out[f"refined_{c}"] = ref.get(c)
-        # Per-predictor confidence columns, never pooled across predictors.
+        # Per-predictor confidence columns, never pooled across predictors -- AF2's
+        # pLDDT/ptm and boltz's complex_plddt/iptm are different quantities on different
+        # scales. Boltz writes its confidences to a sidecar JSON rather than into our
+        # record, so they are harvested here from the structure path instead of by
+        # re-running a prediction; that also means every row gets them regardless of
+        # when it was scored.
+        if not conf and r.get("predictor") == "boltz2" and r.get("raw_pdb_path"):
+            from proteinfoundation.cpseq.adapters.boltz2 import confidence_for_pdb
+
+            conf = confidence_for_pdb(r["raw_pdb_path"])
         for k, v in conf.items():
             out[f"conf_{k}"] = v
         flat.append(out)

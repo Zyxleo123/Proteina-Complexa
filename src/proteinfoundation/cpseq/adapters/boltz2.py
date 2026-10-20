@@ -271,3 +271,41 @@ def predict(
             "stdout_tail": "",
             "stderr_tail": f"timed out after {timeout_s}s",
         }
+
+
+# Confidence keys boltz writes per sample. Harvested from the sibling
+# `confidence_<name>_model_<k>.json` rather than re-running a prediction, and kept under
+# boltz's own names so they are never confused with AF2's pLDDT/ptm conventions -- the
+# two are different quantities on different scales and must not be pooled.
+BOLTZ_CONFIDENCE_KEYS = (
+    "confidence_score",
+    "ptm",
+    "iptm",
+    "protein_iptm",
+    "complex_plddt",
+    "complex_iplddt",
+    "complex_pde",
+    "complex_ipde",
+)
+
+
+def confidence_for_pdb(pdb_path: str | Path) -> dict:
+    """Boltz's confidence values for the sample whose structure is at `pdb_path`.
+
+    Boltz writes `<stem>.pdb` and `confidence_<stem>.json` side by side, so the mapping
+    is by filename. Returns {} when the file is absent -- a missing confidence is
+    reported as absent, never as zero.
+    """
+    pdb_path = Path(pdb_path)
+    sidecar = pdb_path.parent / f"confidence_{pdb_path.stem}.json"
+    if not sidecar.exists():
+        return {}
+    try:
+        data = json.loads(sidecar.read_text())
+    except Exception:  # noqa: BLE001
+        return {}
+    return {
+        k: float(data[k])
+        for k in BOLTZ_CONFIDENCE_KEYS
+        if k in data and isinstance(data[k], (int, float))
+    }
