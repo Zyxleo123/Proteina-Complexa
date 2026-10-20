@@ -150,16 +150,69 @@ there as CPU work.
 
 ---
 
+## First build (config_hash `4207a3085a004bba`)
+
+`python script_utils/cpseq_build_dataset.py --out-dir $ZFS/cpseq/tranche1 --n-parents 12`
+
+| | |
+|---|---|
+| LNR entries parsed | 93 |
+| parent contexts in the 5–16mer ring range | **63** (30 rejected: 3–4mers and 17–27mers, each with its measured length as the reason) |
+| receptor families | **54**, 5 of them multi-parent |
+| split | `dev` whole — see below |
+| parents selected for the tranche | **12**, one per family, lengths 5,5,6,6,7,8,9,11,11,12,14,16 |
+| mainchain candidates (cross-model set) | **107** |
+| disulfide candidates (labeled subset) | **58** |
+| minimum identity to reference | **0.500** |
+
+Mainchain is 107 and not 12 × 9 because one parent's bands coincide onto an
+identical sequence; it merges and carries both band tags. Disulfide is smaller by
+construction — two CYS anchors are charged to the budget first, so the low bands
+have nothing left to spend and collapse into the reference arm.
+
+Counts are capped at `floor(L/2)`: rounding the 50 % band up at an odd length
+gives 7 of 13, which is 46 % identity and outside the retention constraint. The
+cap binds only at the top band and odd lengths, and says so in `note`.
+
+### Missing generalization coverage, stated plainly
+
+LNR goes to `dev` **whole**. It has already shaped this repository's
+preprocessing and sampling decisions, so a held-out slice of it would not be an
+independent test set. PepBench's `train.cluster` / `valid.cluster` (4,157 / 114)
+are staged and are a pre-existing clustering that could supply disjoint target
+families for a future evaluation split; until those are built into contexts,
+**this tranche supports no generalization claim across target families.**
+
+### Tool paths in `.env` that do not resolve
+
+`MMSEQS_EXEC` and `FOLDSEEK_EXEC` both point into the complexa venv's `bin`, and
+neither binary exists there. `env.sh` exports both regardless. The family split
+has to exist *before* variants are generated, so `contexts.assign_families` falls
+back to a built-in pairwise clustering and records which path ran in
+`clustering_method.json`.
+
+The first fallback put all 63 receptors in **one** family: global alignment
+scatters chance matches across a long receptor, normalising by the shorter
+sequence then clears 0.3 for unrelated pairs, and single linkage chains every
+family together from the first false edge. Local alignment with identity over the
+aligned columns — what mmseqs reports — gives the 54 families above.
+
+---
+
 ## Status
 
 - [x] Predictor availability measured; two HighFold3 constraints verified
-- [x] Chemistry capability table grounded in this repo's own code
-- [x] Boltz-2 env build submitted (job `10860559`, idempotent/resumable)
+- [x] Chemistry capability table grounded in this repo's own code, checked against
+      `cyclization.constants`
+- [x] Candidate builder (bands, seeds, anchor accounting, dedup, identity floor)
+- [x] Parent contexts, receptor families, split — built **before** variants
+- [x] First skeleton build: 12 parents, 165 candidates
+- [x] Boltz-2 adapter: inputs verified for both chemistries
+- [ ] Boltz-2 env (job `10860559`, still `PENDING` on `preempt`)
+- [ ] AfCycDesign adapter (encoding already in repo; needs fixed-sequence complex path)
 - [ ] HighFold3 / AF3 env (needs CPython 3.11 + AF3 install; MSAs precomputed)
-- [ ] Chemistry spec + capability table as machine-readable config
-- [ ] Candidate sequence builder (mutation bands, seeds, dedup, anchors)
-- [ ] Target-family/parent split, built **before** variants
-- [ ] Three adapters, fixed-sequence verified against the request
+- [ ] Target-only templates + cached receptor MSAs per parent
 - [ ] Shared chemistry-aware evaluator
 - [ ] Per-predictor end-to-end preflight on shared cases
 - [ ] Bounded first tranche (cap: 24 GPU-h, 300 CPU core-h)
+- [ ] ~6 experimental CP–target complexes as technical controls
