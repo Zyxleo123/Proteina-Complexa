@@ -89,9 +89,21 @@ if [ -f "$MARKERS/af3_$AF3_REV" ] && "$PY" -c "import alphafold3" 2>/dev/null; t
 else
   echo "[af3] installing build requirements"
   "$PY" -m pip install "scikit_build_core" "pybind11" "cmake>=3.28" "ninja" "numpy"
+  # Name the compiler explicitly. Without this the build died with
+  #   CMake Error ... Could not find the compiler specified in the environment
+  #   variable CXX: clang++
+  # even though CXX is unset in the shell and clang is not installed on these nodes --
+  # scikit-build-core/CMake 4.4 guesses clang++ and then reports it as if the
+  # environment had asked for it. gcc 11.5 is present and compiles AF3's required
+  # C++20 (checked: `g++ -std=c++20` builds a trivial TU).
+  export CC="${CC:-gcc}" CXX="${CXX:-g++}"
+  echo "[af3] CC=$CC CXX=$CXX"
   echo "[af3] building (this compiles C++ extensions; slow)"
   # --no-build-isolation would hide the pinned build deps; left on deliberately.
-  "$PY" -m pip install --no-cache-dir "$AF3_WORKTREE"
+  "$PY" -m pip install --no-cache-dir \
+    -C cmake.define.CMAKE_C_COMPILER="$CC" \
+    -C cmake.define.CMAKE_CXX_COMPILER="$CXX" \
+    "$AF3_WORKTREE"
   "$PY" -c "import alphafold3; print('alphafold3 import OK')"
   touch "$MARKERS/af3_$AF3_REV"
 fi
