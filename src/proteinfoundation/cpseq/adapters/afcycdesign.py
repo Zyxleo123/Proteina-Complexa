@@ -145,6 +145,31 @@ def sequence_from_pdb(pdb_path: Path, chain: str) -> str:
     return "".join(seen[k] for k in sorted(seen))
 
 
+def sequence_from_pdb_when_ready(
+    pdb_path: Path, chain: str, *, attempts: int = 10, delay_s: float = 0.2
+) -> str:
+    """`sequence_from_pdb`, but only once the file is actually finished being written.
+
+    Reading immediately after `save_pdb` intermittently returned an empty sequence for
+    the first sample of a run while the identical file parsed correctly moments later --
+    a partially written file, not a wrong prediction. Left alone that shows up in the
+    dataset as `sequence_matches: false`, i.e. a compliance failure invented by a race.
+    Waits for a terminating record before parsing, and reports empty only if it never
+    arrives.
+    """
+    import time
+
+    for _ in range(attempts):
+        try:
+            text = Path(pdb_path).read_text()
+        except OSError:
+            text = ""
+        if text.rstrip().endswith(("END", "ENDMDL", "TER")):
+            return sequence_from_pdb(pdb_path, chain)
+        time.sleep(delay_s)
+    return sequence_from_pdb(pdb_path, chain) if Path(pdb_path).exists() else ""
+
+
 def predict(
     *,
     sequence: str,
@@ -180,10 +205,17 @@ def predict(
     samples: list[dict] = []
     model = None
     try:
+        # num_models is NOT optional. ColabDesign loads only its default number of
+        # parameter sets (2 here) and `models=[k]` indexes into that loaded list, so
+        # asking for model 2 or 3 raised `IndexError: list index out of range` and two
+        # of every four samples failed -- while all five params_model_*_ptm.npz files
+        # were sitting in the directory unused. Load as many as the highest requested
+        # index needs.
         model = mk_afdesign_model(
             protocol="binder",
             use_multimer=config.use_multimer,
             num_recycles=config.num_recycles,
+            num_models=max(config.model_nums) + 1,
             data_dir=af2_params_dir,
         )
         for sample_idx, model_num in enumerate(config.model_nums):
@@ -220,7 +252,7 @@ def predict(
                 pdb_out = out_dir / f"sample_{sample_idx}_model{model_num}.pdb"
                 model.save_pdb(str(pdb_out))
 
-                got = sequence_from_pdb(pdb_out, binder_chain_out)
+                got = sequence_from_pdb_when_ready(pdb_out, binder_chain_out)
                 samples.append(
                     {
                         "sample_index": sample_idx,

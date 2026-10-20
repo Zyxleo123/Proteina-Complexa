@@ -235,6 +235,14 @@ def predict(
         "--accelerator", accelerator,
         "--devices", str(devices),
         "--write_full_pae",
+        # The cuequivariance triangular-multiplication kernels are a speed
+        # optimisation, not part of the model, and we cannot have them here: the
+        # current `cuequivariance_ops_torch_cu12` (0.13.0) requires torch>=2.11 and
+        # pulls CUDA 13, which would replace this env's pinned torch 2.7.0+cu126 and
+        # the boltz install built against it. Without the flag boltz still *tries* the
+        # kernels and dies with `ModuleNotFoundError: cuequivariance_torch` inside the
+        # pairformer -- measured, on both preflight tasks.
+        "--no_kernels",
     ]
     if config.use_potentials:
         cmd.append("--use_potentials")
