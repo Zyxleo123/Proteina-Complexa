@@ -417,6 +417,26 @@ Proteina-Complexa/
 
 ---
 
+## Related work in this repo
+
+**Sequence → target → cyclic-peptide outcome dataset** — see
+[`docs/README_CPSEQ_DATASET.md`](docs/README_CPSEQ_DATASET.md).
+
+Given an LP reference sequence and a target, it predicts cyclic-peptide/target complexes
+across three predictors (Boltz-2, AfCycDesign, HighFold3) and labels them with validity,
+closure, interface, strain and reliability under one shared chemistry-aware evaluator.
+Code lives in `src/proteinfoundation/cpseq/` and `script_utils/cpseq_*.py`; it reuses
+this project's `cyclization/` constants and geometry, `evaluation/rosetta_energy.py` and
+`evaluation/cyclic_offset.py` rather than restating them.
+
+Two findings from it that affect other work here:
+
+- `evaluation/rosetta_energy.py` does **not** run on the installed PyRosetta (2026.39):
+  `InterfaceAnalyzerMover` no longer takes a string, it needs a `DockingPartners` object.
+- Declaring a head-to-tail bond with `declare_chemical_bond` does not survive
+  `FastRelax` -- the ring opens (measured: 0.010 Å → 1.149 Å) unless an explicit
+  `AtomPairConstraint` holds it. Anything here that relaxes a macrocycle is affected.
+
 ## External references
 
 - CPSea paper / data: [GitHub](https://github.com/YZY010418/CPSea), [Zenodo](https://zenodo.org/records/17324994)
