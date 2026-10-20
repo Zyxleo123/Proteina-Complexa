@@ -180,6 +180,55 @@ def _declare_ring(pose, chemistry: str, seqpos_i: int, seqpos_j: int) -> dict:
     return {"declared": False, "how": None, "reason": f"unknown chemistry {chemistry!r}"}
 
 
+def _add_closure_constraint(pose, chemistry: str, seqpos_i: int, seqpos_j: int) -> dict:
+    """Pin the closing bond with an explicit AtomPairConstraint for the duration of relax.
+
+    `declare_chemical_bond` updates the pose's connectivity but gives the minimiser no
+    term that holds those two atoms together, and `constrain_relax_to_start_coords`
+    turned out to be too weak to stand in for one. Measured, before this existed: a
+    head-to-tail ring that Boltz closed to a median 0.010 A of reference came out of
+    refinement at 1.149 A -- i.e. refinement OPENED 319 of 319 rings it was supposed to
+    preserve, and the refined interface energies were computed on a broken macrocycle.
+    (Disulfides went the other way: Rosetta's own disulfide term pulled them from 0.494 A
+    to 0.023 A, closing 144 rings the predictor had failed to close. That is a refiner
+    artefact too, and the raw/refined split is what makes both visible.)
+
+    The constraint is an artificial restraint, so it is scored with a SEPARATE
+    scorefunction and never contributes to a reported energy; `restraints` in the output
+    records that it was applied and at what reference length.
+    """
+    from pyrosetta.rosetta.core.id import AtomID
+    from pyrosetta.rosetta.core.scoring.constraints import AtomPairConstraint
+    from pyrosetta.rosetta.core.scoring.func import HarmonicFunc
+
+    spec = CHEMISTRIES[chemistry]
+    atom_i, atom_j = spec.bond.atom_i, spec.bond.atom_j
+    if chemistry == "isopeptide":
+        return {"applied": False, "reason": "isopeptide is not scored at all"}
+    try:
+        res_i, res_j = pose.residue(seqpos_i), pose.residue(seqpos_j)
+        if not (res_i.has(atom_i) and res_j.has(atom_j)):
+            return {"applied": False, "reason": f"missing {atom_i}/{atom_j}"}
+        cst = AtomPairConstraint(
+            AtomID(res_i.atom_index(atom_i), seqpos_i),
+            AtomID(res_j.atom_index(atom_j), seqpos_j),
+            # sd 0.05 A: tight enough to hold a covalent bond, loose enough not to
+            # dominate the local geometry the relax is otherwise free to fix.
+            HarmonicFunc(spec.bond.length_A, 0.05),
+        )
+        pose.add_constraint(cst)
+        return {
+            "applied": True,
+            "type": "AtomPairConstraint",
+            "atoms": f"{atom_i}({seqpos_i})-{atom_j}({seqpos_j})",
+            "target_length_A": spec.bond.length_A,
+            "harmonic_sd_A": 0.05,
+            "excluded_from_reported_energy": True,
+        }
+    except Exception as exc:  # noqa: BLE001
+        return {"applied": False, "reason": f"{type(exc).__name__}: {exc}"}
+
+
 def _ca_coords(pose, seqpos: list[int]) -> np.ndarray:
     out = []
     for i in seqpos:
@@ -344,7 +393,17 @@ def score_structure(
     receptor_pos = [p for ch in receptor_chains for p in _seqpos_of_chain(pose, ch)]
     ca_before_rec = _ca_coords(pose, receptor_pos)
     try:
-        relax = FastRelax(sf, RELAX_REPEATS)
+        # Two scorefunctions, deliberately. `sf_relax` carries the restraint weights the
+        # refinement needs; `sf` (plain ref2015, zero constraint weight) is the only one
+        # used for any reported energy, so no artificial restraint term can leak into a
+        # physical proxy.
+        from pyrosetta.rosetta.core.scoring import ScoreType
+
+        sf_relax = pyrosetta.create_score_function(SCOREFUNCTION)
+        sf_relax.set_weight(ScoreType.atom_pair_constraint, 1.0)
+        rec["restraints"] = _add_closure_constraint(pose, chemistry, seqpos_i, seqpos_j)
+
+        relax = FastRelax(sf_relax, RELAX_REPEATS)
         # Restrain to the input coordinates: scoring the geometry the model produced,
         # not searching for a better one nearby. Recorded in `protocol`.
         relax.constrain_relax_to_start_coords(True)
@@ -464,11 +523,16 @@ def _deformation_proxy(
         else:
             out["cache_hit"] = False
             free = pyrosetta.Pose(peptide)
+            from pyrosetta.rosetta.core.scoring import ScoreType
             from pyrosetta.rosetta.protocols.relax import FastRelax
 
-            # No coordinate restraints here: the free reference is allowed to move, which
-            # is the whole point. Same repeat budget as the complex refinement.
-            relax = FastRelax(sf, RELAX_REPEATS)
+            # No coordinate restraints here -- the free reference is meant to move. But
+            # the RING must still be held, or the "free cyclic peptide" reference is a
+            # linear peptide and the deformation proxy compares two different molecules.
+            out["free_restraints"] = _add_closure_constraint(free, chemistry, 1, n)
+            sf_free = pyrosetta.create_score_function(SCOREFUNCTION)
+            sf_free.set_weight(ScoreType.atom_pair_constraint, 1.0)
+            relax = FastRelax(sf_free, RELAX_REPEATS)
             relax.apply(free)
             e_free = float(sf(free))
             if isolated_out_path:
