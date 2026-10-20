@@ -1,218 +1,478 @@
 # Sequence → target → cyclic-peptide outcome dataset (`cpseq`)
 
-Build log for the first tranche of
+First tranche of
 `(candidate sequence, target context, cyclization chemistry) → predicted CP–target
 complexes → validity / interface / strain / uncertainty labels`.
 
-Started 2026-10-19. This file records what was **verified by inspection or
-execution**, not what was planned. Anything unverified says so.
+Started 2026-10-19. **Everything stated here was verified by inspection or execution.**
+Where something is unverified it says so. Where an arm is incomplete it says that too,
+rather than substituting another model.
 
 ---
 
-## Session constraint that shapes the schedule
+## 1. Model availability, as measured
 
-The VS Code session runs inside a `node-hold` Slurm job (2 CPUs, 32 GB, 1 GPU,
-A6000). Job `10859131` on `babel-t9-32` had 24 minutes left when this work
-started, so nothing heavy ran in-session: every expensive stage is an `sbatch`
-job that survives the session. `preempt` is `PreemptMode=REQUEUE`, so each job is
-written idempotent and resumable.
-
----
-
-## Predictor arms: availability as measured
-
-| Arm | Source pin | Env | Weights | Status |
+| Arm | Source pin | Runtime | Weights | Status |
 |---|---|---|---|---|
-| Boltz-2 | `upstream/boltz` `b1ebfc46` (2026-05-29) | own venv, **building** (job 10860559) | `boltz_cache/` 6.2 GB present: `boltz2_conf.ckpt`, `boltz2_aff.ckpt`, `ccd.pkl`, `mols.tar` | env build queued |
-| AfCycDesign / cyclic ColabDesign | `community_models/colabdesign` (installed in complexa venv) | complexa venv — `colabdesign`, `alphafold`, `jax`, `haiku` all import | AF2 params present (`params_model_{1,2}{,_ptm,_multimer_v3}.npz`, 5.3 GB) | **ready**; repo already carries the cyclic encoding (below) |
-| HighFold3 | `upstream/highfold3` `2ff1ea31` (2025-09-24) | not built | AF3 `af3.bin` 1.1 GB present | blocked on an AF3 install + a **CPython 3.11** interpreter (below) |
+| **Boltz-2** | `upstream/boltz` `b1ebfc46` (2026-05-29) | own venv, `$ZFS/envs/boltz2` — boltz 2.2.1, torch 2.7.0+cu126, numpy 1.26.4 | `boltz_cache/` 6.2 GB, 45,227 CCD mols extracted | **running, produces data** |
+| **AfCycDesign** | `community_models/colabdesign`, Zenodo `10.5281/zenodo.13309081` | complexa venv (colabdesign, jax, haiku all import) | AF2 params 5.3 GB | **running, produces data** |
+| **HighFold3** | `upstream/highfold3` `2ff1ea31` (2025-09-24) | `$ZFS/envs/highfold3`, CPython 3.11 + AF3 `a8ecdb2d` | AF3 `af3.bin` 1.1 GB | **capability verified by probe; runtime build attempted — see §7** |
 
-### Boltz-2
+Each arm needed its own environment and none of the three could share one.
 
-Needs its own venv: it pins `numpy>=1.26,<2.0`, `einx==0.3.0`, `dm-tree==0.1.8`
-and its own torch, while the complexa venv runs numpy ≥ 2 and torch 2.7.0+cu126
-with openfold/atomworks on top. Resolving them together would downgrade one side,
-so the adapter shells out to a separate interpreter —
-`scripts/cpseq_env_boltz2.sbatch`, installing non-editable from the pinned clone
-so a later `git checkout` in `upstream/` cannot silently change what runs.
+### Why Boltz-2 is isolated
 
-`BOLTZ_CACHE` must point at the cache dir and contain `mols/` extracted from
-`mols.tar`; the env job does that extraction (checked idempotent).
+It pins `numpy>=1.26,<2.0`, `einx==0.3.0`, `dm-tree==0.1.8` and its own torch, while the
+complexa venv runs numpy ≥ 2 and torch 2.7.0+cu126 with openfold/atomworks on top.
+Resolving them together downgrades one side, so the adapter shells out to a separate
+interpreter. Installed non-editable from the pinned clone, so a later `git checkout` in
+`upstream/` cannot silently change what runs.
 
-### AfCycDesign — the cyclic encoding is already in this repo
+**`--no_kernels` is required.** Boltz tries the cuequivariance triangular-multiplication
+kernels and dies in the pairformer with `ModuleNotFoundError: cuequivariance_torch`.
+Installing them is worse than skipping them: `cuequivariance_ops_torch_cu12` 0.13.0
+requires `torch>=2.11` and pulls CUDA 13, which would replace this env's pinned torch and
+the boltz built against it. The kernels are a speed optimisation, not part of the model.
 
-`src/proteinfoundation/evaluation/cyclic_offset.py` already implements the
-AfCycDesign construction (wrap the pairwise sequence offset around the ring for
-the binder block only) and is already wired into
-`src/proteinfoundation/rewards/alphafold2_reward.py` behind a `cyclic_offset`
-flag, with `cyclic_offset_applied` recorded per call. It restricts itself to
-`mainchain` via `CYCLIC_OFFSET_SUPPORTED_TYPES = {"mainchain"}` and says why:
-wrapping the **backbone** offset asserts that residues 0 and L−1 are backbone
-neighbours, which is true only when the closing bond is the peptide bond itself.
-A disulfide or isopeptide ring closes through side chains, so the wrap would
-state something false about the molecule.
+### AfCycDesign — the encoding was already here
 
-This matches the task's constraint that AfCycDesign's head-to-tail positional
-encoding must not be advertised as support for arbitrary crosslinks. The adapter
-work here is therefore *fixed-sequence complex prediction* (design/hallucination
-off), not re-deriving the encoding.
-
-### HighFold3 — two verified constraints
-
-**1. The cyclic module ships only as compiled bytecode.** HighFold3's topology
-control lives in `model/cyclic_peptide_matrix` (`calc_cyclic_matrix_af3`, called
-from `model/features.py:975,982` for both the residue-wise and token-wise
-matrices). The repository contains **only**
-`model/__pycache__/cyclic_peptide_matrix.cpython-311.pyc` — there is no
-`model/cyclic_peptide_matrix.py`. Verified with `git ls-files model` on the
-pinned clone: the `.pyc` is a tracked file and the `.py` is absent.
-
-Consequences, both real:
-- the arm is pinned to **CPython 3.11 exactly** (a `.pyc` only loads under the
-  interpreter whose magic number it was built with — our complexa venv is 3.12);
-- the CycPOEM construction cannot be read as source, so what the flags do must be
-  established behaviourally rather than by reading the implementation.
-
-This is a constraint, not a dead end: a 3.11 venv plus an AF3 install can run it.
-
-**2. Documented topology controls** (`README.md`, and `run_alphafold.py:63,74`,
-`:829`):
-- `--head_to_tail` — bool, "whether the cyclization is in the form of
-  head_to_tail";
-- `--disulfide_chain_res [[1,3,11]]` — `[[chain, Cys_i, Cys_j]]`.
-
-`head_to_tail` is threaded as a single global bool from the flag through
-`featurisation.py:45` → `pipeline.py:156` → `features.py:914` into
-`calc_cyclic_matrix_af3(residue_index, head_to_tail=..., list_cid_ss=...)`. It is
-**not** given a chain id, while the disulfide control **is** (`[[chain, i, j]]`).
-Since `calc_cyclic_matrix_af3` receives only `residue_index` for the head-to-tail
-case, which chain the ring is applied to must be determined by that function from
-where `res_id` restarts — i.e. by chain-boundary inference, not by an argument.
-**Which chain it actually affects is therefore still unverified** and is exactly
-the thing the task says to check: it needs a behavioural test (predict a
-2-chain complex, read back the matrix the module prints — `features.py` already
-`print`s both matrices) before any HighFold3 number enters the dataset.
-
-AF3's genetic databases do not fit the quota (see
-`docs/RESOURCES_COLLECTED.md`); AF3 accepts precomputed alignments inline, so
-MSAs get computed once per target context and cached.
+`src/proteinfoundation/evaluation/cyclic_offset.py` already implements the AfCycDesign
+construction and is already wired into `rewards/alphafold2_reward.py`. It restricts
+itself to `mainchain` and documents why: wrapping the **backbone** offset asserts that
+residues 0 and L−1 are backbone neighbours, true only when the closing bond *is* the
+peptide bond. The new work is the fixed-sequence complex-prediction path, not the
+encoding.
 
 ---
 
-## Chemistry support, as implemented in this project today
+## 2. Chemistry: capability table and specification
 
-The project's own closure chemistries are `mainchain` / `disulfide` /
-`isopeptide` (`src/proteinfoundation/cyclization/constants.py`), with
-`UNSPECIFIED` and `LINEAR` as conditioning-only indices.
+`src/proteinfoundation/cpseq/chemistry.py` is the single table, and it **computes** the
+comparison set rather than asserting it.
 
-Atom-level bonds already pinned in the codebase:
+| | mainchain (head-to-tail amide) | disulfide (SG–SG) | isopeptide |
+|---|---|---|---|
+| **Boltz-2** | `cyclic: true` on the peptide chain | explicit `bond` constraint on the two CYS SG atoms — **not** `cyclic` | expressible as a `bond` constraint |
+| **AfCycDesign** | cyclic sequence-offset wrap | **linear_only** — backbone-only wrap cannot see a side-chain crosslink | **linear_only** |
+| **HighFold3** | `--head_to_tail 1`, peptide first | `--disulfide_chain_res [[1,i,j]]`, peptide first | unsupported |
+| **Rosetta (our scorer)** | strip terminus/cap variants → `declare_chemical_bond(N,C)` | `add_disulfide_bond` | **unsupported** — no residue-connection patch |
 
-| Chemistry | Closing bond | Reference geometry (`cyclization/linkage_geometry.py`) |
-|---|---|---|
-| `mainchain` | `C` of last residue → `N` of first | angles 116.2° / 121.7°, ω ≈ 180° (Engh & Huber) |
-| `disulfide` | `SG`–`SG` | CB-SG-SG 103.8°, CB-SG-SG-CB ≈ ±90°, **sign-symmetric** (both handednesses are real) |
-| `isopeptide` | Lys `NZ` → side-chain carbonyl C (`CG` Asp/Asn, `CD` Glu/Gln) | angles 120° / 117°, planar amide ω ≈ 180° |
+**The cross-model comparison therefore runs on head-to-tail `mainchain`** — the only
+chemistry every predictor *and* the scorer support, and the one the existing CP workflow
+uses. `disulfide` is a **separately labeled subset**: supported by Boltz-2, HighFold3 and
+Rosetta, but `linear_only` for AfCycDesign. `isopeptide` is excluded because **Rosetta
+cannot declare it** — a scorer gap, which is a different reason from a predictor gap, and
+recorded as such.
 
-**Scorer support is narrower than the dataset's chemistry vocabulary.**
-`src/proteinfoundation/evaluation/rosetta_energy.py` declares the closing bond on
-the pose before relax/scoring for `mainchain` (strip terminus variants, then
-`declare_chemical_bond(i,"N",j,"C")`) and `disulfide` (`add_disulfide_bond`), and
-**refuses isopeptide** — an arbitrary Lys-NZ↔Asp/Glu bond needs a residue-
-connection patch plain amino-acid types do not carry. It reports this as
-`binder_rosetta_cyclic_topology_declared=False` rather than scoring a ring that
-was silently left open.
+Atom-level bonds, residue requirements and terminal states are in
+`manifest/chemistry_spec.json`. Terminal state is part of the molecule: a head-to-tail
+ring has **no free termini**, while a side-chain-closed ring keeps both.
 
-So the common supported chemistry across evaluator *and* all three predictors is
-**head-to-tail `mainchain` amide on canonical residues**, which is also the
-chemistry the existing CP workflow uses. `disulfide` is a separate labeled
-subset (supported by Rosetta and by HighFold3's explicit control; **not**
-supported by the AfCycDesign offset wrap, and in Boltz the head-to-tail cyclic
-flag is *not* a substitute for it). `isopeptide` is unsupported by the shared
-evaluator and is marked unsupported rather than scored.
+Chemistry anchors count toward the mutation budget. A terminal disulfide needs CYS at
+both ends; those substitutions are placed and counted *before* any free position is
+drawn, and a band whose budget is smaller than the anchor cost says so rather than
+overspending.
 
 ---
 
-## Reusable pieces found in the repo (do not rewrite)
+## 3. Candidate construction
 
-| Need | Existing code |
-|---|---|
-| Rosetta interface metrics with cyclic bond declared | `evaluation/rosetta_energy.py` — `InterfaceAnalyzerMover`, `pack_separated=True`, `dG_separated`, `dSASA_int`, `delta_unsatHbonds`, `hbonds_int`, `sc_value`, `packstat`, plus `*_norelax` diagnostics so a failed relax stays visible |
-| Closure geometry measurement from a PDB | `evaluation/cyclization_pdb_metrics.py` |
-| Chemistry-specific geometry tolerances | `script_utils/derive_cyclic_thresholds.py` |
-| AF2 cyclic refold + confidence | `rewards/alphafold2_reward.py` (+ `evaluation/cyclic_offset.py`) |
-| Target staging into chain A = receptor / B = binder | `scripts/build_lnr_metadata.py` (coordinates never transformed) |
-| Target-family split material | PepBench `train.cluster` (4,157) / `valid.cluster` (114) — a pre-existing clustering, so no need to invent one |
-| LP references + targets | `/data/user_data/yixiz/LNR` — `test.txt` 93 targets, 96 PDBs (development data) |
-| Slurm conventions | positional **env-file** config (never `sbatch --export`), shared `_*_preamble.sh`, per-shard `rows_<task>.jsonl` so there is one writer per file, `--open-mode=append`, logs under `/home` |
+`src/proteinfoundation/cpseq/candidates.py`. Four things kept honest:
 
-PyRosetta imports in the complexa venv (checked), so the shared evaluator runs
-there as CPU work.
+- **Nominal band is a tag; the row carries the actual integers.** 12.5 % of a 13-mer is
+  1.625 residues, so the row says `n_mutations=2`, `mutation_fraction=0.154`.
+- **Identical replacements are impossible** — draws come from the alphabet minus the
+  residue already present, so a no-op cannot inflate the count.
+- **Collisions merge.** Two bands that round to the same sequence on a short peptide
+  become one row carrying both band tags, not two rows that look independent.
+- **Counts cap at `floor(L/2)`.** Rounding the 50 % band up at odd length gives 7 of 13 =
+  46 % identity, outside the task's retention floor. Verified over L=5…16 and both
+  chemistries: **minimum identity is exactly 0.500.**
+
+CYS is excluded from random draws so no unrequested crosslink partner appears in a
+molecule whose label names one ring.
 
 ---
 
-## First build (config_hash `4207a3085a004bba`)
+## 4. Target contexts and the split
 
-`python script_utils/cpseq_build_dataset.py --out-dir $ZFS/cpseq/tranche1 --n-parents 12`
+**The split is created before any variant exists** — `cpseq_build_dataset.py` runs
+parse → cluster → split → generate, in that order, because variants first and split
+second is how a mutant lands across a boundary from its own reference.
 
 | | |
 |---|---|
 | LNR entries parsed | 93 |
-| parent contexts in the 5–16mer ring range | **63** (30 rejected: 3–4mers and 17–27mers, each with its measured length as the reason) |
-| receptor families | **54**, 5 of them multi-parent |
-| split | `dev` whole — see below |
-| parents selected for the tranche | **12**, one per family, lengths 5,5,6,6,7,8,9,11,11,12,14,16 |
-| mainchain candidates (cross-model set) | **107** |
-| disulfide candidates (labeled subset) | **58** |
-| minimum identity to reference | **0.500** |
+| parent contexts in the 5–16mer range | **63** (30 rejected: 3–4mers and 17–27mers, each with its measured length as the reason) |
+| receptor families | **54**, 5 multi-parent |
+| parents selected | **12**, one per family, lengths 5,5,6,6,7,8,9,11,11,12,14,16 |
+| mainchain candidates | **107** |
+| disulfide candidates | **58** |
+| `config_hash` | `4207a3085a004bba` |
 
-Mainchain is 107 and not 12 × 9 because one parent's bands coincide onto an
-identical sequence; it merges and carries both band tags. Disulfide is smaller by
-construction — two CYS anchors are charged to the budget first, so the low bands
-have nothing left to spend and collapse into the reference arm.
+Mainchain is 107 rather than 12 × 9 because one parent's bands coincide onto an identical
+sequence. Disulfide is smaller by construction: two CYS anchors are charged first, so low
+bands collapse into the reference arm.
 
-Counts are capped at `floor(L/2)`: rounding the 50 % band up at an odd length
-gives 7 of 13, which is 46 % identity and outside the retention constraint. The
-cap binds only at the top band and odd lengths, and says so in `note`.
+**Receptor chain sets are computed from contact with the peptide, not read from
+`test.txt`.** `README_TARGET_DISTRIBUTION_MATCHING.md` records LNR cases where a
+contacting chain was discarded, and dropping a chain that touches the peptide changes the
+pocket. One selected-pool parent has a second contacting chain `test.txt` omits; it is
+kept and noted.
 
-### Missing generalization coverage, stated plainly
+### Two pockets, deliberately
 
-LNR goes to `dev` **whole**. It has already shaped this repository's
-preprocessing and sampling decisions, so a held-out slice of it would not be an
-independent test set. PepBench's `train.cluster` / `valid.cluster` (4,157 / 114)
-are staged and are a pre-existing clustering that could supply disjoint target
-families for a future evaluation split; until those are built into contexts,
-**this tranche supports no generalization claim across target families.**
+Boltz applies `max_distance` between the binder and **each** listed contact. Handing it
+the descriptive 8 Å shell — 27 to 48 residues on these parents — would demand that all of
+them sit within 6 Å of a 5–16mer at once. Nothing satisfies that, and an unsatisfiable
+constraint does not localise a prediction, it distorts it.
 
-### Tool paths in `.env` that do not resolve
+- **descriptive pocket**: full 8 Å shell, 27–48 residues, used to characterise the site.
+- **conditioning pocket**: the **6** nearest genuine contacts (≤ 5 Å to the parent's bound
+  peptide), jointly satisfiable by construction, `force: false`, defined **once per
+  parent** and reused unchanged by every mutant of it.
 
-`MMSEQS_EXEC` and `FOLDSEEK_EXEC` both point into the complexa venv's `bin`, and
-neither binary exists there. `env.sh` exports both regardless. The family split
-has to exist *before* variants are generated, so `contexts.assign_families` falls
-back to a built-in pairwise clustering and records which path ran in
-`clustering_method.json`.
+Both counts are in `manifest/targets.csv`. The pocket localises; it restrains no
+individual peptide residue. Contact retention is not an objective here.
 
-The first fallback put all 63 receptors in **one** family: global alignment
-scatters chance matches across a long receptor, normalising by the shorter
-sequence then clears 0.3 for unrelated pairs, and single linkage chains every
-family together from the first false edge. Local alignment with identity over the
-aligned columns — what mmseqs reports — gives the 54 families above.
+### Shared target conditioning, and one unavoidable difference
+
+Per parent, cached: a **target-only template** (receptor chains only, renumbered 1..N,
+coordinates copied verbatim, peptide chain excluded and the file read back to prove it)
+and **one receptor MSA per unique receptor sequence** — keyed by sequence hash, not parent
+id. **12 searches serve 165 candidates.** Candidate peptides get `msa: empty`: they are
+synthetic sequences with no homologs, so a search each would buy nothing.
+
+> **Conditioning difference, recorded not hidden:** AfCycDesign gets target chains and the
+> target-only template but **no pocket**. ColabDesign's `hotspot` enters the *design
+> loss*, which a fixed-sequence prediction never evaluates, so AF2 has no forward-pass
+> pocket mechanism. Its rows carry `pocket_conditioning: "none"`.
+
+### Generalization coverage — stated plainly
+
+LNR goes to `dev` **whole**. It has already shaped this repository's preprocessing and
+sampling decisions, so a held-out slice of it would not be independent. PepBench's
+`train.cluster` / `valid.cluster` (4,157 / 114) are staged and are a pre-existing
+clustering that could supply disjoint target families later. **Until those are built into
+contexts, this tranche supports no cross-family generalization claim.**
 
 ---
 
-## Status
+## 5. Experimental controls
 
-- [x] Predictor availability measured; two HighFold3 constraints verified
-- [x] Chemistry capability table grounded in this repo's own code, checked against
-      `cyclization.constants`
-- [x] Candidate builder (bands, seeds, anchor accounting, dedup, identity floor)
-- [x] Parent contexts, receptor families, split — built **before** variants
-- [x] First skeleton build: 12 parents, 165 candidates
-- [x] Boltz-2 adapter: inputs verified for both chemistries
-- [ ] Boltz-2 env (job `10860559`, still `PENDING` on `preempt`)
-- [ ] AfCycDesign adapter (encoding already in repo; needs fixed-sequence complex path)
-- [ ] HighFold3 / AF3 env (needs CPython 3.11 + AF3 install; MSAs precomputed)
-- [ ] Target-only templates + cached receptor MSAs per parent
-- [ ] Shared chemistry-aware evaluator
-- [ ] Per-predictor end-to-end preflight on shared cases
-- [ ] Bounded first tranche (cap: 24 GPU-h, 300 CPU core-h)
-- [ ] ~6 experimental CP–target complexes as technical controls
+**Nothing staged in this project is an experimental CP–target complex.** CPSea_PDB's
+entries are `<PDB>_<chain>_<start>_<end>_relaxed` — fragments cut from PDB proteins and
+computationally cyclized — and CPBind's are AFDB accessions given the same treatment.
+Useful data, not ground truth for a macrocycle.
+
+So controls come from an RCSB structural query and each is **verified by measurement**
+with our own evaluator before acceptance: the ring must close inside this repo's own
+window or it is rejected with its measured distance as the reason. A literature claim of
+cyclicity does not get a structure in.
+
+The first pass returned 1SLD, 1VWB, 1VWN and 1VWC — four depositions of the *same* CHPQFC
+peptide on the same receptor, which would have made six controls look far more diverse
+than they are. Deduplicated by (peptide, receptor):
+
+| PDB | chain | chemistry | L | sequence | closure bond |
+|---|---|---|---|---|---|
+| 5TU6 | B | mainchain | 7 | INPYLYP | 1.339 Å |
+| 7K2M | P | mainchain | 7 | GEPETGE | 1.311 Å |
+| 7K2F | C | mainchain | 7 | GAEETGE | 1.554 Å |
+| 1SFI | I | mainchain | 14 | GRCTKSIPPICFPD | 1.334 Å |
+| 1SLD | P | disulfide | 6 | CHPQFC | 2.048 Å |
+| 1SLE | M | disulfide | 8 | CHPQGPPC | 2.026 Å |
+
+These check **implementation and capability**, not prospective accuracy. All predate the
+predictors' training data and may sit inside it.
+
+---
+
+## 6. The shared evaluator
+
+One evaluator, applied identically to every arm. It does not know which predictor made
+the structure it is given: same scorefunction (`ref2015`), same relax budget
+(`FastRelax`, 1 repeat, restrained to input coordinates), same peptide topology, same
+protonation policy (the shared PyRosetta init flags, recorded per row), same target
+flexibility. Predictor-specific steering lives in the *prediction* record, in a different
+file, so the two cannot be confused.
+
+**Raw and refined are both kept**, with how far refinement moved the structure
+(`binder_ca_rmsd_A`, `receptor_ca_rmsd_A`, `total_score_delta`), so a pose rescued by
+relax cannot pass as a good prediction.
+
+- **Validity/closure** — exact sequence, required atoms, closure bond **length and both
+  angles and the torsion**, stereochemistry, backbone geometry, severe intra/inter
+  clashes. Distance alone is not closure (§8 shows exactly why).
+- **Interface energetics** — `dG_separated`, `dSASA_int`, and `dG_separated/dSASA_int ×
+  100`, the last **null** (never 0 or ∞) when `dSASA_int ≤ 0`. Raw energy and area both
+  kept. These are **Rosetta proxies, not measured binding free energies.**
+- **Interface quality** — `delta_unsatHbonds`, `hbonds_int`, `sc_value`, `packstat`, the
+  exact InterfaceAnalyzer definitions.
+- **Peptide deformation** — the bound peptide is extracted **with its ring re-declared**
+  (a split chain does not carry a declared bond, and without this every macrocycle would
+  score strain-free), then relaxed without the receptor under the same budget. Labelled
+  `local_deformation_energy_proxy`, `is_thermodynamic_free_energy: false`: the reference
+  is the nearest free minimum to the bound pose, not a global unbound state.
+- **Reliability** — per-predictor confidences in their own columns, sample spread,
+  cross-predictor agreement with the **receptor** aligned.
+
+Restraints are recorded, and reported energies are read with a scorefunction carrying
+zero constraint weight, so no restraint term is ever counted as physical energy.
+
+### Frozen tolerances
+
+`manifest/geometry_tolerances.json`, written once then read-only. Bond windows are the
+project standard; angle and torsion tolerances sit at the **worst experimental control
+plus 5 %**, the way `derive_cyclic_thresholds.py` does it.
+
+| chemistry | bond window | angle tol | torsion tol | n_controls |
+|---|---|---|---|---|
+| mainchain | 1.1–1.6 Å | ±7.54° | ±8.44° | 4 |
+| disulfide | 1.8–2.3 Å | ±8.98° | ±55.46° | 2 |
+| isopeptide | 1.1–1.6 Å | ±25° (fallback) | ±60° (fallback) | 0 |
+
+The wide disulfide torsion is real — CB-SG-SG-CB genuinely occurs at both ±90°, and the
+check folds the two signs together. `n_controls` travels with the numbers so a bar set
+from two structures is visible as such.
+
+A missing atom, a failed refinement, an undeclarable ring and an absent score are **not**
+successful closure; each is recorded with its reason. A prediction failure is **not** an
+experimental nonbinder label.
+
+---
+
+## 7. Verified findings
+
+### Boltz-2: its two cyclic controls are not equally reliable
+
+First real comparison, `lnr_1elr`, 2 samples each:
+
+| chemistry | closure bond | reference | angles | torsion | clashes |
+|---|---|---|---|---|---|
+| mainchain | 1.337, 1.342 Å | 1.33 | 122/118 vs 121.7/116.2 | near trans | 0 intra |
+| disulfide | 1.454, 3.584 Å | 2.05 | 85–95 vs 103.8 | — | 1, 3 intra |
+
+The native `cyclic` flag closes the amide essentially perfectly. The explicit SG–SG
+`bond` constraint does not — one sample too short to be a bond, one too long to be one.
+**This is the concrete reason the two chemistries had to stay separate arms** rather than
+one "cyclic" bucket.
+
+### AfCycDesign: a ring at the right distance pointing the wrong way
+
+`lnr_1elr`, mainchain: closure bond **1.251 Å — inside the 1.1–1.6 Å window** — while the
+closure angles are off by **46.65°** and **28.66°** and the torsion by **135.42°**. A
+distance-only check would have called that closed. It is two atoms near the right
+distance in a chemically impossible arrangement, and it is why closure is measured as
+length *and* angles *and* torsion.
+
+The same samples show `dSASA_int = 0.0`, `nres_int = 0.0`, `i_ptm = 0.10` with
+`pLDDT = 0.95`: the peptide is confidently **folded** but not **docked**. Being quantified
+across the whole arm before it enters the results as a property rather than an anecdote.
+
+### AfCycDesign yields 2 samples, not 4 — measured both ways
+
+ColabDesign loads `model_{1,2}_ptm` when `use_templates=True` and `[1,2,3,4,5]` only when
+it is False (`af/model.py:110-117`) — those are the monomer-ptm sets carrying template
+weights. The binder protocol here *is* templated, so exactly 2 parameter sets exist;
+asking for models 2+ raised `IndexError`, and no `num_models` argument changes it.
+
+Re-seeding is not a substitute: the same parameter set at seed 42 and seed 777 gave
+peptide CA coordinates identical to **0.000000 Å**. So `SAMPLE_CEILING = 2`, and
+**best-of-2 is kept distinct from best-of-4** throughout the summaries.
+
+### HighFold3: the ring lands on the FIRST chain, and the disulfide chain field is ignored
+
+HighFold3's entire cyclic behaviour lives in `model/cyclic_peptide_matrix`, which ships
+**only** as `model/__pycache__/cyclic_peptide_matrix.cpython-311.pyc` — no `.py` is
+tracked. So the flags cannot be read, only exercised. The bytecode loads under CPython
+3.11, and its own traceback reveals where it was built:
+`/home/admin/.conda/envs/af3-cs/lib/python3.11/site-packages/alphafold3/model/cyclic_peptide_matrix.py`.
+
+Probing `calc_cyclic_matrix_af3` on both the residue-wise and token-wise paths
+`features.py:975,982` calls:
+
+1. **The matrix is sized from where `residue_index` returns to 1, so the ring is applied
+   to the first chain.** Peptide first + receptor second → 5×5, a correct wrapped ring on
+   the 5-mer. Receptor first → 8×8, and the ring lands on the **receptor** while the
+   peptide stays linear.
+
+   **This is the trap, and it is silent.** `--head_to_tail` takes no chain argument, AF3's
+   own examples list the protein first, and the wrong ordering still produces confident
+   output — for a cyclized target protein. The adapter writes the peptide first, and that
+   is not a style choice.
+
+2. **`--disulfide_chain_res`'s documented chain field is ignored.** `[[1,1,6]]` and
+   `[[2,1,6]]` return bit-identical matrices on both paths. The crosslink always goes to
+   the first chain's block, so correctness again rests on ordering.
+
+3. Residue indices are **1-based** (`[[1,2,5]]` sets the ±1 offset between 0-based rows 1
+   and 4).
+
+4. With no topology requested the function returns `[[0]]` — a 1×1 placeholder, so a naive
+   elementwise diff against the "linear" case broadcasts instead of comparing.
+
+Where it is applied the encoding is correct, and `list_cid_ss` encodes a **side-chain**
+crosslink as a graph shortest path — exactly what the AF2 offset wrap cannot express, and
+why HighFold3 can represent a disulfide ring that AfCycDesign genuinely cannot.
+
+`adapters/highfold3.probe_cyclic_matrix()` re-runs all of this as a check, so a different
+HighFold3 revision can be re-established rather than trusted from a docstring.
+
+**Runtime version constraint, pinned from real history.** The bytecode needs CPython
+3.11; current AF3 (`131ab9e7`) sets `requires-python = ">=3.12"`; AF3 `a8ecdb2d`
+(2025-09-08, the last revision before HighFold3's snapshot) allows `>=3.11` with
+`jax==0.4.34` and `dm-haiku==0.0.13`. The cluster has only 3.12, so the interpreter comes
+from python-build-standalone. AF3's genetic databases are **not** fetched —
+`installation.md` wants up to 1 TB against a 500 GB quota with ~225 GB free — and
+alignments are supplied from the same per-target cache the other arms use.
+
+### Environment traps worth recording
+
+- **`MMSEQS_EXEC` and `FOLDSEEK_EXEC` point at binaries that do not exist.** `env.sh`
+  exports both regardless. The family split must exist before variants, so
+  `contexts.assign_families` falls back to a built-in pairwise clustering and records
+  which path ran in `clustering_method.json`. The first fallback put all 63 receptors in
+  **one** family — global alignment scatters chance matches across a long receptor,
+  normalising by the shorter sequence clears 0.3 for unrelated pairs, and single linkage
+  chains every family together from the first false edge. Local alignment with identity
+  over aligned columns (what mmseqs reports) gives the 54 families above.
+- **gemmi 0.6.5 misreads a spec-correct SEQRES block.** A 128-token SEQRES came back as
+  129 residues (one extra LYS) while the deposited 1elr.pdb read exactly right (131 =
+  131); byte-diffing showed identical layout. Boltz reads a PDB template by converting it
+  with gemmi and aligning the entity's `full_sequence`, so this matters: a template
+  sequence *longer* than its coordinates does not crash, it silently inserts unresolved
+  residues. Templates are therefore handed to Boltz as **CIF** with the entity sequence
+  derived from the model and verified equal to the polymer length on read-back.
+- **PyRosetta 2026.39 dropped `InterfaceAnalyzerMover`'s string constructor** for a
+  `DockingPartners` object. `evaluation/rosetta_energy.py` still passes a string, so the
+  repo's existing Rosetta path does not run on the installed build either. Handled with
+  the typed factory plus a fallback.
+- **`packstat` returns 0.0 unless requested.** An uncomputed default, not a value, which
+  would have read dataset-wide as a perfectly unpacked interface.
+  `set_compute_packstat(True)` gives 0.76 on a crystal interface.
+- **Rosetta types LNR 1elr's peptide as `MET:AcetylatedNtermProteinFull`** and declaring a
+  head-to-tail bond exits the process with "doesnt have connection at N" and no
+  traceback. Chemical caps are now stripped alongside plain terminus variants — and their
+  removal is **reported**, because stripping an acetyl changes which molecule was scored.
+- **The interactive node-hold job has 8 GiB, not the 32 GB squeue suggests.** Boltz-2 was
+  OOM-killed there at exactly that ceiling (`oom_kill 2`, `memory.peak 8589303808`) after
+  processing its inputs fine. `sacct` then put the successful step at **11.0 GiB**
+  MaxRSS, which is how the sbatch request was sized (32 G, down from a guessed 48 G).
+
+---
+
+## 8. Architecture
+
+```
+src/proteinfoundation/cpseq/
+  chemistry.py      capability table + atom-level chemistry spec; computes the
+                    cross-model chemistry set rather than asserting it
+  candidates.py     mutation bands, seeds, anchor accounting, dedup, identity floor
+  contexts.py       parent contexts, receptor families, split (before variants)
+  targets.py        target-only templates, CIF companion, cached per-target MSAs,
+                    conditioning pocket
+  geometry.py       measures validity/closure; decides nothing
+  tolerances.py     frozen thresholds + the verdict that applies them
+  scorer.py         the one shared chemistry-aware evaluator
+  adapters/
+    boltz2.py       cyclic flag for the amide, atom-pair bond for the disulfide
+    afcycdesign.py  fixed-sequence complex prediction + the existing cyclic offset
+    highfold3.py    peptide-first input, verified topology flags, probe
+
+script_utils/
+  cpseq_build_dataset.py      parents → families → split → candidates
+  cpseq_prepare_targets.py    templates + MSA cache
+  cpseq_fetch_controls.py     RCSB search → verify by measurement
+  cpseq_freeze_tolerances.py  derive from controls, freeze
+  cpseq_predict.py            stage 1, resumable, sharded, capability-gated
+  cpseq_score.py              stage 2, resumable per sample
+  cpseq_summarize.py          stage 3, joined tables
+
+scripts/
+  cpseq_env_boltz2.sbatch     isolated Boltz-2 env
+  cpseq_env_highfold3.sbatch  CPython 3.11 + AF3 a8ecdb2d + HighFold3 overlay
+  cpseq_predict.sbatch        GPU prediction, array-sharded
+```
+
+Prediction and scoring are **separate stages**, so rescoring never re-runs a predictor.
+Task ids are `sha256(candidate, predictor, chemistry, revision, config)`, and the config
+hash is part of the **output path** too — without that, a re-run at a different sample
+count finds the old record and skips, leaving the tranche silently mixing settings.
+
+---
+
+## 9. Commands
+
+```bash
+cd /home/yixiz/Proteina-Complexa && source env.sh
+
+# one-time environments
+sbatch scripts/cpseq_env_boltz2.sbatch
+sbatch scripts/cpseq_env_highfold3.sbatch
+
+# dataset skeleton: parents -> families -> split -> candidates
+.venv/bin/python script_utils/cpseq_build_dataset.py \
+    --out-dir $ZFS/cpseq/tranche1 --n-parents 12
+
+# shared target conditioning (cached; re-running is nearly free)
+.venv/bin/python script_utils/cpseq_prepare_targets.py \
+    --out-dir $ZFS/cpseq/tranche1 \
+    --boltz-python $ZFS/envs/boltz2/.venv/bin/python
+
+# experimental controls, verified by measurement
+.venv/bin/python script_utils/cpseq_fetch_controls.py \
+    --out-dir $ZFS/cpseq/controls --n 6
+
+# freeze tolerances (once per tranche)
+.venv/bin/python script_utils/cpseq_freeze_tolerances.py \
+    --dataset-dir $ZFS/cpseq/tranche1 --controls $ZFS/cpseq/controls/controls.json
+
+# stage 1 -- prediction
+sbatch --array=0-3 scripts/cpseq_predict.sbatch PREDICTOR=boltz2 SHARD_COUNT=4 SAMPLES=4
+sbatch --array=0-3 scripts/cpseq_predict.sbatch PREDICTOR=afcycdesign SHARD_COUNT=4 SAMPLES=4
+#   LIMIT=2 for a preflight; FORCE=1 to re-run after an adapter fix
+
+# stage 2 -- scoring (CPU; rescoring never re-predicts)
+.venv/bin/python script_utils/cpseq_score.py \
+    --dataset-dir $ZFS/cpseq/tranche1 --predictor boltz2 --shard-index 0 --shard-count 1
+
+# stage 3 -- tables
+.venv/bin/python script_utils/cpseq_summarize.py --dataset-dir $ZFS/cpseq/tranche1
+```
+
+### To expand the tranche
+
+Raise `--n-parents` (63 LNR parents qualify, 54 families) and re-run
+`cpseq_build_dataset.py` → `cpseq_prepare_targets.py` → the prediction arrays. Existing
+work is skipped by record, so expansion is incremental. For a genuine held-out split,
+build contexts from PepBench's `train.cluster`/`valid.cluster` and pass
+`dev_fraction < 1.0` to `contexts.split_by_family`.
+
+---
+
+## 10. Status
+
+- [x] Predictor availability measured; all three arms' chemistry capability verified
+- [x] Chemistry capability table + spec, checked against `cyclization.constants`
+- [x] Candidate builder (bands, seeds, anchors, dedup, ≥50 % identity floor)
+- [x] Parent contexts, 54 receptor families, split built **before** variants
+- [x] Shared target conditioning: target-only templates + 12 cached MSAs for 165 candidates
+- [x] Six experimental controls, each verified by measurement, deduplicated by system
+- [x] Frozen chemistry-specific tolerances with provenance
+- [x] Shared chemistry-aware evaluator (validity, interface, quality, deformation)
+- [x] Boltz-2 adapter — running, both chemistries
+- [x] AfCycDesign adapter — running, mainchain (2-sample ceiling recorded)
+- [x] HighFold3 adapter + topology verification; runtime build attempted
+- [ ] Full first-tranche collection and scoring (in progress — §11)
+- [ ] Cross-predictor pose agreement on the full set
+- [ ] PepBench-derived held-out target families
+
+---
+
+## 11. Results
+
+*Collection is in progress; this section is filled from
+`tables/sequence_summaries.csv` once the arrays complete. Measured compute and
+completion/validity rates per arm go here, with best-of-2 and best-of-4 reported
+separately.*
