@@ -96,6 +96,24 @@ def parse_args() -> argparse.Namespace:
                         "this eval inside an 8 GiB allocation; 0 keeps it in-process.")
     p.add_argument("--batch-size", type=int, default=None,
                    help="Override the training config's batch size (stored runs use 16).")
+    p.add_argument("--cyclization-target-type",
+                   choices=("mainchain", "disulfide", "isopeptide", "unspecified", "linear"),
+                   default=None,
+                   help="Topology REQUEST for rows whose data carries no cyclization label. "
+                        "Ground-truth type comes only from CONECT records, so a corpus "
+                        "without them (LNR crystal peptides) otherwise falls back to "
+                        "`cyclization.target_type`, which is None in every CPSea config and "
+                        "resolves to UNSPECIFIED -- the classifier-free-guidance null, i.e. "
+                        "'model's choice'. `is_ring_request` is False for it, so the ring "
+                        "positional encoding and typed pair channels switch off too, and no "
+                        "ring was ever asked for. Pass `mainchain` to make an LP->CP run "
+                        "actually request a head-to-tail ring. Rows that DO carry a label "
+                        "(CPSea) keep it, per `apply_cyclization_type_conditioning`.")
+    p.add_argument("--keep-dataset-filters", action="store_true",
+                   help="retain the checkpoint's training-time metadata row filters. Off by "
+                        "default: the supplied test parquet is this run's row selection, and "
+                        "an inherited filter either silently drops rows from it or, when it "
+                        "names a column the test metadata lacks, kills the run.")
     p.add_argument("--device", default="cuda")
     p.add_argument("--dry-run", action="store_true", help="Build the subset, print plan, no GPU.")
     return p.parse_args()
@@ -251,6 +269,52 @@ def main() -> int:
     dm = cfg_exp.dataset.unified.datamodule
     dm.metadata_file = str(subset_parquet)
     dm.val_metadata_file = str(subset_parquet)
+
+    # Training-time ROW filters do not survive the repointing above, and must not.
+    # `--test-parquet` plus the stratified subset is already an explicit statement of
+    # which rows to evaluate; a filter inherited from training then silently removes some
+    # of them, so the caller asks for 6 complexes and gets an unexplained smaller number.
+    #
+    # This is not hypothetical: `cpsea_lpmix_from_v4cfg` trained on a mixed corpus and
+    # carries `val_filters: ["dataset_source == 'cpsea'"]`. Evaluated on an LNR subset,
+    # whose metadata has no `dataset_source` column at all, pandas raises
+    # `UndefinedVariableError: name 'dataset_source' is not defined` and the run dies
+    # before sampling. The alternative -- adding a `dataset_source: cpsea` column to the
+    # LNR metadata to satisfy the filter -- would label crystal LNR complexes as CPSea
+    # entries, which is a false provenance claim in the one file that records what was
+    # evaluated. So the filters are dropped and the drop is reported.
+    if not args.keep_dataset_filters:
+        for node_name, node in (
+            ("dataset.unified.datamodule", dm),
+            ("dataset.datamodule", cfg_exp.dataset.get("datamodule")),
+        ):
+            if node is None:
+                continue
+            for key in ("filters", "val_filters"):
+                if node.get(key):
+                    logger.warning(
+                        "dropping {}.{} = {} -- the test parquet is the row selection "
+                        "for this run (use --keep-dataset-filters to retain them)",
+                        node_name, key, list(node[key]),
+                    )
+                    node[key] = None
+
+            # `source_fractions` is the TRAINING mixture (for lpmix: cpsea 0.75,
+            # pepbench 0.06, protfrag 0.19). It is consumed by
+            # `StructureDataModule._compute_sample_weights` to weight the TRAIN dataset
+            # -- which this run never touches, because only `val_dataloader()` is called.
+            # Left in place it is not merely wasted: it hard-fails on any metadata
+            # without a `dataset_source` column, so a mixed-corpus checkpoint cannot be
+            # evaluated on a single-source test set at all. Sampling weights over an
+            # unused split cannot change what the model generates, so this is dropped
+            # with the filters and for the same reason.
+            if node.get("source_fractions"):
+                logger.warning(
+                    "dropping {}.source_fractions = {} -- a training mixture weight, "
+                    "applied to the unused train split in a scoring run",
+                    node_name, dict(node["source_fractions"]),
+                )
+                node["source_fractions"] = None
     if args.num_workers is not None:
         for node in (cfg_exp.dataset.datamodule, dm):
             if node is not None and "num_workers" in node:
@@ -261,6 +325,43 @@ def main() -> int:
             if node is not None and "batch_size" in node:
                 node.batch_size = args.batch_size
         logger.warning("batch_size overridden to {}", args.batch_size)
+
+    if args.cyclization_target_type is not None:
+        from proteinfoundation.cyclization.constants import (
+            DISULFIDE, ISOPEPTIDE, LINEAR, MAINCHAIN, UNSPECIFIED,
+        )
+        _IDX = {"mainchain": MAINCHAIN, "disulfide": DISULFIDE, "isopeptide": ISOPEPTIDE,
+                "unspecified": UNSPECIFIED, "linear": LINEAR}
+        idx = _IDX[args.cyclization_target_type]
+        if cfg_exp.get("cyclization") is None:
+            logger.error("--cyclization-target-type given but this config has no "
+                         "`cyclization` section; the request would be silently dropped.")
+            return 1
+        prev = cfg_exp.cyclization.get("target_type")
+        cfg_exp.cyclization.target_type = int(idx)
+        logger.warning(
+            "cyclization.target_type {} -> {} ({}): rows WITHOUT a CONECT-derived label "
+            "now request this topology instead of falling back to UNSPECIFIED. Rows that "
+            "carry their own label keep it.",
+            prev, args.cyclization_target_type, int(idx),
+        )
+        # A 4-row cyclization embedding predates LINEAR(4) and cannot represent it; index
+        # 4 into it is a device-side assert, not a wrong answer. Checked here because the
+        # failure surfaces deep in a CUDA kernel with no usable stack trace.
+        if idx >= 4:
+            import torch as _t
+            _sd = _t.load(str(ckpt_path), map_location="cpu", mmap=True,
+                          weights_only=False).get("state_dict", {})
+            for _k, _v in _sd.items():
+                if _k.endswith("cond_factory.feat_creators.2.embedding.weight"):
+                    if _v.shape[0] <= idx:
+                        logger.error(
+                            "{} has a {}-row cyclization embedding and cannot represent "
+                            "index {} ({}). Refusing rather than triggering a CUDA "
+                            "device-side assert.", ckpt_path.name, _v.shape[0], idx,
+                            args.cyclization_target_type)
+                        return 1
+                    break
 
     # Rebuild the model exactly as it trained; only the val-generation sampler bookkeeping moves.
     vg = cfg_exp.val_generation

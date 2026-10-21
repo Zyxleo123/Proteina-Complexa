@@ -138,6 +138,22 @@ def main() -> None:
     ap.add_argument("--ckpt-step", type=int, default=None)
     ap.add_argument("--out", type=Path, default=None)
     ap.add_argument("--chemistry", default="mainchain")
+    # Conditioning and the sampling settings were hardcoded into every row's `config`
+    # when this script served exactly one run. An UNCONDITIONAL generator (no
+    # `--seq-cond`, which is the default mode of `eval_val_gen_testset.py`) designs its
+    # own peptide, so recording `seq_cond: true`, `n_mutations: 0` and
+    # `is_reference: true` for it would assert that the model had been handed the
+    # parent's LP sequence and returned it unchanged -- three false provenance claims on
+    # a row whose energy is otherwise perfectly usable.
+    ap.add_argument(
+        "--conditioning",
+        choices=("seq_cond", "partial_seq_cond", "unconditional"),
+        default="seq_cond",
+        help="what the generator was actually given; recorded per row",
+    )
+    ap.add_argument("--keep-frac", type=float, default=1.0)
+    ap.add_argument("--n-repeat", type=int, default=4)
+    ap.add_argument("--nsteps", type=int, default=400)
     args = ap.parse_args()
 
     tol_set = tolmod.load(args.dataset_dir / "manifest" / "geometry_tolerances.json")
@@ -189,9 +205,58 @@ def main() -> None:
                 n_skip += 1
                 continue
 
-            requested = info["reference_sequence"]
+            original = info["reference_sequence"]
             got = sequence_of(read_chain(pdb, binder_chain))
-            rec = recovery(requested, got)
+
+            if args.conditioning == "partial_seq_cond":
+                # Only PART of the sequence was revealed, so the decoded sequence is
+                # neither a request to comply with nor a free design. Scoring it against
+                # the full LP (the seq_cond branch) would fail the exact-sequence gate on
+                # every intentionally designed residue and report 0 % validity for a run
+                # that was asked to design -- geometry would never be reached. So the
+                # structure is scored as the molecule it is, and compliance is reported
+                # separately as `cond_recovery` against the LP, which at reveal fraction
+                # f should sit near f + (1-f)*chance if the model designed the rest.
+                requested = None
+                rec = recovery(original, got)
+                requested_for_scoring = got
+                seq_check_note = (
+                    f"PARTIAL reveal (keep_frac={args.keep_frac}): the exact-sequence gate "
+                    f"is scored against the DECODED sequence, so it is vacuous; compliance "
+                    f"is cond_recovery vs the LP, and n_mutations is the distance from it"
+                )
+            elif args.conditioning == "seq_cond":
+                # The model was handed this sequence; compliance is the question.
+                requested = original
+                rec = recovery(original, got)
+                # Scored against what was ASKED, so a model that designed its own
+                # peptide fails the exact-sequence check rather than being scored as
+                # though it had complied.
+                requested_for_scoring = original
+                seq_check_note = "exact-sequence check is meaningful (sequence was requested)"
+            else:
+                # Nothing was requested, so there is nothing to comply with. The decoded
+                # sequence IS the output, and it is scored as itself; the exact-sequence
+                # gate inside `verdict` is therefore vacuous here and is labelled as
+                # such, so a reader cannot mistake it for demonstrated compliance.
+                requested = None
+                rec = None
+                requested_for_scoring = got
+                seq_check_note = (
+                    "exact-sequence check is VACUOUS (unconditional generation: the "
+                    "decoded sequence is the output, not a request)"
+                )
+
+            # Distance from the parent's original LP sequence. For an unconditional
+            # sample this is a measurement of what the model chose, not a mutation
+            # instruction, and it is what decides whether the sample could serve as a
+            # candidate under this project's floor(L/2) substitution ceiling.
+            n_mut = (
+                sum(1 for a, b in zip(original, got) if a != b)
+                if len(original) == len(got)
+                else None
+            )
+            budget = len(original) // 2
 
             t0 = time.time()
             val = validity_report(
@@ -199,7 +264,7 @@ def main() -> None:
                 binder_chain=binder_chain,
                 receptor_chains=target_chains,
                 chemistry=args.chemistry,
-                requested_sequence=requested,
+                requested_sequence=requested_for_scoring,
             )
             verd = tolmod.verdict(val, tol)
             sc = score_structure(
@@ -207,7 +272,7 @@ def main() -> None:
                 binder_chain=binder_chain,
                 receptor_chains=target_chains,
                 chemistry=args.chemistry,
-                requested_sequence=requested,
+                requested_sequence=requested_for_scoring,
                 refined_out_path=str(pdb.with_suffix("")) + "_refined.pdb",
                 isolated_out_path=str(pdb.with_suffix("")) + "_isolated_relaxed.pdb",
                 deformation_cache=deformation_cache,
@@ -224,21 +289,37 @@ def main() -> None:
                 "predictor_revision": f"step={args.ckpt_step}" if args.ckpt_step else None,
                 "input_hash": None,
                 "config": {
-                    "seq_cond": True,
-                    "keep_frac": 1.0,
-                    "nsteps": 400,
-                    "n_repeat": 4,
+                    "conditioning": args.conditioning,
+                    "seq_cond": args.conditioning in ("seq_cond", "partial_seq_cond"),
+                    "keep_frac": (
+                        args.keep_frac
+                        if args.conditioning in ("seq_cond", "partial_seq_cond") else None
+                    ),
+                    "nsteps": args.nsteps,
+                    "n_repeat": args.n_repeat,
                     "ckpt_step": args.ckpt_step,
                 },
+                "sequence_check_note": seq_check_note,
+                "original_lp_sequence": original,
+                "within_substitution_budget": (
+                    None if n_mut is None else bool(n_mut <= budget)
+                ),
+                "substitution_budget": budget,
                 # Not the same conditioning as the other arms, and said so rather than
                 # implied: this model gets the receptor as x_target with the crop centred
                 # on the binder site, not a target-only template plus a pocket constraint.
                 "pocket_conditioning": "crop_centred_on_binder_site (x_target receptor)",
                 "sequence_requested": requested,
-                "peptide_length": len(requested),
-                "n_mutations": 0,
-                "mutation_fraction": 0.0,
-                "is_reference": True,
+                "peptide_length": len(got),
+                "n_mutations": n_mut,
+                "mutation_fraction": (
+                    None if n_mut is None else round(n_mut / len(original), 6)
+                ),
+                # A reference row is the UNMUTATED sequence returned under sequence
+                # conditioning. An unconditional sample is never that, even when it
+                # happens to decode zero substitutions away from the original.
+                "is_reference": args.conditioning == "seq_cond" and n_mut == 0,
+                "conditioning_mode": args.conditioning,
                 "sample_index": int(row.get("bid", -1)),
                 "sample_identity": {"step": row.get("step"), "rank": row.get("rank"),
                                     "bid": row.get("bid")},
@@ -249,7 +330,11 @@ def main() -> None:
                 # The compliance question this arm uniquely has.
                 "sequence_generated": got,
                 "cond_recovery": rec,
-                "sequence_matches": bool(got == requested),
+                # None, not False, when nothing was requested. `False` would assert that
+                # the model was asked for a sequence and returned a different one, which
+                # is a compliance failure; an unconditional sample has no request to
+                # fail. The vacuity is also stated in `sequence_check_note`.
+                "sequence_matches": (None if requested is None else bool(got == requested)),
                 "valid": bool(verd["valid"]),
                 "validity_checks": verd["checks"],
                 "validity_reasons": verd["reasons"],

@@ -128,8 +128,34 @@ def get_cb_position(
     virtual_cb = virtual_cb_from_backbone(
         atom37[..., N_IDX, :], atom37[..., CA_IDX, :], atom37[..., C_IDX, :]
     )
-    cb_pos = torch.where(cb_is_real[..., None], real_cb, virtual_cb)
-    return cb_pos, cb_is_real
+
+    # The mask alone is not enough when `atom37` is a PREDICTED structure.
+    #
+    # Callers pass ONE ground-truth-derived mask for both structures, on the documented
+    # assumption that "predicted structures are decoded at the same residue/atom slots".
+    # That holds for reconstruction, where the predicted sequence IS the ground-truth
+    # sequence. It fails for generation: a model that decodes its own residue types can
+    # put a glycine where the ground truth has a non-glycine, and then the mask asserts a
+    # Cb that the decode never filled. The slot is read anyway and whatever is in it --
+    # typically all-zeros -- becomes the Cb position.
+    #
+    # Measured consequence before this guard: on 12 unconditional samples the terminal
+    # Cb-Cb distance was reported as 0.000 A for affected residues, which drove
+    # `cyc_cb_window_success` to 0.0 while a direct measurement of the written structures
+    # put 9/12 inside the 3-8 A window. See `script_utils/test_cyclic_cb_metric_mask.py`.
+    #
+    # So a slot is only trusted when it is BOTH masked-in and actually populated. An
+    # unfilled slot falls back to the virtual Cb built from that same structure's own
+    # backbone, which is always decoded -- the same fallback glycine already uses, and the
+    # convention CPSea itself applies for glycine.
+    cb_finite = torch.isfinite(real_cb).all(dim=-1)
+    cb_nonzero = (real_cb != 0).any(dim=-1)
+    cb_usable = cb_is_real & cb_finite & cb_nonzero
+
+    cb_pos = torch.where(cb_usable[..., None], real_cb, virtual_cb)
+    # The second return value reports what was USED, so a caller that logs it sees the
+    # fallback rather than the mask's claim about it.
+    return cb_pos, cb_usable
 
 
 def _per_structure_coord_errors(
