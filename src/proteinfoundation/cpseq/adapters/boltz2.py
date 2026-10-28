@@ -40,6 +40,8 @@ import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import numpy as np
+
 from proteinfoundation.cpseq.chemistry import (
     CHEMISTRIES,
     DISULFIDE,
@@ -205,26 +207,33 @@ def input_hash(yaml_text: str, config: Boltz2Config) -> str:
     return hashlib.sha256(payload.encode()).hexdigest()[:16]
 
 
-def predict(
+def _predict_cmd(
     *,
-    yaml_path: Path,
+    target: Path,
     out_dir: Path,
     config: Boltz2Config,
     python_exec: str,
     boltz_cache: str | Path,
-    devices: int = 1,
-    accelerator: str = "gpu",
-    timeout_s: int = 7200,
-) -> dict:
-    """Run one boltz prediction. Returns a status record; never raises on model failure.
+    devices: int,
+    accelerator: str,
+    preprocessing_threads: int = 1,
+) -> list[str]:
+    """The boltz command line. `target` is one yaml, or a directory of them.
 
-    `--diffusion_samples` is how the four samples per candidate are produced: boltz runs
-    the trunk once and draws that many structures from it, which is the shared-preprocessing
-    multi-sample inference the task asks for rather than four independent invocations.
+    Shared by the single and batched paths deliberately: the inference settings are part
+    of the prediction cache key, so a flag present on one path and absent from the other
+    would produce structures that the cache treats as interchangeable and are not.
+
+    `--preprocessing-threads 1` is why a batch fits in memory. Pointed at a directory,
+    boltz preprocesses the inputs in parallel -- "Processing 9 inputs with 9 threads" --
+    and each thread holds its own copy of the working set, so peak memory scales with the
+    batch while a single-input run never shows the problem. Measured: 9 inputs in a 32 GB
+    task died with SIGKILL (rc -9) in 5-7 s, having produced nothing. Serialising
+    preprocessing costs a few seconds per batch and leaves the saving intact, because
+    what the batch is amortising is the model load, not the preprocessing.
     """
-    out_dir.mkdir(parents=True, exist_ok=True)
     cmd = [
-        python_exec, "-m", "boltz.main", "predict", str(yaml_path),
+        python_exec, "-m", "boltz.main", "predict", str(target),
         "--out_dir", str(out_dir),
         "--cache", str(boltz_cache),
         "--diffusion_samples", str(config.diffusion_samples),
@@ -243,9 +252,124 @@ def predict(
         # kernels and dies with `ModuleNotFoundError: cuequivariance_torch` inside the
         # pairformer -- measured, on both preflight tasks.
         "--no_kernels",
+        "--preprocessing-threads", str(preprocessing_threads),
     ]
     if config.use_potentials:
         cmd.append("--use_potentials")
+    return cmd
+
+
+def predict_many(
+    *,
+    yaml_texts: dict[str, str],
+    stage_dir: Path,
+    config: Boltz2Config,
+    python_exec: str,
+    boltz_cache: str | Path,
+    devices: int = 1,
+    accelerator: str = "gpu",
+    timeout_s: int = 7200,
+    preprocessing_threads: int = 1,
+) -> dict:
+    """One boltz invocation for several inputs, which is where the wall time is.
+
+    Measured on an A6000 with potentials on, this environment's settings, and inputs of
+    the size this project folds: **44 s fixed + 26 s per structure** (70 s for 1 input,
+    145 s for 4, 253 s for 8). The fixed part is process spawn, the torch import, the
+    2.2 GB checkpoint read and the model build on the GPU, and it is paid once per
+    INVOCATION. Folding one structure per invocation therefore spends 44 of every 70 s
+    on setup; nine per invocation spends 44 of every 278.
+
+    Nine is the natural group here -- one target's candidates plus its unchanged peptide,
+    at one seed -- and it is already near the asymptote: 31 s/structure at 9 against
+    28 s at 18.
+
+    `yaml_texts` is keyed by each input's content hash, which becomes its yaml stem and
+    therefore the name of its own output directory. Boltz names every artefact after that
+    stem (`<stem>_model_0.pdb`, `confidence_<stem>_model_0.json`), and every reader in
+    this project finds those by glob rather than by a fixed name, so the files can be
+    filed into per-candidate directories afterwards without renaming.
+
+    Returns the shared invocation record plus `per_key`, mapping each key to the
+    directory holding its structures -- absent for any key boltz produced nothing for,
+    which the caller must treat as that candidate's own failure rather than the batch's.
+    """
+    import time
+
+    # The inputs get a directory of their own, holding nothing but the yamls, and the
+    # output goes to a SIBLING. Boltz is pointed at a directory here rather than a single
+    # file, and it scans that directory for inputs -- so an output directory nested
+    # inside it is scanned too, and the run fails. Measured: with `out` as a child, 0 of
+    # 6 structures came back; as a sibling, 8 of 8.
+    inputs_dir = stage_dir / "inputs"
+    out_dir = stage_dir / "out"
+    inputs_dir.mkdir(parents=True, exist_ok=True)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    for key, text in yaml_texts.items():
+        (inputs_dir / f"{key}.yaml").write_text(text)
+
+    cmd = _predict_cmd(
+        target=inputs_dir, out_dir=out_dir, config=config, python_exec=python_exec,
+        boltz_cache=boltz_cache, devices=devices, accelerator=accelerator,
+        preprocessing_threads=preprocessing_threads,
+    )
+    t0 = time.time()
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_s)
+        status = "ok" if proc.returncode == 0 else "predictor_error"
+        rec = {
+            "status": status,
+            "returncode": proc.returncode,
+            "runtime_s": round(time.time() - t0, 2),
+            "cmd": " ".join(cmd),
+            "stdout_tail": proc.stdout[-4000:],
+            "stderr_tail": proc.stderr[-4000:],
+        }
+    except subprocess.TimeoutExpired:
+        rec = {
+            "status": "timeout",
+            "returncode": None,
+            "runtime_s": round(time.time() - t0, 2),
+            "cmd": " ".join(cmd),
+            "stdout_tail": "",
+            "stderr_tail": f"timed out after {timeout_s}s",
+        }
+
+    # Boltz puts each input's results under `boltz_results_<stage>/predictions/<stem>/`.
+    # Locate by stem rather than assuming the wrapper directory's name.
+    per_key: dict[str, str] = {}
+    for key in yaml_texts:
+        hits = [d for d in out_dir.rglob(f"predictions/{key}") if d.is_dir()]
+        if hits and any(hits[0].glob("*.pdb")):
+            per_key[key] = str(hits[0])
+    rec["per_key"] = per_key
+    rec["n_requested"] = len(yaml_texts)
+    rec["n_produced"] = len(per_key)
+    return rec
+
+
+def predict(
+    *,
+    yaml_path: Path,
+    out_dir: Path,
+    config: Boltz2Config,
+    python_exec: str,
+    boltz_cache: str | Path,
+    devices: int = 1,
+    accelerator: str = "gpu",
+    timeout_s: int = 7200,
+) -> dict:
+    """Run one boltz prediction. Returns a status record; never raises on model failure.
+
+    `--diffusion_samples` is how the four samples per candidate are produced: boltz runs
+    the trunk once and draws that many structures from it, which is the shared-preprocessing
+    multi-sample inference the task asks for rather than four independent invocations.
+    """
+    out_dir.mkdir(parents=True, exist_ok=True)
+    cmd = _predict_cmd(
+        target=yaml_path, out_dir=out_dir, config=config, python_exec=python_exec,
+        boltz_cache=boltz_cache, devices=devices, accelerator=accelerator,
+    )
 
     import time
 
@@ -287,6 +411,92 @@ BOLTZ_CONFIDENCE_KEYS = (
     "complex_pde",
     "complex_ipde",
 )
+
+
+def interface_pae_for_pdb(
+    pdb_path: str | Path,
+    *,
+    binder_chain: str,
+    receptor_chains: list[str],
+) -> dict:
+    """The peptide-target block of boltz's PAE matrix, as two scalars.
+
+    Boltz writes `pae_<stem>.npz` beside `<stem>.pdb`: a token x token matrix of expected
+    aligned error in angstroms. For an all-protein complex there is one token per
+    residue, in the order the chains appear in the structure file, so the binder's block
+    can be located from the PDB itself. Verified on a 285-token matrix against a 275 + 10
+    residue complex (`pepbench_A_C_pdb5t70`).
+
+    Two numbers come back:
+
+    - `interface_pae`, the mean over BOTH off-diagonal blocks. PAE is asymmetric -- the
+      error in placing i given j's frame is not the error in placing j given i's -- and
+      which of the two directions matters depends on what is being asked, so neither is
+      privileged and the mean of the pair is reported.
+    - `binder_pae`, the mean over the binder's own block, which is the peptide's internal
+      confidence rather than a statement about the interface. Carried alongside so a
+      confident peptide placed badly and a vague peptide placed well can be told apart.
+
+    This is harvested at scoring time because `retention.py` deletes the npz: its scalars
+    are supposed to be on the score row by then, and until this function existed the
+    interface block was the one scalar that was not. It is a recorded confidence metric
+    and never part of the objective, so a missing matrix returns `{}` -- reported as
+    absent, never as zero, the same contract as `confidence_for_pdb`.
+    """
+    pdb_path = Path(pdb_path)
+    sidecar = pdb_path.parent / f"pae_{pdb_path.stem}.npz"
+    if not sidecar.exists():
+        return {}
+    try:
+        with np.load(sidecar) as data:
+            pae = np.asarray(data["pae"], dtype=np.float32)
+    except Exception:  # noqa: BLE001
+        return {}
+    if pae.ndim != 2 or pae.shape[0] != pae.shape[1]:
+        return {}
+
+    # Chain label per residue, in file order -- the order the tokens are in.
+    chains: list[str] = []
+    seen: set[tuple[str, str]] = set()
+    try:
+        with open(pdb_path) as fh:
+            for line in fh:
+                if not line.startswith("ATOM"):
+                    continue
+                key = (line[21], line[22:27].strip())
+                if key in seen:
+                    continue
+                seen.add(key)
+                chains.append(key[0])
+    except OSError:
+        return {}
+
+    # A token count that does not match the residue count means something in this
+    # complex is not one-token-per-residue -- a ligand, a modified residue, an atomised
+    # chain. The block boundaries would then be wrong, and a wrong interface PAE is worse
+    # than none, so this says so instead of slicing anyway.
+    if len(chains) != pae.shape[0]:
+        return {
+            "interface_pae_status": (
+                f"token count {pae.shape[0]} != {len(chains)} residues; "
+                f"blocks not located"
+            )
+        }
+
+    labels = np.asarray(chains)
+    b = labels == binder_chain
+    r = np.isin(labels, list(receptor_chains))
+    if not b.any() or not r.any():
+        return {"interface_pae_status": "binder or receptor chain absent from structure"}
+
+    cross = np.concatenate([pae[np.ix_(b, r)].ravel(), pae[np.ix_(r, b)].ravel()])
+    return {
+        "interface_pae": float(cross.mean()),
+        "binder_pae": float(pae[np.ix_(b, b)].mean()),
+        "interface_pae_status": "ok",
+        "n_binder_tokens": int(b.sum()),
+        "n_receptor_tokens": int(r.sum()),
+    }
 
 
 def confidence_for_pdb(pdb_path: str | Path) -> dict:
