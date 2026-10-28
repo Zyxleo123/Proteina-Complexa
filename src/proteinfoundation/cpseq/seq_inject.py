@@ -110,21 +110,35 @@ def file_fingerprint(path: Path) -> str:
 def native_sequences(dataset_dir: Path) -> dict[str, str]:
     """{parent_id -> native peptide sequence} from a prepared dataset's manifest.
 
-    Refuses a manifest whose reference sequences are not unique, because that is exactly
-    the condition under which decode-based attribution stops being well defined.
+    Uniqueness of the sequences is NOT required here. It is required only by consumers that
+    identify a parent BY its native sequence -- `load_requests`, which keys its result that
+    way so a batch row can be matched without trusting the dataloader's order. A consumer
+    that iterates parents explicitly, like a structure predictor folding a list, is
+    unaffected by two parents sharing a peptide, and `pepbench_valid` has two such pairs.
     """
     import pandas as pd
 
     targets = pd.read_csv(Path(dataset_dir) / "manifest" / "targets.csv")
-    out = dict(zip(targets.parent_id.astype(str), targets.reference_sequence.astype(str)))
-    dupes = [s for s in out.values() if list(out.values()).count(s) > 1]
-    if dupes:
+    return dict(zip(targets.parent_id.astype(str), targets.reference_sequence.astype(str)))
+
+
+def _refuse_ambiguous_native(natives: dict[str, str], parent: str, native: str, where: str) -> None:
+    """Refuse a parent whose native peptide is shared with another parent in the manifest.
+
+    Scoped to the parent being requested, and checked against the WHOLE manifest rather
+    than against the request list: a batch row belonging to the OTHER parent would decode
+    to the same sequence and collect this parent's request, even though that parent was
+    never asked for. Requesting one of a colliding pair is therefore already ambiguous.
+    """
+    sharers = sorted(p for p, s in natives.items() if s == native)
+    if len(sharers) > 1:
         raise SequenceInjectionError(
-            f"{dataset_dir} has duplicate reference sequences {sorted(set(dupes))}, so a batch "
-            "row cannot be attributed to one parent by its native sequence. Injection needs an "
-            "explicit per-row id, which this dataset does not carry."
+            f"{where}: parent {parent}'s native peptide {native!r} is shared with "
+            f"{[p for p in sharers if p != parent]}. A batch row cannot be attributed to one of "
+            "them by its decoded sequence, so an injected request could land on the wrong "
+            "receptor. Fold these with a consumer that addresses parents explicitly, or give "
+            "the dataset a per-row id."
         )
-    return out
 
 
 def _rows_from_path(path: Path) -> list[dict]:
@@ -201,6 +215,9 @@ def load_requests(path: Path, dataset_dir: Path, label: str | None = None) -> di
                 f"peptide is {len(native)} ({native!r}). These searches substitute residues and "
                 "never change length, so this is a mis-pairing, not a resize."
             )
+        # This form is keyed by native sequence, so a parent sharing its peptide with
+        # another cannot be matched unambiguously.
+        _refuse_ambiguous_native(natives, parent, native, f"{path} row {i}")
         encode_sequence(seq)  # fail now, on the file, not mid-run on a GPU
         if native in by_native:
             raise SequenceInjectionError(

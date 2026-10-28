@@ -94,8 +94,22 @@ def main() -> int:
         # --- the manifest contract ---------------------------------------------------
         nat = si.native_sequences(ds)
         check("natives loaded", nat == parents, f"got {nat}")
-        dup = make_dataset(tmp / "dup", {"a": "MEEVD", "b": "MEEVD"})
-        expect_refusal("duplicate reference sequences refused", lambda: si.native_sequences(dup))
+
+        # Duplicate natives are refused where they actually break something -- the
+        # by-native-sequence form -- and tolerated where they do not. pepbench_valid has
+        # two such pairs, and refusing it outright blocked folding it with a predictor
+        # that addresses parents explicitly.
+        dupdir = make_dataset(tmp / "dupds", {"a": "MEEVD", "b": "MEEVD", "c": "TFKKTN"})
+        check("native_sequences tolerates duplicates",
+              si.native_sequences(dupdir) == {"a": "MEEVD", "b": "MEEVD", "c": "TFKKTN"})
+        dsrc = source(tmp, [{"parent_id": "a", "sequence": "MEWVD"}], "dup_req.jsonl")
+        expect_refusal("by-native form refuses an ambiguous parent",
+                       lambda: si.load_requests(dsrc, dupdir))
+        check("multi form folds an ambiguous parent anyway",
+              si.load_requests_multi(dsrc, dupdir)["a"][0].requested_sequence == "MEWVD")
+        csrc = source(tmp, [{"parent_id": "c", "sequence": "TFKKTK"}], "unamb_req.jsonl")
+        check("by-native form accepts an unambiguous parent in the same dataset",
+              si.load_requests(csrc, dupdir)["TFKKTN"].requested_sequence == "TFKKTK")
 
         # --- the source file ---------------------------------------------------------
         good = source(tmp, [

@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 import time
@@ -99,6 +100,17 @@ def main() -> int:
     ap.add_argument("--seed", type=int, default=42, help="First model seed; folds are seed..seed+N-1.")
     ap.add_argument("--num-recycles", type=int, default=10)
     ap.add_argument("--parents", default="", help="Comma-separated subset of parent_ids.")
+    ap.add_argument("--chemistry-from", default=None,
+                    help="A search run dir whose state/*/outcomes.jsonl records each parent's "
+                         "chemistry. Needed for corpora with no predictions/ dir of their own, "
+                         "such as pepbench_valid.")
+    ap.add_argument("--chemistry", default=None,
+                    help="Assert one chemistry for every requested parent, overriding anything "
+                         "recorded. A wrong value rings the wrong bond, so it is announced.")
+    ap.add_argument("--journal-tag", default=None,
+                    help="Suffix for this process's journal file (folds_<tag>.jsonl). Defaults to "
+                         "the Slurm array task id, then the job id, then the pid. Array tasks must "
+                         "not share one journal; resume always reads every folds*.jsonl present.")
     ap.add_argument("--timeout-s", type=int, default=14400)
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--force", action="store_true", help="Re-predict even when a structure is cached.")
@@ -113,13 +125,51 @@ def main() -> int:
         print(f"[hf3-designs] sequence source rejected: {exc}")
         return 1
 
-    # The chemistry each parent was prepared under. Taken from the recorded predictions, as
-    # the controls driver does, so this never invents a cyclization for a parent.
+    # The chemistry each parent was prepared under, never invented. Three sources, tried in
+    # order, because they are not all present for every corpus: `pepbench_valid` has no
+    # `predictions/` dir at all, so the controls driver's single source would silently skip
+    # all ten of its parents with "no chemistry recorded".
     chem: dict[str, str] = {}
+    chem_source = "none"
     for rec in (args.dataset_dir / "predictions").rglob("record.json"):
         r = json.loads(rec.read_text())
         if r.get("parent_id") and r.get("chemistry"):
             chem[r["parent_id"]] = r["chemistry"]
+    if chem:
+        chem_source = f"{args.dataset_dir}/predictions/*/record.json"
+    if args.chemistry_from:
+        found = 0
+        for f in sorted(Path(args.chemistry_from).glob("state/*/outcomes.jsonl")):
+            for line in f.read_text().splitlines():
+                if not line.strip():
+                    continue
+                try:
+                    r = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                pid_, ch = r.get("parent_id"), r.get("chemistry")
+                if pid_ and ch and pid_ not in chem:
+                    chem[pid_] = ch
+                    found += 1
+        if found:
+            chem_source = (chem_source + " + " if chem != {} and chem_source != "none" else "") \
+                + f"{args.chemistry_from}/state/*/outcomes.jsonl"
+    if args.chemistry:
+        # Explicit override, applied last so a recorded value cannot mask it, and announced
+        # loudly: asserting a cyclization the dataset never recorded is a claim, and a wrong
+        # one rings the wrong bond.
+        disagree = {p: c for p, c in chem.items() if p in requests and c != args.chemistry}
+        for p in requests:
+            chem[p] = args.chemistry
+        chem_source = f"--chemistry {args.chemistry} (explicit override)"
+        if disagree:
+            print(f"[hf3-designs] WARNING --chemistry {args.chemistry} overrides recorded "
+                  f"values for {len(disagree)} parent(s): {disagree}")
+    print(f"[hf3-designs] chemistry source: {chem_source}")
+    missing = sorted(p for p in requests if p not in chem)
+    if missing:
+        print(f"[hf3-designs] {len(missing)} parent(s) have no chemistry and will be skipped: "
+              f"{missing[:8]}. Pass --chemistry-from <search run dir> or --chemistry.")
 
     wanted = {p.strip() for p in args.parents.split(",") if p.strip()}
     cfg = hf3.HighFold3Config(num_seeds=args.folds, num_recycles=args.num_recycles, seed=args.seed)
@@ -134,15 +184,25 @@ def main() -> int:
                   "contributes nothing to a paired comparison on its own")
 
     rows: list[dict] = []
-    folds_path = args.out_dir / "folds.jsonl"
+    # One journal per process, read as a set. Array tasks appending to a single file would
+    # interleave their lines; resume therefore reads every journal and writes only its own.
+    tag = (args.journal_tag
+           or os.environ.get("SLURM_ARRAY_TASK_ID")
+           or os.environ.get("SLURM_JOB_ID")
+           or f"pid{os.getpid()}")
+    folds_path = args.out_dir / f"folds_{tag}.jsonl"
     done: set[str] = set()
-    if folds_path.exists():
-        for line in folds_path.read_text().splitlines():
+    for jp in sorted(args.out_dir.glob("folds*.jsonl")):
+        for line in jp.read_text().splitlines():
+            if not line.strip():
+                continue
             try:
                 done.add(json.loads(line)["fold_id"])
             except Exception:  # noqa: BLE001, S112
                 continue
-        print(f"[hf3-designs] {len(done)} sequence(s) already recorded; they will be skipped")
+    if done:
+        print(f"[hf3-designs] {len(done)} sequence(s) already recorded across "
+              f"{len(list(args.out_dir.glob('folds*.jsonl')))} journal(s); they will be skipped")
 
     with folds_path.open("a") as fh:
         for pid, reqs in sorted(requests.items()):
@@ -158,8 +218,21 @@ def main() -> int:
                 continue
 
             cmap = json.loads(t["chain_map"])
-            parsed = parse_structure(Path(t["reference_complex_path"]))
-            rec_seqs = {orig: chain_sequence(parsed, orig) for orig in cmap}
+            # `target_template_path`, not `reference_complex_path`: the latter exists only in
+            # the controls dataset, which this driver's ancestor was written against. The
+            # target template is receptor-only by construction -- the manifest's
+            # `peptide_chain_excluded_from_template` records which chain was dropped -- which
+            # is exactly what the receptor sequences should come from, since templating the
+            # peptide would answer a different question confidently.
+            parsed = parse_structure(Path(t["target_template_path"]))
+            # Read by the MAPPED chain id, not the original. `chain_map` is
+            # {original -> predictor id} and the template is written with the chains already
+            # renamed, so looking up the original id finds nothing whenever the two differ.
+            # It differs for 5 of the 20 parents here (lnr_4j86, lnr_5y59, pepbench_B_H_pdb3wa0,
+            # pepbench_C_A_pdb2jz3, pepbench_C_D_pdb4wjq, whose receptors are chain B or C);
+            # the rest only worked because their original id was already 'A'. The key stays the
+            # ORIGINAL id, which is what the MSA map and the provenance record are keyed on.
+            rec_seqs = {orig: chain_sequence(parsed, cmap[orig]) for orig in cmap}
             mp = json.loads(t["receptor_msa_paths"])
             msas = {}
             for orig in cmap:
