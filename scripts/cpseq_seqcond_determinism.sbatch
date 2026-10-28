@@ -3,7 +3,7 @@
 #SBATCH --partition=preempt
 #SBATCH --account=bapoczos
 #SBATCH --qos=preempt_qos
-#SBATCH --gres=gpu:L40S:1
+#SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=24G
 #SBATCH --time=1:30:00
@@ -31,10 +31,17 @@
 # same node, differing only in whether --seq-source is passed. Within-condition spread is
 # the noise floor; between-condition difference is what the plumbing costs.
 #
-# GPU type is PINNED (L40S, the most plentiful on preempt) because the comparison is only
-# valid within one GPU model: the first measurement of this was confounded by one run
-# landing on babel-y9-16 and the other on babel-x5-28. A requeue can still move the job,
-# so every run records its hostname and GPU and the report refuses to compare across them.
+# GPU type is deliberately NOT pinned. The comparison is only valid within one GPU model --
+# the first measurement of this was confounded by one run landing on babel-y9-16 and the
+# other on babel-x5-28 -- but all four runs here are sequential steps of ONE job, so they
+# share a node and a GPU by construction and a pin buys nothing for validity. It was pinned
+# to L40S at first and sat PENDING on Priority with 627 jobs ahead of it and one L40S node
+# free against seven other GPU nodes; that is a 7x smaller target for no gain.
+#
+# What the pin would have guarded is a REQUEUE landing on different hardware mid-sequence.
+# That case is detected instead of prevented: every run records its hostname and GPU, and
+# the report refuses to compare across them rather than averaging two pieces of silicon.
+# If it fires, delete the run dirs and resubmit.
 #
 # Output goes to /data/user_data (NAS), never the session scratchpad: /tmp is node-local
 # and the first attempt at this measurement was lost when the allocation moved nodes.
@@ -62,7 +69,7 @@ SEED="${SEED:-0}"
 
 echo "host=$(hostname) job=${SLURM_JOB_ID:-none}"
 nvidia-smi -L
-echo "request: gpu:L40S:1 cpus=${SLURM_CPUS_PER_TASK:-?} mem=24G time=1:30:00"
+echo "request: gpu:1 cpus=${SLURM_CPUS_PER_TASK:-?} mem=24G time=1:30:00"
 echo "n_complexes=$N_COMPLEXES n_repeat=$N_REPEAT seed=$SEED"
 
 for p in "$CKPT" "$TEST_PARQUET" "$SEQ_SOURCE" "$DATASET_DIR/manifest/targets.csv"; do
