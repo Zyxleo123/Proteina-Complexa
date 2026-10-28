@@ -4,9 +4,9 @@
 #SBATCH --account=bapoczos
 #SBATCH --qos=preempt_qos
 #SBATCH --gres=gpu:1
-#SBATCH --cpus-per-task=4
-#SBATCH --mem=24G
-#SBATCH --time=1:30:00
+#SBATCH --cpus-per-task=2
+#SBATCH --mem=20G
+#SBATCH --time=1:15:00
 #SBATCH --requeue
 #SBATCH --open-mode=append
 #SBATCH --output=/home/yixiz/slurm_logs/cpseq_seqcond_det_%j.out
@@ -69,7 +69,7 @@ SEED="${SEED:-0}"
 
 echo "host=$(hostname) job=${SLURM_JOB_ID:-none}"
 nvidia-smi -L
-echo "request: gpu:1 cpus=${SLURM_CPUS_PER_TASK:-?} mem=24G time=1:30:00"
+echo "request: gpu:1 cpus=${SLURM_CPUS_PER_TASK:-?} mem=20G time=1:15:00"
 echo "n_complexes=$N_COMPLEXES n_repeat=$N_REPEAT seed=$SEED"
 
 for p in "$CKPT" "$TEST_PARQUET" "$SEQ_SOURCE" "$DATASET_DIR/manifest/targets.csv"; do

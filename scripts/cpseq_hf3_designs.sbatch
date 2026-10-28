@@ -4,9 +4,9 @@
 #SBATCH --account=bapoczos
 #SBATCH --qos=preempt_qos
 #SBATCH --gres=gpu:1
-#SBATCH --cpus-per-task=4
-#SBATCH --mem=48G
-#SBATCH --time=1:30:00
+#SBATCH --cpus-per-task=2
+#SBATCH --mem=20G
+#SBATCH --time=1:00:00
 #SBATCH --array=1-20%8
 #SBATCH --requeue
 #SBATCH --open-mode=append
@@ -30,9 +30,20 @@
 #
 # Scope: 20 parents x 2 sequences x 8 seeds = 320 folds. 10 parents are LNR (tranche1) and
 # 10 are PepBench (pepbench_valid); the task list carries each parent's own dataset dir
-# because the two corpora have separate manifests. Receptors are 121-413 residues, in the
-# range the controls ran at 111-432 s per single-seed prediction, so 8 seeds for two
-# sequences is budgeted at 1h30 per task.
+# because the two corpora have separate manifests.
+#
+# Resources are MEASURED, not guessed from AF3's notes. The controls job (10882775, six
+# single-seed predictions, receptors 121-296 residues) completed in 13:32 with a python-step
+# MaxRSS of 9.3 GiB against a 48G request -- 5x oversized, and oversizing is what keeps a
+# job out of backfill on a partition this busy. Receptors here reach 413 residues, so 20G is
+# roughly 2x the measured peak. At ~135 s per single-seed prediction, two sequences at 8
+# seeds each is ~24 min plus JAX's first-call compile, so 1h. If a task dies with a bare
+# SIGKILL (-9), raise the memory rather than theorising.
+#
+# Note the partition floor: memory is clamped to 8000M per CPU, so 4 CPUs would force 32G
+# whatever --mem says. 2 CPUs is enough -- `--norun_data_pipeline` means no genetic search,
+# the driver runs one prediction subprocess at a time, and the mmCIF conversion is
+# single-threaded.
 #
 # Resumable, which preempt's REQUEUE requires: each task writes its own
 # `folds_<array task id>.jsonl` and the resume set is read from EVERY `folds*.jsonl`
@@ -66,7 +77,7 @@ DRY_RUN="${DRY_RUN:-0}"
 
 echo "host=$(hostname) job=${SLURM_JOB_ID:-none} array_task=${SLURM_ARRAY_TASK_ID:-none}"
 nvidia-smi -L || true
-echo "request: gpu:1 cpus=${SLURM_CPUS_PER_TASK:-?} mem=48G time=1:30:00"
+echo "request: gpu:1 cpus=${SLURM_CPUS_PER_TASK:-?} mem=20G time=1:00:00"
 
 [ -f "$TASKS" ] || { echo "missing task list: $TASKS" >&2; exit 2; }
 
