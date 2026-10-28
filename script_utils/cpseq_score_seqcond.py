@@ -124,6 +124,23 @@ def _match_parent(rec_seq: str, index: dict[str, dict]) -> dict | None:
     return None
 
 
+def load_requested_sidecar(path: Path) -> dict[str, dict]:
+    """{native peptide sequence -> request record} written by `seq_inject.write_sidecar`.
+
+    Without this, a run that was conditioned on a SEARCHED sequence is scored against the
+    dataset's native peptide, so every sample fails the exact-sequence check and the whole
+    run reads as non-compliant -- a wrong answer that looks like a finding. Empty dict when
+    there is no sidecar, which is the native-sequence runs and is correct for them.
+    """
+    if not path.exists():
+        return {}
+    payload = json.loads(path.read_text())
+    schema = payload.get("schema")
+    if schema != "cpseq-requested-sequences-1":
+        raise SystemExit(f"{path}: unrecognised schema {schema!r}; refusing to guess its layout.")
+    return payload.get("by_native_sequence", {})
+
+
 def recovery(requested: str, got: str) -> float | None:
     if not requested or not got or len(requested) != len(got):
         return None
@@ -151,6 +168,11 @@ def main() -> None:
         default="seq_cond",
         help="what the generator was actually given; recorded per row",
     )
+    ap.add_argument("--requested-sequences", type=Path, default=None,
+                    help="The requested-sequence sidecar. Default: <dump-dir>/requested_sequences.json, "
+                         "written by the generation run when it was given --seq-source. Without it a "
+                         "run conditioned on searched peptides is scored against the native ones and "
+                         "reads as wholly non-compliant.")
     ap.add_argument("--keep-frac", type=float, default=1.0)
     ap.add_argument("--n-repeat", type=int, default=4)
     ap.add_argument("--nsteps", type=int, default=400)
@@ -160,6 +182,17 @@ def main() -> None:
     tol = tol_set[args.chemistry]
     index = parent_index(args.dataset_dir)
     print(f"[seqcond] {len(index)} parents indexed by receptor sequence")
+
+    requested_sidecar = load_requested_sidecar(
+        args.requested_sequences or (args.dump_dir / "requested_sequences.json")
+    )
+    if requested_sidecar:
+        n_designed = sum(1 for r in requested_sidecar.values() if not r.get("is_native"))
+        print(f"[seqcond] requested-sequence sidecar: {len(requested_sidecar)} parents, "
+              f"{n_designed} carrying substitutions -- compliance is measured against these, "
+              f"not the dataset's native peptides")
+    else:
+        print("[seqcond] no requested-sequence sidecar; compliance is vs each parent's native peptide")
 
     manifests = sorted(glob.glob(str(args.dump_dir / "step_*" / "manifest_rank*.jsonl")))
     if not manifests:
@@ -226,14 +259,25 @@ def main() -> None:
                     f"is cond_recovery vs the LP, and n_mutations is the distance from it"
                 )
             elif args.conditioning == "seq_cond":
-                # The model was handed this sequence; compliance is the question.
-                requested = original
-                rec = recovery(original, got)
+                # The model was handed this sequence; compliance is the question. When the run
+                # injected a searched peptide, the sequence it was handed is NOT the dataset's
+                # reference, and the sidecar is the only record of which one it was.
+                asked = requested_sidecar.get(original)
+                requested = asked["requested_sequence"] if asked else original
+                rec = recovery(requested, got)
                 # Scored against what was ASKED, so a model that designed its own
                 # peptide fails the exact-sequence check rather than being scored as
                 # though it had complied.
-                requested_for_scoring = original
-                seq_check_note = "exact-sequence check is meaningful (sequence was requested)"
+                requested_for_scoring = requested
+                seq_check_note = (
+                    "exact-sequence check is meaningful (sequence was requested"
+                    + (
+                        f"; INJECTED {asked['label']}, {asked['n_substitutions']} substitutions "
+                        f"from the native {original})"
+                        if asked
+                        else ", the dataset's native peptide)"
+                    )
+                )
             else:
                 # Nothing was requested, so there is nothing to comply with. The decoded
                 # sequence IS the output, and it is scored as itself; the exact-sequence
@@ -310,6 +354,10 @@ def main() -> None:
                 # on the binder site, not a target-only template plus a pocket constraint.
                 "pocket_conditioning": "crop_centred_on_binder_site (x_target receptor)",
                 "sequence_requested": requested,
+                "sequence_requested_source": (
+                    "injected_sidecar" if (args.conditioning == "seq_cond" and requested != original)
+                    else ("native_reference" if args.conditioning == "seq_cond" else None)
+                ),
                 "peptide_length": len(got),
                 "n_mutations": n_mut,
                 "mutation_fraction": (

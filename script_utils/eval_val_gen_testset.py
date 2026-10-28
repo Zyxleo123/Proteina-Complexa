@@ -90,6 +90,26 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--keep-frac", type=float, default=1.0,
                    help="Fraction of the binder sequence revealed under --seq-cond (default 1.0 = the "
                         "whole sequence). Ignored without --seq-cond.")
+    p.add_argument("--seq-source", default=None,
+                   help="Condition on sequences from this file INSTEAD of the dataset's native "
+                        "peptides (.json/.jsonl/.csv; rows need `parent_id` and `sequence`). This is "
+                        "how a SEARCHED sequence is put to the generator: without it, --seq-cond can "
+                        "only reveal the peptide the batch already carries. Requires --seq-cond and "
+                        "--seq-source-dataset-dir. Rows are matched to batch rows by the native "
+                        "sequence the batch decodes to, never by batch order.")
+    p.add_argument("--seq-source-dataset-dir", default=None,
+                   help="The prepared dataset whose manifest/targets.csv maps parent_id -> native "
+                        "peptide (e.g. /data/user_data/yixiz/cpseq/tranche1). Required with "
+                        "--seq-source.")
+    p.add_argument("--seq-source-label", default=None,
+                   help="Use only the rows carrying this `label` from --seq-source. A paired file "
+                        "holds both the searched peptide and its native, and one run asks one "
+                        "question; this is how the two runs of a comparison come from one file. The "
+                        "label is recorded in the sidecar and in every closure row.")
+    p.add_argument("--seq-source-on-missing", choices=("error", "native"), default="error",
+                   help="A batch row whose native peptide has no request: 'error' (default) refuses, "
+                        "because a half-injected batch mixes two experiments under one label; "
+                        "'native' leaves that row alone and records that it was not injected.")
     p.add_argument("--num-workers", type=int, default=None,
                    help="Override the training config's dataloader worker count. The stored "
                         "config asks for 8, which forks 8 copies of the dataset and OOM-killed "
@@ -228,6 +248,43 @@ def main() -> int:
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     dump_dir = out_dir / "rosetta_dump"
+
+    # Requested sequences are resolved and validated BEFORE the checkpoint loads: a bad
+    # pairing in the source file should cost a second, not a model load and a GPU.
+    seq_table = None
+    if args.seq_source:
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+        from proteinfoundation.cpseq import seq_inject
+
+        if not args.seq_cond:
+            logger.error("--seq-source needs --seq-cond: there is no conditioning pass to inject into.")
+            return 1
+        if not args.seq_source_dataset_dir:
+            logger.error("--seq-source needs --seq-source-dataset-dir (the manifest that maps "
+                         "parent_id -> native peptide).")
+            return 1
+        if args.keep_frac < 1.0:
+            logger.error(
+                f"--seq-source with --keep-frac {args.keep_frac} would reveal only part of a "
+                "designed peptide and let the model invent the rest, so the sample answers for "
+                "neither sequence. Use --keep-frac 1.0."
+            )
+            return 1
+        try:
+            seq_table = seq_inject.load_requests(
+                Path(args.seq_source), Path(args.seq_source_dataset_dir),
+                label=args.seq_source_label,
+            )
+        except seq_inject.SequenceInjectionError as exc:
+            logger.error(f"sequence source rejected: {exc}")
+            return 1
+        n_designed = sum(not r.is_native for r in seq_table.values())
+        logger.info(
+            f"Sequence source {args.seq_source}"
+            f"{f' [label={args.seq_source_label}]' if args.seq_source_label else ''}: "
+            f"{len(seq_table)} parents, {n_designed} carrying substitutions, "
+            f"sha256[:16]={seq_inject.file_fingerprint(Path(args.seq_source))}"
+        )
 
     cfg_files = sorted(ckpt_dir.glob("exp_config_*.json"))
     if not cfg_files:
@@ -414,6 +471,22 @@ def main() -> int:
     out_path = out_dir / f"closure_rows_{tag}.jsonl"
     logger.info(f"Writing closure rows to {out_path}; dumping complexes to {dump_dir}")
 
+    if seq_table is not None:
+        sidecar = seq_inject.write_sidecar(
+            dump_dir,
+            seq_table,
+            source_path=Path(args.seq_source),
+            dataset_dir=Path(args.seq_source_dataset_dir),
+            extra={
+                "ckpt_name": ckpt_path.name,
+                "ckpt_global_step": ckpt_step,
+                "keep_frac": args.keep_frac,
+                "label": args.seq_source_label,
+                "on_missing": args.seq_source_on_missing,
+            },
+        )
+        logger.info(f"Requested-sequence sidecar -> {sidecar}")
+
     loader = datamodule.val_dataloader()
     n_written, t0 = 0, time.time()
     with out_path.open("a") as fh:
@@ -425,6 +498,24 @@ def main() -> int:
             L.seed_everything(args.seed * 100003 + batch_idx, workers=True)
             model._eval_gstep = batch_idx  # unique step_dir for this batch's dump
             batch = model.transfer_batch_to_device(batch, device, 0)
+            injected: list[dict] | None = None
+            if seq_table is not None:
+                # Substituted here, not inside validation_step_generate: the conditioning mask is
+                # resolved from `residue_type` there, and `sequence_recovery_metrics` compares the
+                # decode against it -- so replacing it first makes val_gen/seq/cond_recovery read
+                # as compliance with the REQUESTED peptide, which is the number this run needs.
+                try:
+                    injected = seq_inject.apply_to_batch(
+                        batch, seq_table, on_missing=args.seq_source_on_missing
+                    )
+                except seq_inject.SequenceInjectionError as exc:
+                    logger.error(f"batch {batch_idx}: {exc}")
+                    return 1
+                names = ", ".join(
+                    f"{r['parent_id']}:{r['requested_sequence']}(-{r['n_substitutions']})"
+                    for r in injected if r["injected"]
+                )
+                logger.info(f"batch {batch_idx}: requested {names}")
             collected.clear()
             # prefix stays "val_gen" (not the training default "val_gen_seqcond") so the aggregator
             # and Rosetta scorer read the same keys they do for the free pass -- only the model's
@@ -439,6 +530,9 @@ def main() -> int:
                 "n_repeat": args.n_repeat,
                 "seq_cond": bool(args.seq_cond),
                 "keep_frac": (args.keep_frac if args.seq_cond else None),
+                "seq_source": (str(args.seq_source) if seq_table is not None else None),
+                "seq_source_label": (args.seq_source_label if seq_table is not None else None),
+                "requested": injected,
                 "metrics": dict(collected),
             }
             fh.write(json.dumps(row) + "\n")
