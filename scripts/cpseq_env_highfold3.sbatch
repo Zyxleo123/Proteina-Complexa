@@ -105,6 +105,10 @@ else
     -C cmake.define.CMAKE_CXX_COMPILER="$CXX" \
     "$AF3_WORKTREE"
   "$PY" -c "import alphafold3; print('alphafold3 import OK')"
+  # HighFold3's overlaid model/features.py imports chex, which pinned AF3 a8ecdb2d does
+  # not declare -- so run_alphafold.py dies with ModuleNotFoundError after a build that
+  # otherwise succeeded. 0.1.87 is the last release compatible with jax 0.4.34.
+  "$PY" -m pip install --no-cache-dir "chex==0.1.87"
   touch "$MARKERS/af3_$AF3_REV"
 fi
 
@@ -128,7 +132,44 @@ for d in model data common constants parsers structure; do
     cp -r "$HF3_SRC/$d/." "$SITE/$d/" 2>/dev/null || cp -r "$HF3_SRC/$d" "$SITE/"
   fi
 done
+# HighFold3's cyclic module ships ONLY as model/__pycache__/
+# cyclic_peptide_matrix.cpython-311.pyc, with no .py tracked. Copying the overlay
+# verbatim leaves it inside __pycache__, where Python will NOT find it: a __pycache__
+# entry is a cache validated against a source file, so with no .py beside it the import
+# fails with "unknown location". A sourceless module must sit directly in the package
+# directory as <name>.pyc. This places it there, which is the only way this module is
+# importable at all.
+AF3_PKG="$("$PY" -c 'import alphafold3, os; print(os.path.dirname(alphafold3.__file__))')"
+CPM_PYC="$AF3_PKG/model/__pycache__/cyclic_peptide_matrix.cpython-311.pyc"
+if [ -f "$CPM_PYC" ]; then
+  cp "$CPM_PYC" "$AF3_PKG/model/cyclic_peptide_matrix.pyc"
+  echo "[hf3] placed sourceless cyclic_peptide_matrix.pyc in $AF3_PKG/model/"
+else
+  echo "WARNING: $CPM_PYC absent; the cyclic module will not import"
+fi
+
 touch "$MARKERS/hf3_overlay_$HF3_REV"
+
+# ------------------------------------------------------------------- CCD data
+# AF3 ships `build_data`, which parses libcifpp's components.cif into
+# constants/converters/ccd.pickle. pip install does NOT run it, and without it every
+# prediction dies at chemical_components.cached_ccd with FileNotFoundError on
+# ccd.pickle -- after the model has loaded, so it looks like a runtime fault rather
+# than an incomplete install.
+#
+# It needs real memory: parsing the full CCD inside a node-hold job's step_extern
+# cgroup gets SIGKILLed (exit 137, no traceback). That is why this is a build stage in
+# a job and not a one-liner someone runs by hand.
+CCD_PICKLE="$AF3_PKG/constants/converters/ccd.pickle"
+if [ -s "$CCD_PICKLE" ]; then
+  echo "[af3] ccd.pickle present, skipping build_data"
+else
+  echo "[af3] build_data (parses components.cif; memory-hungry)"
+  "$VENV/bin/build_data"
+  [ -s "$CCD_PICKLE" ] || { echo "ERROR: build_data did not produce $CCD_PICKLE"; exit 1; }
+  echo "[af3] ccd.pickle $(stat -c%s "$CCD_PICKLE") bytes"
+fi
+touch "$MARKERS/ccd_data"
 
 # --------------------------------------------------------------------- verify
 echo "[verify] cyclic module + topology probe"
