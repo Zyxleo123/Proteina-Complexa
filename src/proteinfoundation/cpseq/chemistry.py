@@ -76,9 +76,31 @@ class AtomBond:
     angle_i_deg: float
     angle_j_deg: float
     dihedral_deg: float
+    # The atoms one bond further out on each side: the ones that, with `atom_i` and
+    # `atom_j`, define the two closure angles and the torsion. `geometry._closure_atoms`
+    # picks the same atoms from a PDB; naming them here lets the scorer restrain exactly
+    # the quantities the gate measures, instead of restraining the bond and leaving the
+    # junction free to absorb the strain.
+    outer_i: str = "CA"
+    outer_j: str = "CA"
     # True where both torsion handednesses are chemically real, so a check must fold
     # +x and -x together. Disulfides occur at both +90 and -90 degrees.
     dihedral_symmetric: bool = False
+    # Every arrangement around this bond that the chemistry actually permits, as reference
+    # torsions in degrees. A deviation is measured against the NEAREST of them.
+    #
+    # An amide bond is planar but has two real arrangements, trans (180) and cis (0), and
+    # which one a macrocycle adopts is conformation, not an error. Judging against trans
+    # alone makes every cis linkage an outlier: measured on 150 cluster-unique native
+    # CPSea head-to-tail macrocycles, 75 of 150 sit nearer cis than trans, the median
+    # deviation from trans is 90.3 deg, and a trans-only window at 8.44 deg admits
+    # 27/150 where cis-or-trans at 30 deg admits 117/150. The training corpus plainly
+    # contains both, so a gate that accepts only trans rejects the chemistry it is
+    # supposed to measure.
+    #
+    # Left as None where the single `dihedral_deg` above (with the symmetric fold) is the
+    # whole story, which is the case for a disulfide.
+    dihedral_alternatives_deg: tuple[float, ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -149,10 +171,16 @@ CHEMISTRIES: dict[str, ChemistrySpec] = {
             atom_i="N",
             atom_j="C",
             length_A=1.33,
+            outer_i="CA",
+            outer_j="CA",
             angle_i_deg=121.7,  # C-N-CA at the N-terminal residue
             angle_j_deg=116.2,  # CA-C-N at the C-terminal residue
-            dihedral_deg=180.0,  # trans amide
+            dihedral_deg=180.0,  # trans amide, the commoner arrangement
             dihedral_symmetric=False,
+            # An amide bond is planar with TWO real arrangements. Native CPSea
+            # head-to-tail macrocycles sit nearer cis than trans in 75 of 150
+            # cluster-unique entries, so cis is part of this chemistry, not a defect.
+            dihedral_alternatives_deg=(180.0, 0.0),
         ),
         required_residue_i=None,
         required_residue_j=None,
@@ -168,6 +196,8 @@ CHEMISTRIES: dict[str, ChemistrySpec] = {
         bond=AtomBond(
             atom_i="SG",
             atom_j="SG",
+            outer_i="CB",
+            outer_j="CB",
             length_A=2.05,
             angle_i_deg=103.8,  # CB-SG-SG
             angle_j_deg=103.8,
@@ -196,6 +226,8 @@ CHEMISTRIES: dict[str, ChemistrySpec] = {
             angle_j_deg=117.0,  # NZ-C-CG at the acid
             dihedral_deg=180.0,
             dihedral_symmetric=False,
+            # Also an amide bond, so the same two planar arrangements apply.
+            dihedral_alternatives_deg=(180.0, 0.0),
         ),
         required_residue_i=("LYS",),
         required_residue_j=("ASP", "ASN", "GLU", "GLN"),

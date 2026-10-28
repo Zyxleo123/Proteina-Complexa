@@ -202,6 +202,11 @@ def closure_geometry(
         "ref_angle_j_deg": spec.bond.angle_j_deg,
         "ref_dihedral_deg": spec.bond.dihedral_deg,
         "dihedral_symmetric": spec.bond.dihedral_symmetric,
+        # Present even when unmeasured, so a consumer never has to distinguish "this
+        # chemistry has one arrangement" from "this key was not written".
+        "dihedral_permitted_deg": list(spec.bond.dihedral_alternatives_deg or ()),
+        "dihedral_matched_ref_deg": None,
+        "dihedral_arrangement": None,
     }
     residues = read_chain(pdb_path, binder_chain)
     out["n_residues"] = len(residues)
@@ -227,10 +232,28 @@ def closure_geometry(
     out["angle_i_dev_deg"] = round(abs(out["angle_i_deg"] - spec.bond.angle_i_deg), 2)
     out["angle_j_dev_deg"] = round(abs(out["angle_j_deg"] - spec.bond.angle_j_deg), 2)
     d_obs, d_ref = out["dihedral_deg"], spec.bond.dihedral_deg
-    if spec.bond.dihedral_symmetric:
+    # Where the chemistry permits several arrangements around the bond, the deviation is
+    # measured against the NEAREST one and the match is recorded. For an amide that means
+    # cis as well as trans: both are planar and both occur, so judging a cis linkage
+    # against trans alone reports a ~180 deg error for a correctly formed bond. Which
+    # arrangement was matched is kept on the record, because "closed, cis" and
+    # "closed, trans" are different conformations and pooling them would hide that.
+    alts = spec.bond.dihedral_alternatives_deg
+    if alts:
+        best = min(alts, key=lambda ref: _circ_dev(d_obs, ref))
+        dev = _circ_dev(d_obs, best)
+        out["dihedral_matched_ref_deg"] = float(best)
+        out["dihedral_arrangement"] = "trans" if abs(best) > 90.0 else "cis"
+    elif spec.bond.dihedral_symmetric:
         dev = min(_circ_dev(d_obs, d_ref), _circ_dev(d_obs, -d_ref))
+        out["dihedral_matched_ref_deg"] = float(
+            d_ref if _circ_dev(d_obs, d_ref) <= _circ_dev(d_obs, -d_ref) else -d_ref
+        )
+        out["dihedral_arrangement"] = None
     else:
         dev = _circ_dev(d_obs, d_ref)
+        out["dihedral_matched_ref_deg"] = float(d_ref)
+        out["dihedral_arrangement"] = None
     out["dihedral_dev_deg"] = round(dev, 2)
     return out
 

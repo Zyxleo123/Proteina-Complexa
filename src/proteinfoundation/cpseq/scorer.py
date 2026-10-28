@@ -185,8 +185,29 @@ def _declare_ring(pose, chemistry: str, seqpos_i: int, seqpos_j: int) -> dict:
     return {"declared": False, "how": None, "reason": f"unknown chemistry {chemistry!r}"}
 
 
+def _nearest_permitted_dihedral(observed_deg: float, spec) -> float:
+    """The arrangement around the closing bond that this structure is already in.
+
+    The torsion restraint targets the arrangement the PREDICTOR produced, not the
+    chemistry's nominal one. An amide is planar with two real arrangements, cis and
+    trans, and 75 of 150 native CPSea macrocycles sit nearer cis -- so restraining every
+    ring to trans would drag half of them through 180 degrees and call the result
+    refinement. A disulfide is symmetric at +-90 for the same reason. This is the same
+    "nearest permitted arrangement" rule `geometry.closure_geometry` judges by, so the
+    restraint holds exactly what the gate will measure.
+    """
+    alts = list(spec.bond.dihedral_alternatives_deg or (spec.bond.dihedral_deg,))
+    if spec.bond.dihedral_symmetric:
+        alts += [-a for a in alts]
+
+    def circular_gap(a: float, b: float) -> float:
+        return abs((a - b + 180.0) % 360.0 - 180.0)
+
+    return min(alts, key=lambda ref: circular_gap(observed_deg, ref))
+
+
 def _add_closure_constraint(pose, chemistry: str, seqpos_i: int, seqpos_j: int) -> dict:
-    """Pin the closing bond with an explicit AtomPairConstraint for the duration of relax.
+    """Pin the closing JUNCTION -- bond, both angles and the torsion -- during relax.
 
     `declare_chemical_bond` updates the pose's connectivity but gives the minimiser no
     term that holds those two atoms together, and `constrain_relax_to_start_coords`
@@ -198,36 +219,103 @@ def _add_closure_constraint(pose, chemistry: str, seqpos_i: int, seqpos_j: int) 
     to 0.023 A, closing 144 rings the predictor had failed to close. That is a refiner
     artefact too, and the raw/refined split is what makes both visible.)
 
-    The constraint is an artificial restraint, so it is scored with a SEPARATE
-    scorefunction and never contributes to a reported energy; `restraints` in the output
-    records that it was applied and at what reference length.
+    Why the angles and the torsion, and not only the bond
+    ------------------------------------------------------
+    An AtomPairConstraint alone fixes a distance and leaves the rest of the junction
+    free, so the minimiser pays for its repulsive term by bending the closure open while
+    holding the two atoms the right distance apart. Measured on 24 folds of three LNR
+    complexes, before this existed:
+
+    | quantity            | pre-relax          | post-relax           | tolerance   |
+    |---------------------|--------------------|----------------------|-------------|
+    | closure angle dev   | median 0.99 deg    | median 16.63 deg     | 7.54 deg    |
+    | closure torsion dev | median 2.35 deg    | median 15.23 deg     | 8.44 deg    |
+    | closure bond length | 1.33 A             | 1.33 A               | 1.23-1.43 A |
+    | angles over tol     | **0 of 48**        | **37 of 48**         |             |
+
+    The bond -- the one restrained quantity -- is held perfectly, and every violation is
+    manufactured by the relax: Boltz-2's junction geometry was clean in 48 of 48
+    measurements. On `lnr_5vao` the predictor produced 4 valid folds and refinement broke
+    all 4. So this is not a gate masking a real defect; it is the scorer being stopped
+    from creating one.
+
+    The restraints are artificial, so they are scored with a SEPARATE scorefunction and
+    never contribute to a reported energy; `restraints` in the output records what was
+    applied and at what reference values.
     """
     from pyrosetta.rosetta.core.id import AtomID
-    from pyrosetta.rosetta.core.scoring.constraints import AtomPairConstraint
-    from pyrosetta.rosetta.core.scoring.func import HarmonicFunc
+    from pyrosetta.rosetta.core.scoring.constraints import (
+        AngleConstraint,
+        AtomPairConstraint,
+        DihedralConstraint,
+    )
+    from pyrosetta.rosetta.core.scoring.func import CircularHarmonicFunc, HarmonicFunc
+    from pyrosetta.rosetta.numeric import dihedral_degrees
 
     spec = CHEMISTRIES[chemistry]
     atom_i, atom_j = spec.bond.atom_i, spec.bond.atom_j
+    outer_i, outer_j = spec.bond.outer_i, spec.bond.outer_j
     if chemistry == "isopeptide":
         return {"applied": False, "reason": "isopeptide is not scored at all"}
     try:
         res_i, res_j = pose.residue(seqpos_i), pose.residue(seqpos_j)
-        if not (res_i.has(atom_i) and res_j.has(atom_j)):
-            return {"applied": False, "reason": f"missing {atom_i}/{atom_j}"}
-        cst = AtomPairConstraint(
-            AtomID(res_i.atom_index(atom_i), seqpos_i),
-            AtomID(res_j.atom_index(atom_j), seqpos_j),
+        need = ((res_i, atom_i), (res_j, atom_j), (res_i, outer_i), (res_j, outer_j))
+        missing = [a for r, a in need if not r.has(a)]
+        if missing:
+            return {"applied": False, "reason": f"missing {','.join(sorted(set(missing)))}"}
+
+        id_bi = AtomID(res_i.atom_index(atom_i), seqpos_i)
+        id_bj = AtomID(res_j.atom_index(atom_j), seqpos_j)
+        id_oi = AtomID(res_i.atom_index(outer_i), seqpos_i)
+        id_oj = AtomID(res_j.atom_index(outer_j), seqpos_j)
+
+        pose.add_constraint(AtomPairConstraint(
+            id_bi, id_bj,
             # sd 0.05 A: tight enough to hold a covalent bond, loose enough not to
             # dominate the local geometry the relax is otherwise free to fix.
             HarmonicFunc(spec.bond.length_A, 0.05),
-        )
-        pose.add_constraint(cst)
+        ))
+
+        # Angles, in radians. sd 0.05 rad (2.9 deg) is the angular analogue of the
+        # bond's 0.05 A: a deviation at the gate's 7.54 deg tolerance then costs about
+        # 7 REU, enough to hold the junction against the repulsive term without
+        # flattening the side-chain repacking the relax exists to do.
+        ang_sd = 0.05
+        # angle_i is at endpoint i (outer_i - bond_i - bond_j), angle_j at endpoint j --
+        # the same two angles, in the same order, that `closure_geometry` measures.
+        pose.add_constraint(AngleConstraint(
+            id_oi, id_bi, id_bj,
+            HarmonicFunc(math.radians(spec.bond.angle_i_deg), ang_sd),
+        ))
+        pose.add_constraint(AngleConstraint(
+            id_bi, id_bj, id_oj,
+            HarmonicFunc(math.radians(spec.bond.angle_j_deg), ang_sd),
+        ))
+
+        # Torsion, targeted at the arrangement this structure is already in. Circular,
+        # because a torsion wraps and a plain harmonic would punish -179 for being 358
+        # degrees from +179.
+        xyz = pose.xyz
+        observed = float(dihedral_degrees(xyz(id_oi), xyz(id_bi), xyz(id_bj), xyz(id_oj)))
+        target = _nearest_permitted_dihedral(observed, spec)
+        tors_sd = 0.10  # 5.7 deg: looser than the angles, as the gate's window is wider
+        pose.add_constraint(DihedralConstraint(
+            id_oi, id_bi, id_bj, id_oj,
+            CircularHarmonicFunc(math.radians(target), tors_sd),
+        ))
+
         return {
             "applied": True,
-            "type": "AtomPairConstraint",
-            "atoms": f"{atom_i}({seqpos_i})-{atom_j}({seqpos_j})",
+            "type": "AtomPair + 2x Angle + Dihedral",
+            "atoms": f"{outer_i}-{atom_i}({seqpos_i})-{atom_j}({seqpos_j})-{outer_j}",
             "target_length_A": spec.bond.length_A,
             "harmonic_sd_A": 0.05,
+            "target_angle_i_deg": spec.bond.angle_i_deg,
+            "target_angle_j_deg": spec.bond.angle_j_deg,
+            "harmonic_sd_rad": ang_sd,
+            "observed_dihedral_deg": round(observed, 2),
+            "target_dihedral_deg": target,
+            "dihedral_sd_rad": tors_sd,
             "excluded_from_reported_energy": True,
         }
     except Exception as exc:  # noqa: BLE001
@@ -405,7 +493,12 @@ def score_structure(
         from pyrosetta.rosetta.core.scoring import ScoreType
 
         sf_relax = pyrosetta.create_score_function(SCOREFUNCTION)
+        # All three restraint terms, or the angle and torsion constraints would be
+        # added to the pose and then scored at weight zero -- present in the record and
+        # absent from the minimiser, which is the failure mode this fix exists to end.
         sf_relax.set_weight(ScoreType.atom_pair_constraint, 1.0)
+        sf_relax.set_weight(ScoreType.angle_constraint, 1.0)
+        sf_relax.set_weight(ScoreType.dihedral_constraint, 1.0)
         rec["restraints"] = _add_closure_constraint(pose, chemistry, seqpos_i, seqpos_j)
 
         relax = FastRelax(sf_relax, RELAX_REPEATS)
@@ -537,6 +630,8 @@ def _deformation_proxy(
             out["free_restraints"] = _add_closure_constraint(free, chemistry, 1, n)
             sf_free = pyrosetta.create_score_function(SCOREFUNCTION)
             sf_free.set_weight(ScoreType.atom_pair_constraint, 1.0)
+            sf_free.set_weight(ScoreType.angle_constraint, 1.0)
+            sf_free.set_weight(ScoreType.dihedral_constraint, 1.0)
             relax = FastRelax(sf_free, RELAX_REPEATS)
             relax.apply(free)
             e_free = float(sf(free))

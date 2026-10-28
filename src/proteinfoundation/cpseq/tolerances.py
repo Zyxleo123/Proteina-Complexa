@@ -55,6 +55,63 @@ BOND_WINDOWS_A = {
     "isopeptide": ISOPEPTIDE_N_C_BOND_WINDOW_A,
 }
 
+# --------------------------------------------------------------------------------------
+# Adopted structural-quality requirements (2026-10-22)
+# --------------------------------------------------------------------------------------
+# Closure windows, as requested: MuCO's published closure-distance windows, which inspect
+# the actual closing atoms rather than a nearby proxy. These are TIGHTER than the project's
+# previous 1.1-1.6 A mainchain window, and the difference is not academic:
+#
+#   7K2F, an experimental crystal macrocycle control, closes at 1.554 A and therefore
+#   FAILS this window while passing the previous one.
+#
+# It is recorded here rather than left to be rediscovered, because the acceptance test for
+# this gate is "every retained native reference passes, with every original failure
+# explained". 7K2F is that one explained failure: it is a genuine deposited structure with
+# an unusually long closing bond, it is the same control MuCO's own +-0.10 A window
+# rejects, and it is retained in the control set as a known out-of-window reference rather
+# than deleted. The other 3 mainchain controls and all 150 native CPSea head-to-tail
+# entries measured pass this window.
+ADOPTED_BOND_WINDOWS_A = {
+    "mainchain": (1.23, 1.43),   # closing amide
+    "disulfide": (1.95, 2.15),   # closing disulfide
+    "isopeptide": (1.23, 1.43),  # also an amide bond
+}
+ADOPTED_BOND_WINDOW_SOURCE = (
+    "MuCO published closure-distance windows (amide 1.23-1.43 A, disulfide 1.95-2.15 A); "
+    "adopted 2026-10-22. Tighter than the prior 1.1-1.6 A project standard; 7K2F "
+    "(1.554 A) is a known retained control that fails it -- see module comment."
+)
+
+# Amide planarity. An amide bond is planar with two real arrangements, cis and trans, and
+# a bond within this tolerance of EITHER is correctly formed; `chemistry.AtomBond`
+# declares which arrangements each chemistry permits and `geometry.closure_geometry`
+# measures against the nearest, recording which it matched.
+#
+# This replaces a tolerance derived as "worst of 4 experimental controls + 5% margin".
+# That derivation was sound in procedure and wrong in reference set: all four mainchain
+# controls happen to be trans (dihedrals 177.0, 173.0, 172.0, 179.2), so it could only
+# ever produce a trans-only window, and it produced 8.44 deg. Measured against 150
+# cluster-unique native CPSea head-to-tail macrocycles -- the corpus these models are
+# trained on -- that window admits 27/150 while cis-or-trans at 30 deg admits 117/150,
+# and 75/150 of those natives sit nearer cis than trans with a median deviation from
+# trans of 90.3 deg. A gate calibrated on 4 structures was rejecting 82% of the
+# chemistry it exists to measure.
+# Planarity is an AMIDE criterion and applies only to chemistries whose closing bond is
+# an amide. A disulfide is not planar: its CB-SG-SG-CB dihedral sits near +-90 deg with a
+# genuinely broad spread, so a 30 deg planarity bar around +-90 is a category error, not a
+# strict standard. Measured: it fails 1SLD, a deposited crystal structure, at 52.82 deg.
+# Disulfides therefore keep the project's existing control-derived procedure, which is
+# chemistry-appropriate because it makes no planarity claim.
+ADOPTED_TORSION_TOL_DEG = 30.0
+AMIDE_CHEMISTRIES = ("mainchain", "isopeptide")
+ADOPTED_TORSION_SOURCE = (
+    "planarity within 30 deg of the nearest arrangement the chemistry permits (cis or "
+    "trans for an amide), following the established twisted-peptide classification; "
+    "adopted 2026-10-22, replacing a trans-only 8.44 deg window derived from 4 "
+    "all-trans controls that admitted 27/150 native CPSea head-to-tail macrocycles."
+)
+
 # Fractional slack away from the worst control, so a bar sitting exactly on an observed
 # value does not fail on floating-point noise or a re-run. Same default as
 # `derive_cyclic_thresholds.py`.
@@ -84,6 +141,10 @@ class ChemistryTolerance:
     n_controls: int
     max_intra_clashes: int = MAX_INTRA_CLASHES
     max_inter_clashes: int = MAX_INTER_CLASHES
+    # The worst closure-torsion deviation among this chemistry's experimental controls,
+    # kept for audit. It is NOT the bar -- `torsion_tol_deg` is a declared standard -- but
+    # it is what a control-derived bar would have been, so the two stay comparable.
+    worst_control_torsion_dev_deg: float | None = None
     fused_bond_dist_A: float = FUSED_BOND_DIST_A
     require_all_L: bool = True
     require_backbone_complete: bool = True
@@ -103,7 +164,7 @@ def derive_tolerances(
     plus the margin, or the fallback where that chemistry has no control.
     """
     out: dict[str, ChemistryTolerance] = {}
-    for chemistry, (lo, hi) in BOND_WINDOWS_A.items():
+    for chemistry, (lo, hi) in ADOPTED_BOND_WINDOWS_A.items():
         records = [
             r for r in control_closures.get(chemistry, []) if r.get("status") == "ok"
         ]
@@ -121,21 +182,31 @@ def derive_tolerances(
         else:
             angle_tol, angle_src = FALLBACK_ANGLE_TOL_DEG, "fallback (no control of this chemistry)"
 
-        if tor_devs:
+        # Declared standard, NOT derived from the controls. Deriving it from this control
+        # set is what produced a trans-only window; the worst control deviation is still
+        # reported below so the derivation remains auditable against the adopted bar.
+        worst_control_torsion = round(max(tor_devs), 2) if tor_devs else None
+        if chemistry in AMIDE_CHEMISTRIES:
+            tor_tol, tor_src = ADOPTED_TORSION_TOL_DEG, ADOPTED_TORSION_SOURCE
+        elif tor_devs:
+            # Not a planarity criterion; the existing worst-control procedure stands.
             tor_tol = round(max(tor_devs) * (1.0 + margin), 2)
-            tor_src = f"worst of {len(records)} experimental controls + {margin:.0%} margin"
+            tor_src = (f"worst of {len(records)} experimental controls + {margin:.0%} "
+                       f"margin (non-amide closure; planarity does not apply)")
         else:
-            tor_tol, tor_src = FALLBACK_TORSION_TOL_DEG, "fallback (no control of this chemistry)"
+            tor_tol = FALLBACK_TORSION_TOL_DEG
+            tor_src = "fallback (no control of this chemistry; planarity does not apply)"
 
         out[chemistry] = ChemistryTolerance(
             chemistry=chemistry,
             bond_length_min_A=lo,
             bond_length_max_A=hi,
-            bond_length_source="eval.cyclic_reconstruction_metrics (project standard)",
+            bond_length_source=ADOPTED_BOND_WINDOW_SOURCE,
             angle_tol_deg=angle_tol,
             angle_tol_source=angle_src,
             torsion_tol_deg=tor_tol,
             torsion_tol_source=tor_src,
+            worst_control_torsion_dev_deg=worst_control_torsion,
             n_controls=len(records),
         )
     return out
