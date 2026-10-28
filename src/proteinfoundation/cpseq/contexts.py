@@ -227,8 +227,20 @@ def load_lnr_contexts(
     *,
     min_len: int = PEPTIDE_MIN_LEN,
     max_len: int = PEPTIDE_MAX_LEN,
+    source: str = "LNR",
+    id_prefix: str = "lnr",
 ) -> tuple[list[ParentContext], list[dict]]:
-    """Parse LNR into parent contexts. Returns (contexts, rejected_rows)."""
+    """Parse a peptide-complex corpus into parent contexts. Returns (contexts, rejected).
+
+    The layout this reads -- a whitespace-separated list of
+    `entry_id receptor_chain peptide_chain` plus `pdbs/<entry_id>.pdb` -- is LNR's, and
+    PepBench's is identical, so one parser serves both.
+
+    `source` and `id_prefix` are parameters rather than the hardcoded "LNR"/"lnr" they
+    once were. A PepBench entry carried through as `lnr_A_Q_pdb4f27` with `source="LNR"`
+    is a false provenance claim in the one file that records what was evaluated, and it
+    would survive into every downstream table.
+    """
     lnr_root = Path(lnr_root)
     contexts: list[ParentContext] = []
     rejected: list[dict] = []
@@ -261,12 +273,12 @@ def load_lnr_contexts(
         rec_chains = contacting_chains(parsed, pep_chain)
         note = ""
         if rec_chain not in rec_chains:
-            note = f"test.txt names receptor chain {rec_chain} but it does not contact the peptide"
+            note = f"{list_file} names receptor chain {rec_chain} but it does not contact the peptide"
         extra = tuple(c for c in rec_chains if c != rec_chain)
         if extra:
             note = (note + "; " if note else "") + (
                 f"kept {len(extra)} further contacting chain(s) {','.join(extra)} that "
-                "test.txt does not list"
+                f"{list_file} does not list"
             )
         if not rec_chains:
             rejected.append({"pdb_id": pdb_id, "reason": "no receptor chain contacts the peptide"})
@@ -275,8 +287,8 @@ def load_lnr_contexts(
         local, resseq, mindist = pocket_for(parsed, rec_chains, pep_chain)
         contexts.append(
             ParentContext(
-                parent_id=f"lnr_{pdb_id}",
-                source="LNR",
+                parent_id=f"{id_prefix}_{pdb_id}",
+                source=source,
                 pdb_id=pdb_id,
                 structure_path=str(path),
                 receptor_chains=rec_chains,
