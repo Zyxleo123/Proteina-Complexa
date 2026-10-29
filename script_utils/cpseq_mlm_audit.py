@@ -200,13 +200,26 @@ def audit_arm(name: str, run_dir: Path) -> dict:
         print(f"\n5. PER-REGIME (final eval, withheld positions only)")
         last = ev[-1]
         base = manifest.get("baselines", {}).get("per_regime", {})
+        # Which prior the manifest actually holds. A run started before the
+        # chemistry-aware prior existed carries only the chemistry-FREE one, and that
+        # column overstates the model's margin by ~60% -- it is the bug this very script
+        # surfaced, so it must not be reprinted as though it were the bar.
+        has_chem = any("positional_chem_argmax_acc" in v for v in base.values())
+        prior_key = ("positional_chem_argmax_acc" if has_chem
+                     else "positional_argmax_acc")
+        if not has_chem and base:
+            print("   !! this run's manifest predates the chemistry-aware prior, so the")
+            print("      'prior' column below is P(r|pos,L) -- HANDICAPPED, since the model")
+            print("      is given the chemistry token. Measured true margin for these two")
+            print("      runs is +0.039 overall (prior 0.228), not the +0.063 shown here;")
+            print("      per regime: denovo +0.033 budget +0.048 anchor +0.029 span +0.056.")
         print(f"   {'regime':8s} {'top1':>7s} {'top3':>7s} {'prior':>7s} {'vs prior':>9s} {'ppl':>7s} {'n':>6s} trajectory")
         for rg in REGIMES:
             a = last.get(f"val/acc/{rg}")
             if a is None:
                 continue
             t3 = last.get(f"val/top3/{rg}")
-            pp = base.get(rg, {}).get("positional_argmax_acc")
+            pp = base.get(rg, {}).get(prior_key)
             traj = [r.get(f"val/acc/{rg}") for r in ev if r.get(f"val/acc/{rg}") is not None]
             delta = f"{a - pp:+.4f}" if pp is not None else "n/a"
             print(f"   {rg:8s} {a:7.4f} {t3:7.4f} {pp if pp is None else f'{pp:7.4f}'}"
