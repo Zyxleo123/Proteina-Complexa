@@ -163,14 +163,24 @@ Scheduler assumptions worth re-checking on the new cluster, all of them local to
 
 From `metrics.jsonl`. At step 60000, per-position accuracy on withheld positions only:
 
-| regime | pocket top-1 | pocket top-3 | control top-1 | control top-3 | positional prior (top-1) |
-|---|---|---|---|---|---|
-| denovo | 0.236 | 0.401 | 0.205 | 0.351 | 0.189 |
-| budget | 0.266 | 0.442 | 0.239 | 0.408 | 0.191 |
-| anchor | 0.555 | 0.651 | 0.565 | 0.648 | 0.426 |
-| span | 0.185 | 0.363 | 0.164 | 0.330 | 0.121 |
-| **all** | **0.268** | **0.430** | 0.246 | 0.391 | **0.204** |
-| shuffled pockets | 0.226 | 0.357 | 0.246 | 0.391 | — |
+| regime | pocket top-1 | pocket top-3 | control top-1 | `P(r\|pos,L)` | **`P(r\|pos,L,cyc)`** | model margin |
+|---|---|---|---|---|---|---|
+| denovo | 0.235 | 0.401 | 0.205 | 0.189 | 0.202 | +0.033 |
+| budget | 0.261 | 0.442 | 0.239 | 0.191 | 0.213 | +0.048 |
+| anchor | 0.555 | 0.651 | 0.565 | 0.426 | **0.526** | **+0.029** |
+| span | 0.184 | 0.361 | 0.164 | 0.121 | 0.128 | **+0.056** |
+| **all** | **0.267** | **0.430** | 0.246 | 0.204 | **0.228** | **+0.039** |
+| shuffled pockets | 0.226 | 0.357 | 0.246 | — | — | — |
+
+**Use the `P(r|pos,L,cyc)` column as the bar.** The model is handed the chemistry token, so
+a prior without it is handicapped. Quoting the chemistry-free prior overstated this arm's
+margin by 60% (+0.063 vs the honest +0.039).
+
+Two things that inverts. On `anchor` the prior rises 0.426 -> 0.526 once it sees the
+chemistry, so the model's margin there collapses to **+0.029** -- a terminal disulfide
+anchor must be CYS, which is a lookup, not a prediction. And `span`, which is the weakest
+regime by raw accuracy, is where the model contributes **most** (+0.056): a contiguous run
+cannot be guessed from position and chemistry, while a ring anchor largely can.
 
 **Read these three things and not more:**
 
@@ -195,6 +205,18 @@ From `metrics.jsonl`. At step 60000, per-position accuracy on withheld positions
   time with a re-forward. So this is not the accuracy of the sampling procedure.
 - The priors are **top-1 only**. There is no top-3 baseline, so the top-3 column has no
   matching bar; random top-3 of 20 residues is 0.15.
+- **A 2.4 training loss is not independently impressive.** In nats, measured on 2.44M
+  train peptides: uniform-20 = 2.996, amino-acid marginal = 2.883, +chemistry = 2.841,
+  +position&length = 2.690, +position&length&chemistry = 2.557, **model = 2.364**. The
+  entire learnable span from uniform to model is 0.63 nats and the model's share beyond
+  the best lookup table is 0.19 nats (ppl 12.89 -> 10.63, a 17.5% reduction). The floor is
+  high because residue identity in a 5-16-mer is intrinsically ambiguous -- visible in the
+  per-regime spread under one set of weights: `anchor` ppl 4.14 vs `span` ppl 14.14.
+- The arm-vs-arm gap (pocket 0.267 vs control 0.246) is **not significant**: positions are
+  clustered within peptides (4757 positions but only ~800 peptides, 5.9 each), giving a
+  clustered z of +1.00 against an unclustered +2.44. One seed per arm. The pocket-shuffle
+  gain is the sound evidence -- within-model, identical positions, monotone in training
+  (r=+0.89, late mean +0.0406 +- 0.0018 = 23 sd from zero).
 - Nothing here measures design success. These are teacher-forced infilling accuracies. Ring
   closure and Rosetta dG are this project's actual criteria, and the arm has not yet been
   run through the Boltz-2 gate against `mpnn_redesign`.

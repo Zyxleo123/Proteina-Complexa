@@ -75,6 +75,7 @@ from cpseq_mlm_data import (  # noqa: E402
     collate,
     draw_mask,
     load_corpus,
+    positional_chemistry_marginal,
     positional_marginal,
 )
 from proteinfoundation.cyclization.constants import UNSPECIFIED  # noqa: E402
@@ -316,15 +317,20 @@ def main() -> int:
     panel = build_eval_panel(val_rows, cfg, seed=args.seed, n=args.eval_n)
     marg = amino_acid_marginal(train_rows)
     posm = positional_marginal(train_rows)
+    # The chemistry-aware prior is THE bar: the model is handed the chemistry token, so a
+    # baseline without it is handicapped and the margin against it is inflated. Measured:
+    # quoting the chemistry-free prior overstated this model's margin by 60%
+    # (+0.0633 vs the honest +0.0393).
+    poscm = positional_chemistry_marginal(train_rows)
     base_all = baseline_accuracy(
-        [p[0] for p in panel], [p[1] for p in panel], marg, posm
+        [p[0] for p in panel], [p[1] for p in panel], marg, posm, poscm
     )
     per_regime_base = {}
     for regime in REGIMES:
         sub = [(r, h) for (r, h, g) in panel if g == regime]
         if sub:
             per_regime_base[regime] = baseline_accuracy(
-                [s[0] for s in sub], [s[1] for s in sub], marg, posm
+                [s[0] for s in sub], [s[1] for s in sub], marg, posm, poscm
             )
     manifest = {
         "model": args.model, "arm": "no_pocket" if args.no_pocket else "pocket",
@@ -339,8 +345,11 @@ def main() -> int:
     print("baselines (hidden positions only):")
     print(f"  marginal argmax ('{base_all['marginal_argmax_residue']}'): "
           f"{base_all['marginal_argmax_acc']:.4f}")
-    print(f"  positional argmax:                {base_all['positional_argmax_acc']:.4f}")
-    print("  >>> the trained model must beat the POSITIONAL number, not the marginal one.")
+    print(f"  positional argmax  P(r|pos,L):    {base_all['positional_argmax_acc']:.4f}")
+    print(f"  +chemistry  P(r|pos,L,cyc):       {base_all['positional_chem_argmax_acc']:.4f}  <== THE BAR")
+    print("  >>> judge the model against the CHEMISTRY-AWARE prior. The model is given the")
+    print("      chemistry token, so a prior without it is handicapped: using the")
+    print("      chemistry-free one overstated this arm's margin by 60%.")
 
     # ---- optimiser
     decay, no_decay = [], []
@@ -430,13 +439,14 @@ def main() -> int:
             row.update({f"val_pocketshuf/{k}": v for k, v in m_shuf.items()})
             row["val/baseline_marginal_acc"] = base_all["marginal_argmax_acc"]
             row["val/baseline_positional_acc"] = base_all["positional_argmax_acc"]
+            row["val/baseline_positional_chem_acc"] = base_all["positional_chem_argmax_acc"]
             # The headline: how much of the accuracy survives losing the right pocket.
             if "acc/all" in m and "acc/all" in m_shuf:
                 row["val/pocket_gain"] = m["acc/all"] - m_shuf["acc/all"]
             with open(metrics_path, "a") as f:
                 f.write(json.dumps(row) + "\n")
             print(f"  [eval {step}] acc/all={m.get('acc/all', float('nan')):.4f} "
-                  f"(pos-prior {base_all['positional_argmax_acc']:.4f}) "
+                  f"(chem-prior {base_all['positional_chem_argmax_acc']:.4f}) "
                   f"shuffled={m_shuf.get('acc/all', float('nan')):.4f} "
                   f"gain={row.get('val/pocket_gain', float('nan')):+.4f}", flush=True)
             for regime in REGIMES:
@@ -444,7 +454,7 @@ def main() -> int:
                     b = per_regime_base.get(regime, {})
                     print(f"      {regime:7s} acc={m[f'acc/{regime}']:.4f} "
                           f"ppl={m[f'ppl/{regime}']:.3f} "
-                          f"pos-prior={b.get('positional_argmax_acc', float('nan')):.4f} "
+                          f"chem-prior={b.get('positional_chem_argmax_acc', float('nan')):.4f} "
                           f"n={m[f'n_hidden/{regime}']}")
 
         if step % args.save_every == 0 or step == args.max_steps:

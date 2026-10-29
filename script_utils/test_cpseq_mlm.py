@@ -36,7 +36,11 @@ from cpseq_mlm_data import (  # noqa: E402
     draw_mask,
     positional_marginal,
 )
-from proteinfoundation.cyclization.constants import ISOPEPTIDE, MAINCHAIN  # noqa: E402
+from proteinfoundation.cyclization.constants import (  # noqa: E402
+    DISULFIDE,
+    ISOPEPTIDE,
+    MAINCHAIN,
+)
 
 
 def _row(pep="ACDEFGHIKL", pocket="MNPQ/RST", cyc=MAINCHAIN, i=0, j=None):
@@ -149,6 +153,44 @@ def test_mixed_shard_groupings_are_refused():
         assert_one_shard_grouping(
             ["val_shard0000of0004.jsonl", "val_shard0000of0032.jsonl"]
         )
+
+
+def test_chemistry_aware_prior_is_at_least_as_strong_as_the_positional_one():
+    """The model is HANDED the chemistry token, so a prior without it is handicapped and
+    the margin measured against it is inflated. Measured on the real panel, quoting the
+    chemistry-free prior overstated this arm's margin by 60% (+0.0633 vs +0.0393).
+
+    Constructed so chemistry is the ONLY thing that disambiguates: at position 0 a
+    mainchain peptide starts with A and a disulfide one with C, so P(r|pos,L) is at chance
+    between them while P(r|pos,L,cyc) is exact."""
+    from cpseq_mlm_data import positional_chemistry_marginal
+
+    rows = ([_row(pep="AAAA", cyc=MAINCHAIN) for _ in range(50)]
+            + [_row(pep="CAAA", cyc=DISULFIDE) for _ in range(50)])
+    masks = [[0] for _ in rows]
+    marg = amino_acid_marginal(rows)
+    posm = positional_marginal(rows)
+    poscm = positional_chemistry_marginal(rows)
+    b = baseline_accuracy(rows, masks, marg, posm, poscm)
+    assert b["positional_chem_argmax_acc"] == pytest.approx(1.0)
+    assert b["positional_argmax_acc"] == pytest.approx(0.5)
+    assert b["positional_chem_argmax_acc"] >= b["positional_argmax_acc"]
+
+
+def test_chemistry_prior_backs_off_on_unseen_cells():
+    """A (pos, L, cyc) cell absent from train must fall back to (pos, L), not score a free
+    miss -- otherwise the fair baseline is understated on rare length/chemistry pairs and
+    the model's margin gets re-inflated by the very fix meant to remove the bias."""
+    from cpseq_mlm_data import positional_chemistry_marginal
+
+    train = [_row(pep="AAAA", cyc=MAINCHAIN) for _ in range(20)]
+    poscm = positional_chemistry_marginal(train)
+    posm = positional_marginal(train)
+    marg = amino_acid_marginal(train)
+    # scored row carries a chemistry the prior never saw
+    unseen = [_row(pep="AAAA", cyc=ISOPEPTIDE)]
+    b = baseline_accuracy(unseen, [[0]], marg, posm, poscm)
+    assert b["positional_chem_argmax_acc"] == pytest.approx(1.0)
 
 
 def test_marginal_sums_to_one_and_counts_only_residues():

@@ -108,11 +108,30 @@ was 99.5% copying. A revealed position carrying a label is that bug.
 Every eval reports, on the identical hidden positions:
 
 - `marginal_argmax_acc` — always guess the commonest residue.
-- `positional_argmax_acc` — **the baseline that matters.** CPSea cyclises terminally, so
+- `positional_argmax_acc` — P(r | position, length). CPSea cyclises terminally, so
   positions 0 and L−1 are anchor-enriched; a model that learns only "anchor at the ends,
   hydrophobic in the middle" beats the flat marginal while knowing nothing about any
   pocket. A sibling arm in this project landed at 9.77% against a 9.7% always-guess-leucine
   prior, which read as learning until the prior was computed.
+- `positional_chem_argmax_acc` — P(r | position, length, **chemistry**). **This is the
+  bar.** The model is handed the chemistry token, so a prior without it is handicapped and
+  the margin against it is inflated. Measured on the real panel, the difference is not
+  cosmetic:
+
+  | | model | P(r\|pos,L) | P(r\|pos,L,cyc) | honest margin |
+  |---|---|---|---|---|
+  | denovo | 0.235 | 0.189 | 0.202 | +0.033 |
+  | budget | 0.261 | 0.191 | 0.213 | +0.048 |
+  | anchor | 0.555 | 0.426 | **0.526** | **+0.029** |
+  | span | 0.184 | 0.121 | 0.128 | **+0.056** |
+  | **all** | **0.267** | 0.204 | **0.228** | **+0.039** |
+
+  Quoting the chemistry-free prior overstated this arm's margin by 60% (+0.063 vs +0.039),
+  and it **inverted the per-regime story**: `anchor` looked like the model's best regime
+  (+0.129) and is actually its worst (+0.029), because a terminal disulfide anchor must be
+  CYS — a lookup, not a prediction. `span` is lowest in raw accuracy but is where the model
+  contributes most (+0.056): a contiguous run cannot be guessed from position and
+  chemistry, while a ring anchor largely can.
 - `val_pocketshuf/*` — **the pocket-shuffle control.** Same peptides, same masks, pockets
   permuted across examples. A pocket-conditioned model must lose accuracy;
   `val/pocket_gain` is the difference. Two arms in this project shipped a conditioning
@@ -204,6 +223,39 @@ props = p.propose(
 - `score()` gives the masked-LM **pseudo**-perplexity (one forward per position, that
   position alone masked) — the quantity PepMLM reports. It is not a joint likelihood and
   must not be compared against an autoregressive model's perplexity as though it were.
+
+## 8b. Why a ~2.4 loss is not self-evidently good
+
+Cross-entropy 2.364 nats = perplexity 10.6 over a ~20-way choice. Measured on 2.44M train
+peptides, the ladder it sits on:
+
+| predictor | nats | ppl |
+|---|---|---|
+| uniform over 20 residues | 2.996 | 20.00 |
+| amino-acid marginal `P(r)` | 2.883 | 17.87 |
+| + chemistry | 2.841 | 17.13 |
+| + position & length | 2.690 | 14.73 |
+| + position, length & chemistry | 2.557 | 12.89 |
+| **trained model** | **2.364** | **10.63** |
+
+The entire learnable span from uniform to model is **0.63 nats**, and the model's share
+beyond the best lookup table is **0.19 nats** — a 17.5% relative perplexity reduction. So
+"loss fell 3.4 → 2.4" is mostly the model learning composition and positional structure
+that a table already captures.
+
+The floor is high because residue identity in a 5–16-mer is intrinsically ambiguous: many
+residues are substitutable. The per-regime spread under one set of weights is the evidence —
+`anchor` ppl 4.14 (chemistry nearly determines it) against `span` ppl 14.14 (many valid
+answers). Training cannot drive this toward zero.
+
+Two sanity checks fall out: train CE 2.364 vs val 20-way-restricted 2.357 are essentially
+equal, so there is no train/val gap (consistent with 0.76 epochs) and the model puts almost
+no probability mass on the 18 non-residue vocab tokens.
+
+Do **not** compare this against published pLM perplexities. ESM-2-scale models report
+single-digit perplexity on UniRef, but that is natural proteins where evolutionary and
+structural context constrain identity heavily; a short macrocycle has almost no sequence
+context to exploit. Different entropy regimes.
 
 ## 9. Two traps that cost real time here
 

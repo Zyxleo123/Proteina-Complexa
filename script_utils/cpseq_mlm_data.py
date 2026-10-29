@@ -462,17 +462,62 @@ def positional_marginal(rows: list[CorpusRow]) -> dict[tuple[int, int], dict[str
     return out
 
 
+def positional_chemistry_marginal(
+    rows: list[CorpusRow],
+) -> dict[tuple[int, int, int], dict[str, float]]:
+    """P(residue | position, length, cyclization type) -- THE fair baseline.
+
+    WHY THIS EXISTS AND `positional_marginal` IS NOT ENOUGH. The model is handed the
+    chemistry as an input token, so a baseline that does not get it is handicapped
+    relative to the model, and the margin measured against it is inflated. Measured on the
+    real val panel, this mattered a lot:
+
+        model - P(r | pos, L)        = +0.0633
+        model - P(r | pos, L, cyc)   = +0.0393     <- the honest number
+
+    and the damage was concentrated exactly where the model looked strongest. On the
+    `anchor` regime the prior rises 0.4261 -> 0.5258 once it can see the chemistry, cutting
+    the model's apparent margin there from +0.129 to +0.029 -- because a terminal disulfide
+    anchor must be CYS, which is a lookup, not a prediction.
+
+    It also INVERTS which regime the model contributes most to: by raw accuracy `span` is
+    the weakest (0.184), but against a fair prior it is where the model adds the MOST
+    (+0.056) while `anchor` adds the least (+0.029). A contiguous run cannot be guessed
+    from position and chemistry; a ring anchor largely can.
+    """
+    counts: dict[tuple[int, int, int], dict[str, int]] = {}
+    for r in rows:
+        L = len(r.pep_seq)
+        for pos, ch in enumerate(r.pep_seq):
+            if ch not in AA20:
+                continue
+            d = counts.setdefault((pos, L, r.cyc_type), {})
+            d[ch] = d.get(ch, 0) + 1
+    out: dict[tuple[int, int, int], dict[str, float]] = {}
+    for key, d in counts.items():
+        tot = sum(d.values())
+        out[key] = {a: c / tot for a, c in d.items()}
+    return out
+
+
 def baseline_accuracy(
     rows: list[CorpusRow],
     masks: list[list[int]],
     marginal: dict[str, float],
     positional: dict[tuple[int, int], dict[str, float]] | None = None,
+    positional_chem: dict[tuple[int, int, int], dict[str, float]] | None = None,
 ) -> dict[str, float]:
-    """Accuracy of the always-argmax baselines on exactly the hidden positions given."""
+    """Accuracy of the always-argmax baselines on exactly the hidden positions given.
+
+    Report `positional_chem_argmax_acc` as the bar whenever the model is chemistry-
+    conditioned. The other two are kept because they show how much of the task is pure
+    composition and pure position, which is useful context -- but they are not the bar.
+    """
     best_global = max(marginal, key=marginal.get) if marginal else "L"
     n = 0
     hit_global = 0
     hit_pos = 0
+    hit_pos_chem = 0
     for row, hidden in zip(rows, masks):
         L = len(row.pep_seq)
         for p in hidden:
@@ -487,9 +532,23 @@ def baseline_accuracy(
                         hit_pos += 1
                 elif truth == best_global:
                     hit_pos += 1
+            if positional_chem is not None:
+                # Back off (pos, L, cyc) -> (pos, L) -> global, so a cell unseen in train
+                # degrades to the weaker prior rather than scoring a free miss. Without the
+                # backoff this baseline would be understated on rare length/chemistry
+                # combinations, which would re-inflate the model's margin.
+                d = positional_chem.get((p, L, row.cyc_type))
+                if not d and positional is not None:
+                    d = positional.get((p, L))
+                if d:
+                    if truth == max(d, key=d.get):
+                        hit_pos_chem += 1
+                elif truth == best_global:
+                    hit_pos_chem += 1
     return {
         "n_hidden": n,
         "marginal_argmax_acc": hit_global / max(n, 1),
         "positional_argmax_acc": hit_pos / max(n, 1),
+        "positional_chem_argmax_acc": hit_pos_chem / max(n, 1),
         "marginal_argmax_residue": best_global,
     }
