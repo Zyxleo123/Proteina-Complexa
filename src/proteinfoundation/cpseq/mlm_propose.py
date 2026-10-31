@@ -299,6 +299,86 @@ class MlmProposer:
             ))
         return out
 
+    # -- filling masks somebody else chose -----------------------------------------
+
+    def fill(
+        self,
+        *,
+        masks: list,
+        pocket_seq: str,
+        cyc_type: int,
+        original: str,
+        draws_per_mask: int = 1,
+        temperature: float = 1.0,
+        order: str = "random",
+        seed: int = 0,
+        budget: int | None = None,
+    ) -> list[dict]:
+        """Fill each of `masks`, returning one row per draw with its provenance.
+
+        The division of labour this exists for: something else -- an LLM reading the
+        interface, or a uniform draw -- decides WHICH positions to open, and this model
+        decides what goes in them. `masks` is a list of objects carrying `.mask`,
+        `.start_from` and optionally `.reason`/`.seed` (`llm_propose.MaskProposal`), or
+        bare position tuples, in which case the fill starts from `original`.
+
+        THE START IS NOT ALWAYS THE ORIGINAL. Filling a mask on an elite rewrites only
+        the masked positions of THAT sequence, so the result keeps the elite's other
+        substitutions. The budget is therefore still counted against `original`, and
+        this function does not enforce it -- `llm_propose.screen_candidates` does, after
+        the fact, because only the finished sequence says how many positions actually
+        differ. A mask whose worst case already breaks the budget should have been
+        refused by `screen_masks` before any of this ran.
+
+        NO-OP FILLS ARE RETURNED, NOT DROPPED. The model may re-emit the residue that
+        was already there, and at a 20-way softmax it sometimes will. Silently discarding
+        those would overstate the proposal rate and hide a temperature that is too low;
+        they are flagged `noop` and the caller decides.
+        """
+        rows: list[dict] = []
+        for k, item in enumerate(masks):
+            mask = tuple(getattr(item, "mask", item))
+            start_from = getattr(item, "start_from", original)
+            reason = getattr(item, "reason", "")
+            mask_seed = int(getattr(item, "seed", 0))
+            props = self.propose(
+                original=start_from,
+                edit_mask=list(mask),
+                pocket_seq=pocket_seq,
+                cyc_type=cyc_type,
+                n=draws_per_mask,
+                temperature=temperature,
+                order=order,
+                seed=seed + 1000 * k,
+                # Against `start_from`, whose length equals the original's. The real
+                # gate is `screen_candidates` against `original`.
+                budget=len(start_from) if budget is None else budget,
+            )
+            for p in props:
+                changed = tuple(
+                    i for i in range(len(original))
+                    if i < len(p.sequence) and p.sequence[i] != original[i]
+                )
+                rows.append({
+                    "sequence": p.sequence,
+                    "mask": ",".join(str(i) for i in mask),
+                    "mask_size": len(mask),
+                    "start_from": start_from,
+                    "edited_vs_start": ",".join(str(i) for i in p.edited_positions),
+                    "edited_vs_original": ",".join(str(i) for i in changed),
+                    "n_mutations_vs_original": len(changed),
+                    "noop": p.sequence == start_from,
+                    "mlm_logprob": round(p.logprob, 6),
+                    "unmask_order": p.order,
+                    "temperature": p.temperature,
+                    "fill_seed": p.seed,
+                    "mask_seed": mask_seed,
+                    "mask_reason": reason[:200],
+                    "per_position": p.per_position,
+                    "generator": "cpsea_mlm",
+                })
+        return rows
+
     # -- scoring ------------------------------------------------------------------
 
     def score(

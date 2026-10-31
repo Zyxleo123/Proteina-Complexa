@@ -141,7 +141,13 @@ class CandidateRecord:
     # ratio is imposed -- so the ratio has to be visible rather than enforced.
     n_valid_folds: int = 0
 
-    def one_line(self, original: str, *, show_substitutions: bool = True) -> str:
+    def one_line(
+        self,
+        original: str,
+        *,
+        show_substitutions: bool = True,
+        show_positions: bool = False,
+    ) -> str:
         """`show_substitutions` spells out the differences as `D1Y`.
 
         Switched off under the edit-list output format. That notation is anchored on the
@@ -152,6 +158,12 @@ class CandidateRecord:
         chance. The count stays, because how far a candidate sits from the original is
         real information; only the notation goes, and the sequence itself is printed on
         the same line anyway.
+
+        `show_positions` is the mask format's rendering: the differences as bare position
+        numbers, `3 sub at 2, 7, 11`. It is the same information in the only vocabulary
+        that format's answer may contain, so a history line cannot teach the model to
+        write a residue letter into a MASK line. It takes precedence over
+        `show_substitutions` when both are set.
         """
         subs = ",".join(
             f"{original[i]}{i + 1}{self.sequence[i]}"
@@ -178,9 +190,17 @@ class CandidateRecord:
             f" [{self.n_valid_folds}/{self.n_folds} fold(s) valid]"
             if self.n_folds else ""
         )
-        detail = f"{self.n_mutations} sub: {subs}" if show_substitutions else (
-            f"{self.n_mutations} sub"
-        )
+        if show_positions:
+            at = ", ".join(
+                str(i + 1)
+                for i in range(min(len(original), len(self.sequence)))
+                if original[i] != self.sequence[i]
+            )
+            detail = f"{self.n_mutations} sub at {at}" if at else "0 sub"
+        elif show_substitutions:
+            detail = f"{self.n_mutations} sub: {subs}"
+        else:
+            detail = f"{self.n_mutations} sub"
         return f"  {self.sequence}  ({detail})  {verdict}{folds}"
 
 
@@ -344,7 +364,8 @@ def shuffle_outcome_associations(
 # the other one: the proposals are not drawn from the same process.
 OUTPUT_FORMAT_EDITS = "edits"
 OUTPUT_FORMAT_SEQUENCE = "sequence"
-OUTPUT_FORMATS = (OUTPUT_FORMAT_EDITS, OUTPUT_FORMAT_SEQUENCE)
+OUTPUT_FORMAT_MASK = "mask"
+OUTPUT_FORMATS = (OUTPUT_FORMAT_EDITS, OUTPUT_FORMAT_SEQUENCE, OUTPUT_FORMAT_MASK)
 DEFAULT_OUTPUT_FORMAT = OUTPUT_FORMAT_EDITS
 
 SYSTEM_PROMPT_EDITS = (
@@ -365,26 +386,77 @@ SYSTEM_PROMPT_EDITS = (
 )
 
 
+# The mask format splits the proposal in two: the LLM says WHERE to edit and the CPSea
+# unmasking model says WHAT to put there. The division is not arbitrary. Reading an
+# interface and deciding which positions are wasted is a judgement over a table of
+# contacts, burial and overlap, which is what the LLM is being given and what it visibly
+# does well -- §6 of README_CPSEQ_LLM_SEARCH.md records it locating the overlap and the
+# empty positions unprompted. Choosing a residue is a question about what belongs at a
+# position given the pocket and the rest of the peptide, which is the question a masked
+# LM trained on 2.44M CPSea rows was fitted to answer and the LLM has no training signal
+# for. The same document also records the cost of making the LLM write sequences: all 16
+# malformed round-1 proposals were off-by-one in length, from miscounting letters. A
+# position list cannot be miscounted.
+SYSTEM_PROMPT_MASK = (
+    "You are an expert in peptide chemistry and structure-based design, working on a "
+    "head-to-tail cyclic peptide bound to a protein target.\n\n"
+    "You will be given the peptide sequence, a hard budget on how many positions may "
+    "be changed, a per-residue description of the interface from PLIP and Biopython, "
+    "and every candidate already built and scored.\n\n"
+    "YOUR JOB IS TO CHOOSE POSITIONS, NOT RESIDUES. You decide which positions are "
+    "worth redesigning. A separate model, trained on a large corpus of cyclic "
+    "peptide-receptor complexes, then chooses the residues to put at the positions you "
+    "name. Do not suggest residues; they will be ignored. Spend your reasoning on "
+    "which positions are wasted, harmful or improvable, and why.\n\n"
+    "Positions worth opening include: a residue that makes no receptor contact at all; "
+    "a residue whose side chain overlaps the receptor; a small residue leaving a pocket "
+    "empty; a buried charged residue. Positions worth leaving closed include: a residue "
+    "making a salt bridge or hydrogen bond to the receptor, and a fully buried "
+    "hydrophobic anchor.\n\n"
+    "Hard rules you must obey:\n"
+    "- Name positions only, as numbers. Never write a sequence or a residue letter.\n"
+    "- Positions are numbered from 1.\n"
+    "- Never name more positions than the stated budget allows.\n"
+    "- Never repeat a set of positions you have already proposed.\n"
+    "- The budget is a ceiling, not a target, but you may use more of it than a "
+    "hand-written substitution would, because you are not choosing the residues.\n\n"
+    "Output format. First a short block of reasoning, at most 120 words. Then the "
+    "proposals, one per line, each a comma-separated list of positions:\n"
+    "MASK: <position>, <position>, ... | <brief reason>\n"
+    "For example `MASK: 1, 5, 11 | none of these three touches the receptor`.\n"
+    "Emit exactly the number of MASK lines requested and nothing after the last one."
+)
+
+
 def system_prompt_for(output_format: str) -> str:
     if output_format not in OUTPUT_FORMATS:
         raise ValueError(f"unknown output format {output_format!r}")
+    if output_format == OUTPUT_FORMAT_MASK:
+        return SYSTEM_PROMPT_MASK
     return (
         SYSTEM_PROMPT_EDITS
         if output_format == OUTPUT_FORMAT_EDITS else SYSTEM_PROMPT
     )
 
 
-def render_numbered_sequence(seq: str) -> str:
+def render_numbered_sequence(seq: str, *, for_mask: bool = False) -> str:
     """The sequence being edited, laid out so the position-to-residue map is given.
 
     Residue before number, matching the order an EDIT line asks for, so the model reads
     `Y1` and writes `Y1F` rather than transposing a `1Y` it was shown.
+
+    `for_mask` changes only the closing instruction. The layout stays identical: a model
+    choosing WHICH positions to open still needs to see what currently sits at each one,
+    and the reason it must not copy `Y1` into its answer belongs in the sentence that
+    says what the answer is, not in a different table.
     """
     cells = "   ".join(f"{aa}{i + 1}" for i, aa in enumerate(seq))
-    return (
-        f"THE SEQUENCE YOU ARE EDITING, POSITION BY POSITION\n  {cells}\n"
-        f"Every residue you name in an EDIT line must come from THIS list."
+    closing = (
+        "Name positions from THIS list, as bare numbers: write `1`, not `Y1`."
+        if for_mask
+        else "Every residue you name in an EDIT line must come from THIS list."
     )
+    return f"THE SEQUENCE YOU ARE EDITING, POSITION BY POSITION\n  {cells}\n{closing}"
 
 
 def build_user_prompt(
@@ -415,10 +487,15 @@ def build_user_prompt(
     if output_format not in OUTPUT_FORMATS:
         raise ValueError(f"unknown output format {output_format!r}")
     edits_format = output_format == OUTPUT_FORMAT_EDITS
+    mask_format = output_format == OUTPUT_FORMAT_MASK
     # Under the edit-list format the prompt must not model original-anchored `D1Y`
     # notation anywhere, because that is the notation the model is asked to emit against
     # a DIFFERENT sequence. See `CandidateRecord.one_line`.
-    show_subs = not edits_format
+    #
+    # Under the mask format the history is rendered as bare positions instead, which is
+    # the same information in the only vocabulary a MASK line may contain.
+    show_subs = not edits_format and not mask_format
+    show_pos = mask_format
     alpha = alphabet or default_alphabet()
     excluded = sorted(set(AA20) - set(alpha))
     L = len(original)
@@ -432,7 +509,26 @@ def build_user_prompt(
     native_excluded = sorted(
         {f"{original[i]}{i + 1}" for i in range(L) if original[i] not in set(alpha)}
     )
-    if excluded:
+    if excluded and mask_format:
+        # Under the mask format the exclusion is not this model's rule to obey -- it
+        # chooses no residues. Stating it as a prohibition would read as "do not touch
+        # position 12", which is wrong: opening a position holding an excluded residue
+        # is how the search gets RID of it, and the filler cannot put one back.
+        rule = (
+            f"RESIDUES AVAILABLE TO THE FILLER: {''.join(alpha)}\n"
+            f"It will never introduce {' or '.join(excluded)} "
+            f"(a free cysteine could form an unintended disulfide and change the "
+            f"molecule's chemistry)."
+        )
+        if native_excluded:
+            rule += (
+                f" The original holds {', '.join(native_excluded)}. Leaving "
+                f"{'that position' if len(native_excluded) == 1 else 'those positions'} "
+                f"closed keeps the residue and costs no budget; opening "
+                f"{'it' if len(native_excluded) == 1 else 'them'} is how the residue "
+                f"gets replaced, and it cannot come back."
+            )
+    elif excluded:
         rule = (
             f"ALLOWED RESIDUES FOR SUBSTITUTIONS: {''.join(alpha)}\n"
             f"You must not INTRODUCE {' or '.join(excluded)} at any position "
@@ -500,11 +596,11 @@ def build_user_prompt(
         ]
         if passed:
             block.append("Passed, best energy first:")
-            block += [h.one_line(original, show_substitutions=show_subs)
+            block += [h.one_line(original, show_substitutions=show_subs, show_positions=show_pos)
                       for h in passed[:history_best]]
         if others[:history_worst]:
             block.append("Rejected, smallest geometry violation first:")
-            block += [h.one_line(original, show_substitutions=show_subs)
+            block += [h.one_line(original, show_substitutions=show_subs, show_positions=show_pos)
                       for h in others[:history_worst]]
         parts.append("\n".join(block))
 
@@ -593,6 +689,39 @@ def build_user_prompt(
             )
 
     start_from = parent_candidate.sequence if parent_candidate is not None else original
+    if output_format == OUTPUT_FORMAT_MASK:
+        headroom = mask_headroom(original, start_from, budget)
+        already_changed = sorted(
+            i + 1 for i in range(min(L, len(start_from)))
+            if original[i] != start_from[i]
+        )
+        if already_changed:
+            carried = (
+                f"{start_from} already differs from the original at position(s) "
+                f"{', '.join(str(i) for i in already_changed)}. Naming one of those "
+                f"again is free -- it is already being paid for. You may open up to "
+                f"{headroom} further position(s) on top of them."
+            )
+        else:
+            carried = f"You may name up to {headroom} positions in a single proposal."
+        parts.append(
+            f"TASK\nPropose exactly {n_requested} distinct sets of positions to open "
+            f"in {start_from}, the sequence named above as the one to improve.\n"
+            + render_numbered_sequence(start_from, for_mask=True) + "\n"
+            f"Name positions only. The residues to put at them will be chosen by a "
+            f"model trained on cyclic peptide-receptor complexes, which sees this "
+            f"target's pocket and the cyclization chemistry. A residue letter in your "
+            f"answer is discarded.\n"
+            f"{carried}\n"
+            f"Vary the size of the sets across your proposals, and make them cover "
+            f"different parts of the peptide: two proposals that open nearly the same "
+            f"positions give the search almost nothing the first one did not. Include "
+            f"at least one proposal that opens a single position and at least one that "
+            f"uses most of the allowance.\n"
+            f"End with exactly {n_requested} lines of the form:\n"
+            f"MASK: <position>, <position>, ... | <brief reason>"
+        )
+        return "\n\n".join(parts)
     if edits_format:
         parts.append(
             f"TASK\nPropose exactly {n_requested} distinct sets of substitutions to "
@@ -767,6 +896,136 @@ def parse_edit_completion(
             continue
         found.append((seq, reason))
     return found, malformed
+
+
+_MASK_LINE_RE = re.compile(
+    r"^[ \t]*(?:\d{1,2}[.)]\s*)?MASKS?\s*:\s*(?P<body>[^|\n]*?)\s*"
+    r"(?:\|\s*(?P<reason>.*))?$",
+    re.MULTILINE | re.IGNORECASE,
+)
+# Only bare integers. A line that names residues as well -- `MASK: K7, L9` -- is a model
+# that has not understood the division of labour, and reading the number out of it would
+# hide that in the one place the log is supposed to show it.
+_MASK_POS_RE = re.compile(r"^\s*\d{1,3}\s*$")
+
+
+def parse_mask_completion(
+    text: str, *, length: int
+) -> tuple[list[tuple[tuple[int, ...], str]], list[dict]]:
+    """Read MASK lines into 0-based position tuples.
+
+    Returns `(masks, malformed)` rather than the `(sequence, reason)` pairs the other two
+    formats return, because under this format the model does not produce a sequence --
+    the unmasking model does, from these positions. The legality screen is therefore
+    `screen_masks` here and `screen_candidates` after the fill, and both run: a mask can
+    be legal while the sequence built from it is not.
+
+    Positions are 1-based in the prompt and 0-based everywhere in the code, and that
+    conversion happens here, once.
+    """
+    found: list[tuple[tuple[int, ...], str]] = []
+    malformed: list[dict] = []
+    for m in _MASK_LINE_RE.finditer(text):
+        body, reason = m.group("body") or "", (m.group("reason") or "").strip()
+        fields = [f for f in body.replace(";", ",").split(",") if f.strip()]
+        if not fields:
+            malformed.append({"text": m.group(0)[:120], "reason": "no position parsed"})
+            continue
+        if not all(_MASK_POS_RE.match(f) for f in fields):
+            bad = [f.strip() for f in fields if not _MASK_POS_RE.match(f)][:4]
+            malformed.append({
+                "text": m.group(0)[:120],
+                "reason": f"not a bare position: {', '.join(bad)}",
+            })
+            continue
+        ones = [int(f) for f in fields]
+        if any(not (1 <= p <= length) for p in ones):
+            malformed.append({
+                "text": m.group(0)[:120],
+                "reason": f"position outside 1..{length}",
+            })
+            continue
+        found.append((tuple(sorted({p - 1 for p in ones})), reason))
+    return found, malformed
+
+
+def mask_headroom(original: str, start_from: str, budget: int) -> int:
+    """How many CLOSED positions of `start_from` a mask may open and still be safe.
+
+    A mask on an offspring is not capped at `budget` positions. Let `d` be where
+    `start_from` already differs from the original. After filling a mask `M`, the
+    finished sequence differs from the original at `(d \\ M)` plus whichever positions of
+    `M` the fill does not return to the original residue, so in the worst case at
+    `|d \\ M| + |M|` positions. Writing `N = M \\ d` for the positions the mask opens
+    that are not already changed, that worst case is exactly `|d| + |N|`. So re-opening
+    a position the offspring has already changed is free -- it can only revert or
+    re-edit a difference that is already being paid for -- and the budget constrains
+    `|N|` alone.
+
+    Returning the headroom rather than a cap on `|M|` is what lets an elite carrying six
+    differences still be handed a seven-position mask, which the naive cap would refuse
+    and which is the ordinary case for a deep round.
+    """
+    d = sum(1 for a, b in zip(original, start_from) if a != b)
+    return max(0, int(budget) - d)
+
+
+def screen_masks(
+    masks: list[tuple[tuple[int, ...], str]],
+    *,
+    original: str,
+    start_from: str | None = None,
+    budget: int | None = None,
+    already: set[tuple[int, ...]] | None = None,
+) -> tuple[list[tuple[tuple[int, ...], str]], list[dict]]:
+    """Legality of a mask, before any weight is loaded.
+
+    The budget is checked HERE and not only after the fill. `mlm_propose.validate_request`
+    would also refuse an over-budget mask, but it raises, and one bad line out of eight
+    must cost that line and not the round. Rejections are counted by reason for the same
+    purpose they are in `screen_candidates`: a model that mostly names illegal positions
+    and one that mostly names good ones must not look alike in the log.
+
+    Passing this screen does NOT make the filled sequence legal. It bounds the worst
+    case, and `screen_candidates` still judges what the fill actually produced, against
+    the original and with the shared alphabet and novelty rules. Both run, because a
+    legal mask can produce an illegal sequence and the two rejections mean different
+    things: one is the LLM's fault and the other is the unmasking model's.
+
+    A duplicate mask is rejected rather than deduplicated silently. Two identical masks
+    would still give different sequences, since the fill is sampled -- but the ROUND then
+    contains less independent variation than its count suggests, and §6's diversity
+    finding is that this proposer's failure mode is exactly concentration.
+    """
+    base = original if start_from is None else start_from
+    cap = len(original) // 2 if budget is None else int(budget)
+    headroom = mask_headroom(original, base, cap)
+    changed = {i for i in range(min(len(original), len(base))) if original[i] != base[i]}
+    seen: set[tuple[int, ...]] = set(already or ())
+    accepted: list[tuple[tuple[int, ...], str]] = []
+    rejected: list[dict] = []
+    for mask, reason in masks:
+        key = tuple(sorted(mask))
+        opened = [i for i in key if i not in changed]
+        if not mask:
+            why = "empty mask"
+        elif len(opened) > headroom:
+            why = (
+                f"{len(opened)} newly opened position(s) exceeds the headroom "
+                f"{headroom} left by budget {cap}"
+            )
+        elif key in seen:
+            why = "duplicate mask"
+        else:
+            seen.add(key)
+            accepted.append((key, reason))
+            continue
+        rejected.append({
+            "mask": ",".join(str(i) for i in sorted(mask)),
+            "reason": why,
+            "model_reason": reason[:160],
+        })
+    return accepted, rejected
 
 
 def screen_candidates(
@@ -1114,6 +1373,198 @@ def propose_round(
             f"{len(proposals)}, not {want}"
         )
     return proposals, record
+
+
+@dataclass
+class MaskProposal:
+    """One set of positions the LLM wants opened, and where it wants them opened.
+
+    Deliberately not a `Proposal`. A `Proposal` carries a sequence and is a thing the
+    evaluator can fold; this is a question put to the unmasking model, and until that
+    model answers there is no candidate. Keeping the two types apart is what stops a
+    mask from being counted as a proposal in a round that never got as far as filling it.
+    """
+
+    mask: tuple[int, ...]
+    start_from: str
+    original: str
+    reason: str = ""
+    seed: int = 0
+
+    @property
+    def newly_opened(self) -> tuple[int, ...]:
+        """Masked positions that `start_from` has not already changed.
+
+        These are the ones that cost budget; see `mask_headroom`.
+        """
+        return tuple(
+            i for i in self.mask
+            if i >= len(self.original) or self.original[i] == self.start_from[i]
+        )
+
+    def to_row(self) -> dict:
+        return {
+            "mask": ",".join(str(i) for i in self.mask),
+            "mask_size": len(self.mask),
+            "n_newly_opened": len(self.newly_opened),
+            "start_from": self.start_from,
+            "mask_seed": self.seed,
+            "llm_reason": self.reason[:200],
+        }
+
+
+def propose_mask_round(
+    *,
+    proposer: LlamaProposer,
+    original: str,
+    budget: int,
+    round_index: int,
+    parent_id: str,
+    already_masks: set[tuple[int, ...]] | None = None,
+    reference_summary: dict | None = None,
+    history: list[CandidateRecord] | None = None,
+    alphabet: tuple[str, ...] | None = None,
+    pdb_id: str | None = None,
+    pocket_note: str | None = None,
+    feedback_note: str | None = None,
+    max_attempts: int = DEFAULT_MAX_ATTEMPTS,
+    prompt_dir: Path | None = None,
+    n_requested: int | None = None,
+    parent_candidate: CandidateRecord | None = None,
+    prompt_tag: str = "llmmask",
+) -> tuple[list[MaskProposal], dict]:
+    """Ask the LLM which positions to open. It never sees a residue it must choose.
+
+    The same shape as `propose_round` -- same attempt loop, same retry note, same audit
+    record, same refusal to pad a short round -- because the two are arms of one
+    experiment and a difference in how a round is run would be confounded with the
+    difference being measured.
+
+    What it returns are masks, not candidates. The fill is a separate step with a
+    separate model, and `screen_candidates` still judges what that fill produces: a legal
+    mask can yield an illegal sequence, and the two rejections are charged to different
+    models.
+    """
+    alpha = alphabet or default_alphabet()
+    want = budget if n_requested is None else max(1, int(n_requested))
+    system = system_prompt_for(OUTPUT_FORMAT_MASK)
+    start_from = (
+        parent_candidate.sequence if parent_candidate is not None else original
+    )
+    blocked: set[tuple[int, ...]] = set(already_masks or ())
+    accepted: list[tuple[tuple[int, ...], str]] = []
+    attempts: list[dict] = []
+    rejections: list[dict] = []
+    malformed: list[dict] = []
+
+    record: dict = {
+        "parent_id": parent_id,
+        "round_index": round_index,
+        "arm": ARM_LLM,
+        "original_sequence": original,
+        "budget": budget,
+        "headroom": mask_headroom(original, start_from, budget),
+        "n_requested": want,
+        "output_format": OUTPUT_FORMAT_MASK,
+        "start_from": start_from,
+        "elite_sequence": (
+            parent_candidate.sequence if parent_candidate is not None else None
+        ),
+        "elite_energy": (
+            parent_candidate.energy if parent_candidate is not None else None
+        ),
+        "llm": proposer.config,
+        "feedback_candidates_shown": len(history or []),
+        "attempts": attempts,
+        "rejections": rejections,
+        "malformed": malformed,
+        "note": "",
+    }
+
+    for attempt in range(max_attempts):
+        need = want - len(accepted)
+        if need <= 0:
+            break
+        ask = min(need + 2, want + 4)
+        user = build_user_prompt(
+            original=original,
+            budget=budget,
+            n_requested=ask,
+            reference_summary=reference_summary,
+            history=history,
+            alphabet=alpha,
+            pdb_id=pdb_id,
+            pocket_note=pocket_note,
+            feedback_note=feedback_note,
+            parent_candidate=parent_candidate,
+            output_format=OUTPUT_FORMAT_MASK,
+        )
+        if attempt:
+            tail = rejections[-6:]
+            user += (
+                "\n\nYOUR PREVIOUS ANSWER WAS PARTLY UNUSABLE. Rejected proposals and "
+                "why:\n"
+                + "\n".join(f"  MASK {r['mask']}: {r['reason']}" for r in tail)
+                + f"\nPropose {ask} DIFFERENT sets of positions that obey every rule."
+            )
+        seed = proposal_seed(parent_id, round_index, prompt_tag, attempt)
+        comp = proposer.complete(system, user, seed=seed)
+
+        cands, bad = parse_mask_completion(comp["text"], length=len(original))
+        malformed.extend(bad)
+        ok, rej = screen_masks(
+            cands,
+            original=original,
+            start_from=start_from,
+            budget=budget,
+            already=blocked,
+        )
+        for mask, reason in ok:
+            if len(accepted) >= want:
+                break
+            blocked.add(mask)
+            accepted.append((mask, reason))
+        rejections.extend(rej)
+        attempts.append({
+            "attempt": attempt,
+            "seed": seed,
+            "n_parsed": len(cands),
+            "n_malformed": len(bad),
+            "n_accepted": len(ok),
+            "n_rejected": len(rej),
+            "prompt_tokens": comp["prompt_tokens"],
+            "completion_tokens": comp["completion_tokens"],
+            "seconds": comp["seconds"],
+        })
+        if prompt_dir is not None:
+            prompt_dir.mkdir(parents=True, exist_ok=True)
+            stem = f"{parent_id}_r{round_index}_{prompt_tag}_a{attempt}"
+            (prompt_dir / f"{stem}.prompt.txt").write_text(
+                f"=== SYSTEM ===\n{system}\n\n=== USER ===\n{user}\n"
+            )
+            (prompt_dir / f"{stem}.completion.txt").write_text(comp["text"])
+
+    masks = [
+        MaskProposal(
+            mask=mask,
+            start_from=start_from,
+            original=original,
+            reason=reason,
+            seed=proposal_seed(parent_id, round_index, prompt_tag, "pick", k),
+        )
+        for k, (mask, reason) in enumerate(accepted)
+    ]
+    record["n_accepted"] = len(masks)
+    record["masks"] = [",".join(str(i) for i in m.mask) for m in masks]
+    record["mask_sizes"] = [len(m.mask) for m in masks]
+    if len(masks) < want:
+        record["note"] = (
+            f"round {round_index} produced {len(masks)}/{want} legal novel masks "
+            f"after {len(attempts)} attempt(s); the shortfall is NOT padded with "
+            f"random masks, so this arm's budget for this round is {len(masks)}, "
+            f"not {want}"
+        )
+    return masks, record
 
 
 # --------------------------------------------------------------------------------------

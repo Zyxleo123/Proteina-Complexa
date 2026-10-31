@@ -27,12 +27,15 @@ from proteinfoundation.cpseq.llm_propose import (  # noqa: E402
     apply_substitutions,
     build_user_prompt,
     history_from_outcomes,
+    mask_headroom,
     parse_completion,
     parse_edit_completion,
+    parse_mask_completion,
     propose_generation,
     render_single_substitution_pairs,
     round_diversity,
     screen_candidates,
+    screen_masks,
     select_elites,
     shuffle_outcome_associations,
     single_substitution_pairs,
@@ -659,6 +662,129 @@ def test_edit_parsing() -> None:
 
 
 
+def test_mask_parsing() -> None:
+    """The mask format: the LLM names positions, never residues."""
+    print("\nmask format -- parsing")
+    L = len(ORIG_CYS)
+
+    found, bad = parse_mask_completion(
+        "Thinking about it.\n"
+        "MASK: 1, 5, 11 | none of these three touches the receptor\n"
+        "MASK: 7 | the lysine is buried and unpaired\n"
+        "3. Masks: 2;4 | both point into solvent\n",
+        length=L,
+    )
+    check("three MASK lines parsed", len(found) == 3, f"{found}")
+    check("positions come back 0-based and sorted",
+          found[0][0] == (0, 4, 10), f"{found[0][0]}")
+    check("a single position parses", found[1][0] == (6,), f"{found[1][0]}")
+    check("a numbered line with semicolons parses",
+          found[2][0] == (1, 3), f"{found[2][0]}")
+    check("the reason is carried as provenance",
+          "touches the receptor" in found[0][1])
+
+    # The failure that matters: a model that answers in residue notation has not
+    # understood the division of labour, and reading the number out of `K7` would hide
+    # exactly that in the one place the log should show it.
+    found, bad = parse_mask_completion("MASK: K7, L9 | swap these", length=L)
+    check("a residue letter makes the line malformed, not a position",
+          found == [] and len(bad) == 1, f"{found} {bad}")
+    check("the malformed reason names what was wrong",
+          "not a bare position" in bad[0]["reason"], f"{bad}")
+
+    found, bad = parse_mask_completion("MASK: 0, 3 | zero-based by mistake", length=L)
+    check("position 0 is out of range in a 1-based prompt",
+          found == [] and "outside" in bad[0]["reason"], f"{found} {bad}")
+    found, bad = parse_mask_completion(f"MASK: {L + 1} | past the end", length=L)
+    check("a position past the end is rejected",
+          found == [] and "outside" in bad[0]["reason"], f"{found} {bad}")
+    found, bad = parse_mask_completion("MASK: | nothing here", length=L)
+    check("an empty body is malformed",
+          found == [] and "no position parsed" in bad[0]["reason"], f"{bad}")
+
+    check("a duplicate position collapses within one mask",
+          parse_mask_completion("MASK: 3, 3, 5 | x", length=L)[0][0][0] == (2, 4))
+    check("nothing is parsed from the other formats",
+          parse_mask_completion("PROPOSE: RIIYDRKFLMECRW | x", length=L)[0] == []
+          and parse_mask_completion("EDIT: K7R | x", length=L)[0] == [])
+
+
+def test_mask_legality() -> None:
+    """`screen_masks` bounds the worst case; `screen_candidates` still judges the fill."""
+    print("\nmask format -- legality")
+    budget = len(ORIG_CYS) // 2  # 7
+
+    acc, rej = screen_masks(
+        [((0, 1, 2), "a"), (tuple(range(8)), "b"), ((0, 1, 2), "c")],
+        original=ORIG_CYS, budget=budget,
+    )
+    check("a mask within budget is accepted", len(acc) == 1, f"{acc}")
+    check("an over-budget mask is rejected with its size",
+          any("exceeds the headroom" in r["reason"] for r in rej), f"{rej}")
+    check("a repeated mask is rejected, not silently deduplicated",
+          any(r["reason"] == "duplicate mask" for r in rej), f"{rej}")
+
+    # Breeding from an elite. The budget caps differences from the ORIGINAL, so
+    # re-opening a position the elite already changed costs nothing.
+    elite = "RIAYDRKFLMETRN"   # differs from ORIG_CYS at positions 2 and 11
+    check("headroom is the budget less what the elite already spends",
+          mask_headroom(ORIG_CYS, elite, budget) == budget - 2)
+    acc, rej = screen_masks(
+        [((2, 11), "reopen only what it already changed")],
+        original=ORIG_CYS, start_from=elite, budget=budget,
+    )
+    check("re-opening an already-changed position is free", len(acc) == 1, f"{rej}")
+    acc, rej = screen_masks(
+        [(tuple(range(7)), "seven fresh positions on an elite that spends two")],
+        original=ORIG_CYS, start_from=elite, budget=budget,
+    )
+    check("a mask whose worst case breaks the budget is refused",
+          len(acc) == 0 and "headroom" in rej[0]["reason"], f"{acc} {rej}")
+
+    acc, _ = screen_masks(
+        [((0, 1, 2), "x")], original=ORIG_CYS, budget=budget, already={(0, 1, 2)},
+    )
+    check("a mask proposed in an earlier attempt is blocked", acc == [])
+
+
+def test_mask_prompt() -> None:
+    """The prompt must ask for positions and must not model residue notation."""
+    print("\nmask format -- prompt")
+    hist = [
+        CandidateRecord(sequence="RIAYDRKFLMECRN", n_mutations=1, valid=True,
+                        energy=-30.0, n_folds=5, n_valid_folds=5),
+    ]
+    prompt = build_user_prompt(
+        original=ORIG_CYS, budget=7, n_requested=8, history=hist,
+        alphabet=ALPHA, output_format="mask",
+    )
+    check("the answer format is MASK", "MASK: <position>" in prompt)
+    check("it says the residues are chosen elsewhere",
+          "chosen by a model trained on cyclic peptide-receptor complexes" in prompt)
+    check("it says a residue letter is discarded",
+          "A residue letter in your answer is discarded." in prompt)
+    check("the numbered sequence asks for bare numbers",
+          "write `1`, not `Y1`" in prompt)
+    check("no EDIT instruction leaks in", "EDIT:" not in prompt)
+    check("no PROPOSE instruction leaks in", "PROPOSE:" not in prompt)
+    # History under this format is rendered as positions, so no history line can teach
+    # the model to write a residue letter into a MASK line.
+    check("history shows positions, not substitution notation",
+          "1 sub at 3" in prompt and "I3A" not in prompt, prompt[-1200:])
+    check("it asks for a spread of mask sizes",
+          "opens a single position" in prompt and "most of the allowance" in prompt)
+
+    # The cysteine rule is not this model's rule to obey. Stated as a prohibition it
+    # reads as "do not touch position 12", which is backwards: opening that position is
+    # how the search replaces the cysteine, and the filler cannot put one back.
+    check("the excluded residue is described as the filler's constraint",
+          "RESIDUES AVAILABLE TO THE FILLER" in prompt
+          and "It will never introduce C" in prompt, prompt[:900])
+    check("it does not forbid the model from opening the native cysteine",
+          "You must not INTRODUCE" not in prompt
+          and "opening it is how the residue gets replaced" in prompt, prompt[:900])
+
+
 def main() -> int:
     print("arm D (LLM proposal) checks")
     test_parsing()
@@ -675,6 +801,9 @@ def main() -> int:
     test_prompt_carries_the_new_blocks()
     test_edit_output_format()
     test_edit_parsing()
+    test_mask_parsing()
+    test_mask_legality()
+    test_mask_prompt()
     print(f"\n{PASS} passed, {FAIL} failed")
     return 1 if FAIL else 0
 

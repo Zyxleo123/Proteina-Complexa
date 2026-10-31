@@ -36,11 +36,13 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from proteinfoundation.cpseq.evaluate import (  # noqa: E402
+    SCORING_BEHAVIOUR,
     SCORING_PROTOCOL_VERSION,
     Protocol,
     Store,
     evaluate,
     load_target_contexts,
+    scoring_behaviour,
 )
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -67,6 +69,14 @@ def main() -> int:
         "arm under test is the bug this tool exists to repair.",
     )
     ap.add_argument("--chemistry", default="mainchain")
+    ap.add_argument(
+        "--scoring-version", default=SCORING_PROTOCOL_VERSION,
+        choices=sorted(SCORING_BEHAVIOUR),
+        help="which protocol to score under. Defaults to the current one. Named "
+        "explicitly when the point is to reach an OLDER protocol -- re-scoring an arm "
+        "down to the version its baseline already carries is cheaper than re-scoring "
+        "the baseline up, and it is the same like-for-like comparison either way.",
+    )
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
 
@@ -80,7 +90,7 @@ def main() -> int:
         d = sources.get(pid) or cohort.get("dataset_dir")
         contexts |= load_target_contexts(Path(d), [pid])
 
-    protocol = Protocol(chemistry=args.chemistry)
+    protocol = Protocol(chemistry=args.chemistry, scoring_version=args.scoring_version)
     # The cohort's own frozen gate, exactly as `ladder` loads it. A rescore that picked
     # up a different tolerances file would change the verdict for a reason that has
     # nothing to do with the scoring protocol under test.
@@ -91,7 +101,10 @@ def main() -> int:
         retention="full",
     )
     print(f"[rescore] {out_dir}")
-    print(f"[rescore] target protocol: {SCORING_PROTOCOL_VERSION}")
+    behaviour = scoring_behaviour(args.scoring_version)
+    print(f"[rescore] target protocol: {args.scoring_version}")
+    print(f"[rescore] validity judged on: {behaviour['validity_stage']}")
+    print(f"[rescore] relax holds: {behaviour['relax_restraint']}")
 
     done = 0
     t0 = time.time()
@@ -108,7 +121,11 @@ def main() -> int:
         for o in journal.outcomes:
             if o.get("technical_failure") or not o.get("input_hash"):
                 continue
-            if o.get("scoring_version") == SCORING_PROTOCOL_VERSION:
+            # Already at the REQUESTED protocol, not merely at the current default.
+            # Comparing against the module constant re-scored every fold that already
+            # carried the target version and skipped the ones that needed the work --
+            # exactly backwards whenever the target is an older protocol.
+            if o.get("scoring_version") == args.scoring_version:
                 continue
             if args.stage and o.get("stage") != args.stage:
                 continue
@@ -135,7 +152,7 @@ def main() -> int:
                 break
             if args.dry_run:
                 print(f"    [dry] {o['sequence']} seed={o['prediction_seed']} "
-                      f"({o.get('scoring_version')} -> {SCORING_PROTOCOL_VERSION})")
+                      f"({o.get('scoring_version')} -> {args.scoring_version})")
                 done += 1
                 continue
             rec = evaluate(

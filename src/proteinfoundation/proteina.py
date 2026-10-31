@@ -37,7 +37,10 @@ from proteinfoundation.logging.metric_schema import finalize_metrics, init_metri
 from proteinfoundation.nn.genie2 import Genie2Denoiser
 from proteinfoundation.utils.file_utils import create_dir as _create_dir
 from proteinfoundation.utils.sample_utils import add_clean_samples, sample_formatting
-from proteinfoundation.utils.seq_conditioning import sequence_conditioning_fraction
+from proteinfoundation.utils.seq_conditioning import (
+    choose_reveal_mask,
+    sequence_conditioning_fraction,
+)
 from proteinfoundation.utils.training_handlers import _safe_get as _safe_cfg_get
 from proteinfoundation.utils.training_handlers import handle_batch_conditioning
 from proteinfoundation.utils.validation_utils import (
@@ -2370,12 +2373,19 @@ class Proteina(L.LightningModule):
             if "residue_type" not in gen_batch:
                 logger.warning("seq-conditioned val_generation requested but batch has no `residue_type`; skipping.")
                 return
-            keep_frac = float(vg.get("seq_cond", {}).get("keep_frac", 1.0))
-            if keep_frac >= 1.0:
-                seq_cond_mask = gen_mask.clone()
-            else:
-                seq_cond_mask = (torch.rand_like(gen_mask, dtype=torch.float32) < keep_frac) & gen_mask
+            # An explicit per-residue reveal mask wins over `keep_frac` -- see
+            # `choose_reveal_mask`. It rides in on the batch, and `gen_batch` copies every
+            # key from `batch` and repeat_interleaves tensors, so a [b, n] bool built per
+            # ORIGINAL row arrives already expanded to the repeats.
+            seq_cond_mask = choose_reveal_mask(
+                gen_batch.get("seq_cond_reveal_mask", None),
+                float(vg.get("seq_cond", {}).get("keep_frac", 1.0)),
+                gen_mask,
+                n_repeat=n_repeat,
+            )
             gen_batch["use_residue_type_feature"] = seq_cond_mask
+            # Not a model input; drop it so nothing downstream mistakes it for a feature.
+            gen_batch.pop("seq_cond_reveal_mask", None)
         else:
             # A val batch is a plain data batch, but be explicit: an unconditioned pass must
             # not inherit a flag from anywhere.

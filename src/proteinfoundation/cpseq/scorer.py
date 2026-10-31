@@ -75,14 +75,44 @@ from proteinfoundation.evaluation.rosetta_energy import (  # noqa: E402
 )
 
 
-def _init_flags_record() -> dict:
-    """The shared PyRosetta init, recorded so the protonation/typing policy is explicit."""
+# How much of the closing junction the relax holds. These are not interchangeable
+# qualities of the same protocol: `JUNCTION` changes the refined coordinates and every
+# refined energy, which is why it was a scoring-version bump rather than a new rule on
+# old structures. `BOND` is what v2-v4 applied, and it stays selectable so a run scored
+# under one of those versions can reproduce its own relax instead of being re-judged by
+# a protocol it never ran under.
+BOND_RESTRAINT = "bond"
+JUNCTION_RESTRAINT = "junction"
+
+
+def _init_flags_record(relax_restraint: str = JUNCTION_RESTRAINT) -> dict:
+    """The shared PyRosetta init, recorded so the protonation/typing policy is explicit.
+
+    `relax_restraint` is described from the mode actually used, not stated as a
+    constant. It was a fixed string describing the bond-only restraint, written before
+    the junction restraint existed, so a v5 run recorded provenance claiming only an
+    AtomPairConstraint had been applied -- understating the restraint in the one field a
+    reader would consult to find out.
+    """
+    restraint_desc = {
+        BOND_RESTRAINT: (
+            "constrain_relax_to_start_coords + closure AtomPairConstraint "
+            "(harmonic, sd 0.05 A, on both the complex and the isolated peptide)"
+        ),
+        JUNCTION_RESTRAINT: (
+            "constrain_relax_to_start_coords + closure junction held: AtomPairConstraint "
+            "(harmonic, sd 0.05 A) + both closure AngleConstraints (harmonic, sd 0.05 rad) "
+            "+ the closure DihedralConstraint (circular harmonic, sd 0.10 rad, targeted at "
+            "the arrangement the predictor produced), on both the complex and the isolated "
+            "peptide"
+        ),
+    }
     return {
         "scorefunction": SCOREFUNCTION,
         "relax_repeats": RELAX_REPEATS,
-        "relax_restraint": (
-            "constrain_relax_to_start_coords + closure AtomPairConstraint "
-            "(harmonic, sd 0.05 A, on both the complex and the isolated peptide)"
+        "relax_restraint_mode": relax_restraint,
+        "relax_restraint": restraint_desc.get(
+            relax_restraint, f"unknown restraint mode {relax_restraint!r}"
         ),
         # The restraints are carried by a separate scorefunction; every reported energy
         # is read with plain ref2015, whose constraint weights are zero.
@@ -206,8 +236,22 @@ def _nearest_permitted_dihedral(observed_deg: float, spec) -> float:
     return min(alts, key=lambda ref: circular_gap(observed_deg, ref))
 
 
-def _add_closure_constraint(pose, chemistry: str, seqpos_i: int, seqpos_j: int) -> dict:
-    """Pin the closing JUNCTION -- bond, both angles and the torsion -- during relax.
+def _add_closure_constraint(
+    pose,
+    chemistry: str,
+    seqpos_i: int,
+    seqpos_j: int,
+    *,
+    mode: str = JUNCTION_RESTRAINT,
+) -> dict:
+    """Pin the closing junction during relax: the bond alone, or the whole junction.
+
+    `mode` selects how much is held. `BOND_RESTRAINT` adds the bond distance only, as
+    v2-v4 did; `JUNCTION_RESTRAINT` adds both angles and the torsion as well, which is
+    v5. The measured consequence of the difference is in the next paragraphs -- under
+    the bond-only restraint the minimiser bends the ring open while holding the two
+    atoms the correct distance apart, so a bond-only run's post-relax closure failures
+    are largely manufactured by the relax.
 
     `declare_chemical_bond` updates the pose's connectivity but gives the minimiser no
     term that holds those two atoms together, and `constrain_relax_to_start_coords`
@@ -276,6 +320,21 @@ def _add_closure_constraint(pose, chemistry: str, seqpos_i: int, seqpos_j: int) 
             HarmonicFunc(spec.bond.length_A, 0.05),
         ))
 
+        if mode == BOND_RESTRAINT:
+            # v2-v4: the bond distance and nothing else. Returned here rather than
+            # guarded further down so the angle and torsion constraints are never even
+            # constructed -- a constraint added to the pose and then scored at weight
+            # zero is the exact failure this mode has to avoid reintroducing.
+            return {
+                "applied": True,
+                "type": "AtomPair",
+                "mode": mode,
+                "atoms": f"{atom_i}({seqpos_i})-{atom_j}({seqpos_j})",
+                "target_length_A": spec.bond.length_A,
+                "harmonic_sd_A": 0.05,
+                "excluded_from_reported_energy": True,
+            }
+
         # Angles, in radians. sd 0.05 rad (2.9 deg) is the angular analogue of the
         # bond's 0.05 A: a deviation at the gate's 7.54 deg tolerance then costs about
         # 7 REU, enough to hold the junction against the repulsive term without
@@ -307,6 +366,7 @@ def _add_closure_constraint(pose, chemistry: str, seqpos_i: int, seqpos_j: int) 
         return {
             "applied": True,
             "type": "AtomPair + 2x Angle + Dihedral",
+            "mode": mode,
             "atoms": f"{outer_i}-{atom_i}({seqpos_i})-{atom_j}({seqpos_j})-{outer_j}",
             "target_length_A": spec.bond.length_A,
             "harmonic_sd_A": 0.05,
@@ -363,6 +423,7 @@ def score_structure(
     refined_out_path: str | Path | None = None,
     isolated_out_path: str | Path | None = None,
     deformation_cache: dict | None = None,
+    relax_restraint: str = JUNCTION_RESTRAINT,
 ) -> dict:
     """Score one predicted complex. Returns a record; raises only on programmer error.
 
@@ -376,7 +437,7 @@ def score_structure(
         "chemistry": chemistry,
         "binder_chain": binder_chain,
         "receptor_chains": list(receptor_chains),
-        "protocol": _init_flags_record(),
+        "protocol": _init_flags_record(relax_restraint),
         "status": "unscored",
     }
 
@@ -499,7 +560,9 @@ def score_structure(
         sf_relax.set_weight(ScoreType.atom_pair_constraint, 1.0)
         sf_relax.set_weight(ScoreType.angle_constraint, 1.0)
         sf_relax.set_weight(ScoreType.dihedral_constraint, 1.0)
-        rec["restraints"] = _add_closure_constraint(pose, chemistry, seqpos_i, seqpos_j)
+        rec["restraints"] = _add_closure_constraint(
+            pose, chemistry, seqpos_i, seqpos_j, mode=relax_restraint
+        )
 
         relax = FastRelax(sf_relax, RELAX_REPEATS)
         # Restrain to the input coordinates: scoring the geometry the model produced,
@@ -549,6 +612,10 @@ def score_structure(
         sf=sf,
         isolated_out_path=isolated_out_path,
         cache=deformation_cache,
+        # The free reference's ring is held the same way the complex's was: a proxy that
+        # compared a junction-restrained complex against a bond-only free peptide would
+        # be differencing two different relax protocols.
+        relax_restraint=relax_restraint,
     )
 
     rec["status"] = "ok"
@@ -564,6 +631,7 @@ def _deformation_proxy(
     sf,
     isolated_out_path: str | Path | None,
     cache: dict | None,
+    relax_restraint: str = JUNCTION_RESTRAINT,
 ) -> dict:
     """Bound-conformation vs locally-relaxed-free intramolecular energy of the peptide.
 
@@ -627,7 +695,9 @@ def _deformation_proxy(
             # No coordinate restraints here -- the free reference is meant to move. But
             # the RING must still be held, or the "free cyclic peptide" reference is a
             # linear peptide and the deformation proxy compares two different molecules.
-            out["free_restraints"] = _add_closure_constraint(free, chemistry, 1, n)
+            out["free_restraints"] = _add_closure_constraint(
+                free, chemistry, 1, n, mode=relax_restraint
+            )
             sf_free = pyrosetta.create_score_function(SCOREFUNCTION)
             sf_free.set_weight(ScoreType.atom_pair_constraint, 1.0)
             sf_free.set_weight(ScoreType.angle_constraint, 1.0)

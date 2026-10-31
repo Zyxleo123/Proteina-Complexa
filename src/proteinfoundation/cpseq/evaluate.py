@@ -64,7 +64,11 @@ from proteinfoundation.cpseq.adapters.boltz2 import predict as boltz_predict
 from proteinfoundation.cpseq.adapters.boltz2 import predict_many as boltz_predict_many
 from proteinfoundation.cpseq.contexts import chain_sequence, parse_structure
 from proteinfoundation.cpseq.geometry import validity_report
-from proteinfoundation.cpseq.scorer import score_structure
+from proteinfoundation.cpseq.scorer import (
+    BOND_RESTRAINT,
+    JUNCTION_RESTRAINT,
+    score_structure,
+)
 from proteinfoundation.cpseq.search import (
     budget_for,
     default_alphabet,
@@ -128,7 +132,55 @@ GPU_LOCK = threading.Lock()
 # measurements before relax and 37 of 48 after, while the restrained bond length stayed
 # perfect. The refined coordinates and every refined energy change, so this is a new
 # version rather than a new validity rule on old structures.
-SCORING_PROTOCOL_VERSION = "v5-junction-restrained-relax"
+SCORING_PROTOCOL_VERSION = "v4-postrelax-validity"
+
+# What each version actually DOES, on the two axes this project has changed:
+#
+#   validity_stage  -- which structure the validity label is judged on. v3 judged the
+#       prediction. v4 moved it to the relaxed complex, the structure
+#       `refined_dG_separated` is computed on.
+#   relax_restraint -- how much of the closing junction the relax holds. v2-v4 held the
+#       bond distance alone. v5 holds both angles and the torsion as well.
+#
+# Selectable rather than hardcoded because the two post-relax readings disagree and the
+# disagreement is itself the measurement. Under a bond-only relax the minimiser bends
+# rings open while holding the bond length perfectly -- 37 of 48 closure angles over
+# tolerance after relax against 0 of 48 before -- so a v4 closure failure may be the
+# refiner's doing rather than the design's. Under a junction-restrained relax the ring
+# is held shut, so the gate cannot report a ring the PREDICTOR left open; v5's own rows
+# show this directly, with folds whose `prerelax_valid` is False passing post-relax.
+# Neither label is interpretable without knowing which protocol produced it, so the
+# version and both axes are recorded on every row.
+SCORING_BEHAVIOUR: dict[str, dict[str, str]] = {
+    "v3-cis-amide-muco-windows": {
+        "validity_stage": "prerelax",
+        "relax_restraint": BOND_RESTRAINT,
+    },
+    "v4-postrelax-validity": {
+        "validity_stage": "postrelax",
+        "relax_restraint": BOND_RESTRAINT,
+    },
+    "v5-junction-restrained-relax": {
+        "validity_stage": "postrelax",
+        "relax_restraint": JUNCTION_RESTRAINT,
+    },
+}
+
+
+def scoring_behaviour(version: str) -> dict[str, str]:
+    """The two behaviour axes for a scoring version.
+
+    Unknown versions raise rather than defaulting: a silent fallback would score folds
+    under one protocol and file them under another version's name, which is the one
+    error that cannot be detected afterwards from the rows.
+    """
+    try:
+        return SCORING_BEHAVIOUR[version]
+    except KeyError:
+        known = ", ".join(sorted(SCORING_BEHAVIOUR))
+        raise ValueError(
+            f"unknown scoring version {version!r}; known versions: {known}"
+        ) from None
 
 # Rosetta energies are REU. Recorded on every row so no reader has to assume.
 ENERGY_UNITS = "Rosetta ref2015 REU (NOT a measured binding free energy)"
@@ -711,6 +763,7 @@ def evaluate(
                     if tol
                     else {"valid": False, "reasons": [f"no tolerance for {protocol.chemistry}"], "checks": {}}
                 )
+                behaviour = scoring_behaviour(protocol.scoring_version)
                 sc = score_structure(
                     pdb,
                     binder_chain=BINDER_CHAIN,
@@ -719,6 +772,7 @@ def evaluate(
                     requested_sequence=candidate_sequence,
                     refined_out_path=f"{stem}_refined.pdb",
                     isolated_out_path=f"{stem}_isolated_relaxed.pdb",
+                    relax_restraint=behaviour["relax_restraint"],
                 )
                 # Validity is judged on the RELAXED complex, because that is the
                 # structure `refined_dG_separated` was computed on. Judging the raw
@@ -747,21 +801,32 @@ def evaluate(
                         if tol
                         else {"valid": False, "reasons": [f"no tolerance for {protocol.chemistry}"], "checks": {}}
                     )
-                geom = rval if rval is not None else val
+                # Which structure carries the verdict is the version's choice, not a
+                # fixed property of the gate. v3 judges the prediction; v4 and v5 judge
+                # the relaxed complex. The other verdict is kept either way -- under
+                # `prerelax_*` below -- so the gap between them stays measurable per arm
+                # whichever way round this run was scored.
+                if behaviour["validity_stage"] == "prerelax":
+                    stage, sverd, sval = "prerelax", verd, val
+                else:
+                    stage, sverd, sval = "postrelax", rverd, rval
+                geom = sval if sval is not None else val
                 row |= {
                     "scoring_status": sc.get("status"),
-                    # No relaxed structure means no post-relax verdict and no refined
-                    # energy either, so there is nothing to call valid. Reported as its
-                    # own reason rather than silently inheriting the pre-relax label.
-                    "valid": bool(rverd["valid"]) if rverd else False,
+                    # A missing relaxed structure means no post-relax verdict and no
+                    # refined energy either, so there is nothing to call valid. Reported
+                    # as its own reason rather than silently falling back to the other
+                    # stage's label, which would file one protocol's verdict under the
+                    # other's name.
+                    "valid": bool(sverd["valid"]) if sverd else False,
                     "validity_reasons": (
-                        rverd["reasons"] if rverd
+                        sverd["reasons"] if sverd
                         else [f"no relaxed structure to judge (scorer: {sc.get('status')})"]
                     ),
-                    "validity_checks": rverd["checks"] if rverd else {},
-                    "validity_stage": "postrelax" if rverd else "unavailable",
+                    "validity_checks": sverd["checks"] if sverd else {},
+                    "validity_stage": stage if sverd else "unavailable",
                     "violation": (
-                        violation_magnitude(rval, tol) if (rval is not None and tol) else None
+                        violation_magnitude(sval, tol) if (sval is not None and tol) else None
                     ),
                     "sequence_matches": val.get("sequence_matches"),
                     "sequence_observed": val.get("sequence_observed"),

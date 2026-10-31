@@ -95,6 +95,60 @@ def resolve_sequence_conditioning_mask(
     return mask
 
 
+def choose_reveal_mask(
+    explicit,
+    keep_frac: float,
+    gen_mask: torch.Tensor,
+    *,
+    n_repeat: int = 1,
+) -> torch.Tensor:
+    """The sampling-time reveal mask: an explicit one if given, else a ``keep_frac`` draw.
+
+    ``keep_frac`` hides a UNIFORMLY RANDOM subset. That is the right instrument for
+    *measuring* the channel -- a uniform subset makes the hidden-position rate comparable
+    to a position-agnostic prior -- and the wrong one for *using* it. A proposer wants
+    named positions opened, and which positions those are is the entire content of the
+    proposal. So an explicit mask takes precedence, and the two never mix.
+
+    Args:
+        explicit: ``[b, n]`` bool (or None). Already expanded to the repeats.
+        keep_frac: used only when ``explicit`` is None. ``>= 1.0`` reveals everything.
+        gen_mask: ``[b, n]`` bool, the real (non-padding) residues.
+        n_repeat: only to make the shape error message say where the mismatch came from.
+
+    Returns:
+        ``[b, n]`` bool reveal mask, guaranteed to reveal at least one position.
+
+    Raises:
+        ValueError: on a shape mismatch, or when an explicit mask reveals nothing.
+    """
+    if explicit is not None:
+        explicit = torch.as_tensor(explicit, device=gen_mask.device).bool()
+        if explicit.shape != gen_mask.shape:
+            # Refused rather than broadcast. A mask of the wrong width would silently
+            # reveal the wrong positions and every metric downstream would still look
+            # reasonable -- the failure mode this project keeps meeting.
+            raise ValueError(
+                f"seq_cond_reveal_mask has shape {tuple(explicit.shape)}, expected "
+                f"{tuple(gen_mask.shape)} ([b, n] after n_repeat={n_repeat} "
+                f"interleaving). Build it per ORIGINAL row and let the batch repeat it."
+            )
+        mask = explicit & gen_mask
+        if not bool(mask.any()):
+            # All-hidden is the unconditional sampler wearing a conditioned label: it
+            # would log a NaN cond_recovery and a free_recovery that is really an
+            # unconditioned generation, which is a different experiment.
+            raise ValueError(
+                "seq_cond_reveal_mask reveals nothing on any row; that is the "
+                "unconditional pass, so run it with seq_cond=False rather than "
+                "recording it as sequence-conditioned."
+            )
+        return mask
+    if keep_frac >= 1.0:
+        return gen_mask.clone()
+    return (torch.rand_like(gen_mask, dtype=torch.float32) < keep_frac) & gen_mask
+
+
 def sequence_conditioning_fraction(flag, b: int, n: int, device: torch.device) -> float:
     """Fraction of ``b * n`` slots revealed -- for logging only. 0.0 when nothing is."""
     mask = resolve_sequence_conditioning_mask(flag, b, n, device)

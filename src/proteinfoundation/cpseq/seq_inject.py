@@ -378,6 +378,98 @@ def apply_to_batch(
     return records
 
 
+def reveal_mask_for_batch(
+    batch: dict,
+    masks_by_native: dict[str, list[int]],
+    *,
+    on_missing: str = "error",
+) -> tuple[torch.Tensor, list[dict]]:
+    """A ``[b, n]`` reveal mask that hides the requested positions of each row's peptide.
+
+    The companion to `apply_to_batch` for the mask arm. Nothing is substituted here: the
+    row keeps its native peptide in `residue_type` -- that IS the sequence being
+    redesigned -- and the named positions are simply not revealed, so the generator fills
+    them. The result goes in `batch["seq_cond_reveal_mask"]`, which
+    `utils.seq_conditioning.choose_reveal_mask` prefers over `keep_frac`.
+
+    Attribution is by the row's own decoded native sequence, exactly as in
+    `apply_to_batch` and for the same reason: the dataloader's ordering is not a contract,
+    and pairing a mask to the wrong receptor would open positions on one peptide that were
+    chosen by looking at another -- which produces a plausible result rather than an error.
+    The dumped complexes cannot be used for this: their manifest carries a batch index
+    (`bid`) and no example id.
+
+    Args:
+        batch: must carry `residue_type` and a residue mask.
+        masks_by_native: native peptide sequence -> 0-based positions to HIDE.
+        on_missing: "error", or "reveal_all" to leave an unrequested row fully revealed
+            (it then generates nothing new, which is the reference, and the record says so).
+
+    Returns:
+        `(reveal_mask [b, n] bool, records)`.
+    """
+    if on_missing not in ("error", "reveal_all"):
+        raise SequenceInjectionError(
+            f"on_missing must be 'error' or 'reveal_all', not {on_missing!r}"
+        )
+    if "residue_type" not in batch:
+        raise SequenceInjectionError(
+            "batch has no `residue_type`, so there is no peptide to hide positions of."
+        )
+    residue_type = batch["residue_type"]
+    mask = batch["mask"].bool() if "mask" in batch else batch["coord_mask"][..., 1].bool()
+    reveal = mask.clone()
+    records: list[dict] = []
+
+    for b in range(residue_type.shape[0]):
+        native = decode_sequence(residue_type[b], mask[b])
+        hide = masks_by_native.get(native)
+        if hide is None:
+            if on_missing == "error":
+                raise SequenceInjectionError(
+                    f"batch row {b} decodes to native peptide {native!r}, which has no mask. "
+                    f"Known natives: {sorted(masks_by_native)}. If this decode looks like "
+                    "nonsense rather than a peptide, the residue-type alphabet assumption is "
+                    "wrong and nothing should be hidden."
+                )
+            records.append({"row": b, "native_sequence": native, "masked": False,
+                            "reason": "no mask requested"})
+            continue
+
+        positions = mask[b].nonzero(as_tuple=True)[0]
+        L = len(positions)
+        bad = [p for p in hide if not (0 <= p < L)]
+        if bad:
+            raise SequenceInjectionError(
+                f"batch row {b} ({native!r}, length {L}) was given positions {bad} to hide, "
+                "which are outside the peptide. A mask paired with the wrong parent looks "
+                "exactly like this."
+            )
+        if len(set(hide)) == L:
+            # Hiding everything is de novo generation, not a budgeted edit of this peptide.
+            raise SequenceInjectionError(
+                f"batch row {b} ({native!r}) would have all {L} positions hidden; that is "
+                "unconditional generation, not a masked redesign."
+            )
+        reveal[b, positions[list(sorted(set(hide)))]] = False
+        records.append({
+            "row": b,
+            "native_sequence": native,
+            "masked": True,
+            "hidden_positions": sorted(set(hide)),
+            "n_hidden": len(set(hide)),
+            "n_revealed": L - len(set(hide)),
+            "peptide_length": L,
+        })
+
+    if not any(r["masked"] for r in records):
+        raise SequenceInjectionError(
+            "no row in this batch had any position hidden; the run would measure the "
+            "native peptides under a misleading label."
+        )
+    return reveal, records
+
+
 def write_sidecar(
     dump_dir: Path,
     table: dict[str, Request],

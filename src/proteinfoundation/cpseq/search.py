@@ -47,6 +47,14 @@ ARM_MPNN = "backbone_mpnn"
 # Arm D: the same search, with an instruction-tuned text model choosing the positions and
 # residues that `propose_edit` draws from an rng. See `llm_propose.py`.
 ARM_LLM = "llm_search"
+# Arm E: the proposal split in two. The LLM names positions only and the CPSea unmasking
+# model fills them (`mlm_propose.py`). ARM_MLM_MASK is its control and differs in exactly
+# one thing -- the positions are drawn uniformly instead of chosen -- so the pair measures
+# the LLM's choice of WHERE and nothing else. Both fill with the same model, the same
+# temperature and the same number of draws; without that the comparison measures the
+# filler, not the chooser.
+ARM_LLM_MASK = "llm_mask_mlm_fill"
+ARM_MLM_MASK = "random_mask_mlm_fill"
 
 # Proposal kinds, recorded per candidate so a result can be attributed to the mechanism
 # that produced it rather than to the arm as a whole.
@@ -62,6 +70,16 @@ KIND_RANDOM = "random_matched_count"
 KIND_RANDOM_STANDALONE = "random_standalone_count"
 KIND_MPNN = "mpnn_redesign"
 KIND_LLM = "llm_proposed"
+# A sequence written by the unmasking model into a mask somebody else chose. The row
+# records which positions were opened separately from which ones actually changed: the
+# model is free to re-emit the native residue, and a mask of three that produced one
+# substitution is a different event from a mask of one.
+KIND_MLM_FILL = "mlm_fill"
+# A sequence written into a mask somebody else chose, by whichever filler the arm names
+# (the arm says which; the kind says how the proposal was made). Separate from KIND_LLM
+# because under KIND_LLM the model that picked the positions also picked the residues,
+# and pooling the two would lose the one fact that distinguishes arms D and E.
+KIND_MASK_FILL = "mask_fill"
 
 
 def default_alphabet(allow_cys: bool = False) -> tuple[str, ...]:

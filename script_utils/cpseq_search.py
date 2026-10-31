@@ -72,6 +72,7 @@ from proteinfoundation.cpseq.search import (  # noqa: E402
     ARM_MPNN,
     ARM_RANDOM,
     KIND_LLM,
+    KIND_MASK_FILL,
     KIND_MPNN,
     KIND_REFERENCE,
     Archive,
@@ -1371,6 +1372,56 @@ def load_llm_proposals(
     return unique, notes
 
 
+def load_mask_proposals(
+    out_dir: Path, parent_id: str, *, arm: str, through_round: int
+) -> tuple[list[dict], list[str]]:
+    """Arms E/F/G's draws for one parent, in the same globally stable order as arm D's.
+
+    Deliberately a sibling of `load_llm_proposals` rather than a generalisation of it:
+    the ordering contract is the load-bearing part (a rung is a PREFIX of the draws, so
+    draw 9 must mean the same sequence in a two-round run as in a five-round one), and a
+    shared path that silently took a different directory would be easy to mis-call.
+
+    Only ACCEPTED proposals are loaded. A row the fill stage screened out never became a
+    candidate, and folding it would spend GPU time on a sequence the shared legality rules
+    already rejected.
+    """
+    rows: list[dict] = []
+    notes: list[str] = []
+    for rnd in range(1, through_round + 1):
+        path = out_dir / "mask_proposals" / arm / f"round{rnd}" / f"{parent_id}.jsonl"
+        if not path.exists():
+            notes.append(f"round {rnd}: no proposal file for this parent")
+            continue
+        n_before = len(rows)
+        for line in path.read_text().splitlines():
+            if not line.strip():
+                continue
+            try:
+                r = json.loads(line)
+            except Exception:  # noqa: BLE001, S112
+                continue
+            if r.get("sequence") and r.get("accepted", True):
+                rows.append(r)
+        notes.append(f"round {rnd}: {len(rows) - n_before} proposal(s)")
+    # Deduplicate preserving first appearance, and index the draws -- the same two steps
+    # `load_llm_proposals` ends with, and for the same reasons. Two masks can produce the
+    # same sequence, and a sequence proposed twice is ONE draw: the second would be a
+    # cache hit filling a slot, overstating how many distinct candidates the arm bought.
+    # `_draw_index` is what makes a rung a prefix, and `Proposal` requires it.
+    seen: set[str] = set()
+    unique: list[dict] = []
+    for r in rows:
+        if r["sequence"] in seen:
+            notes.append(f"dropped duplicate proposal {r['sequence']} (already a draw)")
+            continue
+        seen.add(r["sequence"])
+        unique.append(r)
+    for i, r in enumerate(unique):
+        r["_draw_index"] = i
+    return unique, notes
+
+
 def run_parent_ladder(
     *,
     parent_id: str,
@@ -1384,6 +1435,12 @@ def run_parent_ladder(
     dry_run: bool = False,
     limit: int = 0,
     llm_proposals: list[dict] | None = None,
+    # The arm and kind the supplied proposals are recorded under. Default to arm D, so
+    # every existing caller is unchanged. Arms E/F/G reuse this whole path -- same plan,
+    # same depth, same gate, same evaluator, same journal -- and differ only in the label
+    # and in who produced the sequences, which is the only reason they are comparable.
+    proposal_arm: str | None = None,
+    proposal_kind: str | None = None,
     # Group the sequences that share a seed into one boltz invocation. A prefetch into
     # the same cache `evaluate` reads, so it changes no result -- only who paid for the
     # prediction. See `prefetch_predictions` for the measured 44 s + 26 s/structure.
@@ -1420,7 +1477,9 @@ def run_parent_ladder(
     # -- the prefix-safe plan, the fold depth, the gate, the evaluator, the journal -- is
     # shared, so a difference between the arms is attributable to the proposer and to
     # nothing else.
-    draw_arm = ARM_LLM if llm_proposals is not None else ARM_RANDOM
+    prop_arm = proposal_arm or ARM_LLM
+    prop_kind = proposal_kind or KIND_LLM
+    draw_arm = prop_arm if llm_proposals is not None else ARM_RANDOM
     if llm_proposals is not None:
         props = []
         for r in llm_proposals:
@@ -1428,9 +1487,9 @@ def run_parent_ladder(
             try:
                 props.append(Proposal(
                     sequence=seq,
-                    arm=ARM_LLM,
+                    arm=prop_arm,
                     round_index=int(r.get("llm_round") or r.get("round_index") or 0),
-                    kind=KIND_LLM,
+                    kind=prop_kind,
                     # The elite the model was asked to edit, as the propose stage
                     # recorded it. Carried through rather than dropped: the ladder is
                     # where the offspring is measured, so this is the row that has to
@@ -1824,7 +1883,16 @@ def cmd_ladder(args) -> int:
         contexts |= load_target_contexts(Path(ddir), pids)
 
     llm_round = int(getattr(args, "llm_round", 0) or 0)
-    arm_label = ARM_LLM if llm_round else ARM_RANDOM
+    mask_round = int(getattr(args, "mask_round", 0) or 0)
+    mask_arm = str(getattr(args, "mask_arm", "") or "")
+    if mask_round and llm_round:
+        # Both would load a different set of sequences into the same run under one label.
+        raise SystemExit(
+            "--llm-round and --mask-round are different arms; pass one, not both."
+        )
+    if mask_round and not mask_arm:
+        raise SystemExit("--mask-round needs --mask-arm to say which arm to fold.")
+    arm_label = mask_arm if mask_round else (ARM_LLM if llm_round else ARM_RANDOM)
     print(f"[ladder] {len(parents)} parent(s) shard {args.shard_index}/{args.shard_count}")
     print(f"[ladder] arm={arm_label}, {n_draws} draws x {len(seeds)} folds, "
           f"ladder rungs B={list(budgets)}")
@@ -1839,7 +1907,17 @@ def cmd_ladder(args) -> int:
             print(f"[ladder] {pid}: no target context -- skipped")
             continue
         llm_props = None
-        if llm_round:
+        if mask_round:
+            llm_props, load_notes = load_mask_proposals(
+                out_dir, pid, arm=mask_arm, through_round=mask_round
+            )
+            for n in load_notes:
+                print(f"  [{pid}] proposals: {n}")
+            if not llm_props:
+                print(f"  [{pid}] no {mask_arm} proposals for rounds 1..{mask_round} "
+                      f"-- skipped. Run scripts/cpseq_mask_arm.sbatch first.")
+                continue
+        elif llm_round:
             llm_props, load_notes = load_llm_proposals(
                 out_dir, pid, through_round=llm_round
             )
@@ -1858,6 +1936,8 @@ def cmd_ladder(args) -> int:
             dry_run=args.dry_run, limit=args.limit,
             batch_predict=not args.no_batch_predict,
             prefetch_ahead=args.prefetch_ahead, llm_proposals=llm_props,
+            proposal_arm=(mask_arm or None),
+            proposal_kind=(KIND_MASK_FILL if mask_round else None),
             predict_only=getattr(args, "predict_only", False),
         )
         summaries.append(s)
@@ -2201,6 +2281,13 @@ def main() -> int:
                          "result changes -- only who is waiting. Expect the task to "
                          "become CPU-bound, at which point more scoring workers, not "
                          "faster folding, is the next lever.")
+    lr.add_argument("--mask-arm", default="",
+                    help="fold arm E/F/G proposals under this arm label, from "
+                         "<out-dir>/mask_proposals/<arm>/round*/ . Needs --mask-round. "
+                         "Mutually exclusive with --llm-round.")
+    lr.add_argument("--mask-round", type=int, default=0,
+                    help="fold mask-arm proposal rounds 1..N, concatenated in order so "
+                         "the ladder's rungs stay prefixes of the draws.")
     lr.add_argument("--llm-round", type=int, default=0,
                     help="fold arm D instead of the random stream: use the LLM "
                          "proposals from rounds 1..N written by cpseq_llm_propose.py "

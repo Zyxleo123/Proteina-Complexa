@@ -88,6 +88,12 @@ RETENTION="${RETENTION:-rescorable}"
 # rows are tagged arm=llm_search, so the two arms can share one OUT_DIR -- and should,
 # because the reference folds are then shared and the comparison is properly paired.
 LLM_ROUND="${LLM_ROUND:-0}"
+# Arms E/F/G. MASK_ARM names which arm's proposals to fold and MASK_ROUND how many rounds,
+# read from <OUT_DIR>/mask_proposals/<MASK_ARM>/round*/ and tagged with that arm. Same
+# OUT_DIR as the other arms on purpose: the reference folds are then shared and every
+# comparison is paired. Mutually exclusive with LLM_ROUND, which cpseq_search.py enforces.
+MASK_ARM="${MASK_ARM:-}"
+MASK_ROUND="${MASK_ROUND:-0}"
 # Overlap folding with scoring. A task folds every seed and only then scores, so the GPU
 # sits idle for the whole scoring phase -- 51.5 % boltz duty cycle measured on the live
 # corpus run. With this set, the next seed folds on a background thread while the current
@@ -110,13 +116,21 @@ echo "request:   cpus=${SLURM_CPUS_PER_TASK:-?} mem=${SLURM_MEM_PER_NODE:-?}M gp
 echo "shard:     ${SHARD_INDEX}/${SHARD_COUNT}  retention=$RETENTION  limit=$LIMIT"
 echo "mode:      $([ "$PREDICT_ONLY" = "0" ] && echo 'predict+score' || echo 'PREDICT ONLY (score separately on CPU)')"
 echo "prefetch:  $([ "$PREFETCH_AHEAD" = "0" ] && echo 'sequential (fold all, then score)' || echo 'ahead (fold next seed while scoring)')"
-echo "arm:       $([ "$LLM_ROUND" = "0" ] && echo 'random_control (draw stream)' || echo "llm_search (proposal rounds 1..$LLM_ROUND)")"
+if [ -n "$MASK_ARM" ] && [ "$MASK_ROUND" != "0" ]; then
+  echo "arm:       $MASK_ARM (mask proposal rounds 1..$MASK_ROUND)"
+elif [ "$LLM_ROUND" != "0" ]; then
+  echo "arm:       llm_search (proposal rounds 1..$LLM_ROUND)"
+else
+  echo "arm:       random_control (draw stream)"
+fi
 echo "out_dir:   $OUT_DIR"
 nvidia-smi -L || echo "no nvidia-smi"
 
 EXTRA=()
 [ -n "$PARENTS" ] && EXTRA+=(--parents "$PARENTS")
 [ "$LLM_ROUND" != "0" ] && EXTRA+=(--llm-round "$LLM_ROUND")
+[ -n "$MASK_ARM" ] && EXTRA+=(--mask-arm "$MASK_ARM")
+[ "$MASK_ROUND" != "0" ] && EXTRA+=(--mask-round "$MASK_ROUND")
 [ "$PREFETCH_AHEAD" != "0" ] && EXTRA+=(--prefetch-ahead)
 [ "$PREDICT_ONLY" != "0" ] && EXTRA+=(--predict-only)
 

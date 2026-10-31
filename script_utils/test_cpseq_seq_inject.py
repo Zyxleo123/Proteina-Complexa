@@ -71,6 +71,65 @@ def source(tmp: Path, rows: list[dict], name: str = "req.jsonl") -> Path:
     return p
 
 
+def _mask_batch(seqs: list[str], n: int) -> dict:
+    """A minimal batch: `residue_type` plus a residue mask, padded to width `n`."""
+    from openfold.np import residue_constants as rc
+
+    b = len(seqs)
+    rt = torch.full((b, n), rc.restype_num, dtype=torch.long)
+    m = torch.zeros(b, n, dtype=torch.bool)
+    for i, seq in enumerate(seqs):
+        ids = si.encode_sequence(seq)
+        rt[i, : len(ids)] = torch.tensor(ids)
+        m[i, : len(ids)] = True
+    return {"residue_type": rt, "mask": m}
+
+
+def test_reveal_mask_for_batch() -> None:
+    """The mask arm's attribution: which positions get hidden, on which row."""
+    print("\nreveal_mask_for_batch")
+    seqs = ["MEEVD", "RIIYDRKFLMECRN"]
+    masks = {"MEEVD": [1, 3], "RIIYDRKFLMECRN": [2, 5, 11]}
+
+    batch = _mask_batch(seqs, 16)
+    reveal, recs = si.reveal_mask_for_batch(batch, masks)
+    check("every row is attributed", all(r["masked"] for r in recs), f"{recs}")
+    check("the named positions are hidden and nothing else",
+          reveal[0, :5].tolist() == [True, False, True, False, True],
+          f"{reveal[0, :5].tolist()}")
+    check("hidden counts are recorded per row",
+          [r["n_hidden"] for r in recs] == [2, 3], f"{recs}")
+    check("padding is never revealed", not bool(reveal[0, 5:].any()))
+
+    # The property the whole module exists for. The dataloader's ordering is not a
+    # contract, and a mask paired with the wrong receptor opens positions on one peptide
+    # that were chosen by looking at another -- a plausible result, not an error.
+    flipped = _mask_batch(list(reversed(seqs)), 16)
+    reveal2, _ = si.reveal_mask_for_batch(flipped, masks)
+    check("attribution does not depend on batch order",
+          reveal2[1, :5].tolist() == reveal[0, :5].tolist(),
+          f"{reveal2[1, :5].tolist()} vs {reveal[0, :5].tolist()}")
+
+    for bad, label, needle in (
+        ({"MEEVD": [0, 1, 2, 3, 4], "RIIYDRKFLMECRN": [2]},
+         "a fully hidden row", "unconditional generation"),
+        ({"MEEVD": [9], "RIIYDRKFLMECRN": [2]},
+         "a position past the end", "outside the peptide"),
+        ({"NOPE": [1]}, "a native with no mask", "has no mask"),
+    ):
+        try:
+            si.reveal_mask_for_batch(batch, bad)
+            check(f"{label} is refused", False, "no error raised")
+        except si.SequenceInjectionError as e:
+            check(f"{label} is refused", needle in str(e), str(e)[:100])
+
+    reveal3, recs3 = si.reveal_mask_for_batch(
+        batch, {"MEEVD": [1]}, on_missing="reveal_all"
+    )
+    check("on_missing='reveal_all' leaves the unrequested row fully revealed",
+          bool(reveal3[1, :14].all()) and not recs3[1]["masked"], f"{recs3}")
+
+
 def main() -> int:
     print("=== cpseq.seq_inject ===")
 
@@ -229,6 +288,8 @@ def main() -> int:
               payload["by_native_sequence"]["MEEVD"]["n_substitutions"] == 1)
         check("sidecar fingerprints its source", len(payload["source_sha256_16"]) == 16)
         check("sidecar carries extras", payload["ckpt_name"] == "last-v3-EMA.ckpt")
+
+    test_reveal_mask_for_batch()
 
     print(f"\n{PASS} passed, {FAIL} failed")
     return 1 if FAIL else 0
