@@ -47,11 +47,11 @@
 > caveats from the journals it packs rather than copying another run's.
 >
 > **−7.82 is superseded by −5.23 (§0.2).** It was a pilot number on 10 of 20 complexes
-> selected from the arm's whole pool, and that estimator is now implemented as
+> with the winner chosen from every draw the arm made, and that estimator is now
 > `cpseq_selected_candidate_report.py --pilot`. Re-measured on the same gate and cohort
 > the primary arm reads **−5.23 REU, 10/0, p = 0.0020**; `llm_search` reproduces its
 > −7.23 exactly. The default (no `--pilot`) rungs table answers a different question —
-> per-budget B, not whole-pool — and its numbers are not comparable to either. §0.2,
+> per-budget B, not all draws — and its numbers are not comparable to either. §0.2,
 > §5.2 and §5.3 bound all of them.
 
 The configuration the scale-up runs. Fixed 2026-10-30 after the pilot; every value below
@@ -67,7 +67,7 @@ two arms comparable.
 **Why this arm.** Measured one method at a time, per complex, cross-fitted — select the
 best candidate on half the folds, report its energy from the other half:
 
-| | arm | complexes | median held-out ΔdG | improves | mean pool |
+| | arm | complexes | median held-out ΔdG | improves | mean draws |
 |---|---|---|---|---|---|
 | **PRIMARY** | **`random_mask_mpnn_fill`** | 10 | **−7.82 REU** | **10/10** | 7.7 |
 | **RETAINED** | **`llm_search`** | 10 | **−7.23 REU** | **9/10** | 13.1 |
@@ -75,10 +75,10 @@ best candidate on half the folds, report its energy from the other half:
 | | `llm_mask_mpnn_fill` | 10 | −3.49 | 9/10 | 7.5 |
 | | `llm_mask_random_fill` | 7 | −3.34 | 6/7 | 7.7 |
 
-The primary arm improves on every complex with a usable baseline, from a pool a fifth the
-size of the random control's. The paired contrast that matters:
-`random_mask_mpnn_fill` −7.82 against `llm_mask_mpnn_fill` −3.49 at near-identical pool
-sizes with the filler held constant, so **random position choice beat the LLM's position
+The primary arm improves on every complex with a usable baseline, from a fifth as many draws as
+the random control. The paired contrast that matters:
+`random_mask_mpnn_fill` −7.82 against `llm_mask_mpnn_fill` −3.49 at near-identical draw
+counts with the filler held constant, so **random position choice beat the LLM's position
 choice**. The second contrast, −7.82 against `llm_mask_random_fill` −3.34, says the fill
 model is doing the work.
 
@@ -87,10 +87,10 @@ Read these numbers only with §0.1, §0.2, §5.1 and §5.2 in hand.
 ## 0.2 Re-measured 2026-11-01 on the same estimator. The arm ordering changed.
 
 §3's estimator is now implemented, as `cpseq_selected_candidate_report.py --pilot`
-(`--pool all --directions 2 --min-ref-valid 3 --energy-key refined_dG_separated`), so
+(`--draws all --directions 2 --min-ref-valid 3 --energy-key refined_dG_separated`), so
 §0's table is redrawable for the first time. Same gate (v3), same cohort, same rule:
 
-| arm | §0 ΔdG | **re-measured** | §0 improves | **w/l now** | sign p | §0 pool | pool now |
+| arm | §0 ΔdG | **re-measured** | §0 improves | **w/l now** | sign p | §0 draws | draws now |
 |---|---|---|---|---|---|---|---|
 | `llm_search` | −7.23 | **−7.23** | 9/10 | **9/1** | 0.022 | 13.1 | 15.7 |
 | `llm_mask_random_fill` | −3.34 | **−5.99** | 6/7 | **8/1** | 0.039 | 7.7 | 11.7 |
@@ -101,7 +101,7 @@ Read these numbers only with §0.1, §0.2, §5.1 and §5.2 in hand.
 **`llm_search` reproduces to the digit**, which is what certifies the implementation: it
 is the one arm with no v5 rows (3,150 v3 / 0 v5). Every arm that moved is an arm whose
 folds were later split across gates — `random_mask_mpnn_fill` 2,204 v3 / 1,840 v5,
-`llm_mask_mpnn_fill` 2,613 / 1,950, `llm_mask_random_fill` 2,477 / 2,360 — so its v3 pool
+`llm_mask_mpnn_fill` 2,613 / 1,950, `llm_mask_random_fill` 2,477 / 2,360 — so the v3 draws it keeps
 today is a ~55 % subset of what the pilot measured, selected by which folds a later
 rescore happened to touch. That is the leading explanation for the movement and it is
 fixable: see §5.2's v5→v3 recommendation.
@@ -109,8 +109,8 @@ fixable: see §5.2's v5→v3 recommendation.
 What survives and what does not:
 
 - **Survives.** `random_mask_mpnn_fill` is still the only arm negative on every complex
-  with a baseline (10/0, p = 0.0020, the lowest of the five), still from a pool a fifth
-  of the control's. The §0 contrast against `llm_mask_mpnn_fill` at matched filler also
+  with a baseline (10/0, p = 0.0020, the lowest of the five), still from a fifth as many draws
+  as the control. The §0 contrast against `llm_mask_mpnn_fill` at matched filler also
   survives, −5.23 against −2.16, so **random position choice still beats the LLM's**.
 - **Does not survive.** §0's second contrast, "the fill model is doing the work"
   (−7.82 against `llm_mask_random_fill` −3.34), **reverses**: −5.23 against −5.99. On
@@ -140,7 +140,7 @@ v3, same search and same report, under this section's own estimator:
 Best-of-8 random substitution beats the unchanged native peptide at 39x the arm table's
 complex count, with no validity cost. **No proposer has ever been run on those 391
 complexes**, which is the gap: §0.2's −5.23 and this −1.43 are different cohorts at
-different pool sizes and are not comparable. 391 of them already have a paid-for v3
+different draw counts and are not comparable. 391 of them already have a paid-for v3
 reference at full depth, so the baseline for an arm run at scale is already bought.
 
 **Why the same run reads −2.21 or −1.43.** One axis changed at a time, `random_control`,
@@ -149,13 +149,14 @@ v3, so a number seen elsewhere can be placed:
 | estimator | n | ΔdG | w/l | unmeas | no_base |
 |---|---|---|---|---|---|
 | default, B=8 | 400 | −2.21 | 249/124 | 6 | 21 |
-| `--pool all` | 418 | −2.24 | 257/127 | 13 | 21 |
+| `--draws all` | 418 | −2.24 | 257/127 | 13 | 21 |
 | `--min-ref-valid 3` | 374 | −2.24 | 246/122 | 4 | 29 |
 | `--directions 2` | 400 | **−1.60** | 249/**136** | **0** | 15 |
 | full `--pilot` | 391 | −1.43 | 250/141 | 0 | 27 |
 
-- **`--pool all` is a no-op here.** The corpus arm drew exactly 8, so B=8 *is* the whole
-  pool. This is the axis that dominates on `llm_ladder`, where pools are 10–59.
+- **`--draws all` is a no-op here.** The corpus arm made exactly 8 draws per target, so
+  B=8 *is* all of them. This is the axis that dominates on `llm_ladder`, where the arms
+  made 10–59 draws per target.
 - **`--min-ref-valid 3` is a no-op on the estimate**, dropping 26 complexes and moving
   nothing. The ~29 % of corpus targets with a thin baseline are not carrying the effect.
   A reassuring null, and not the one expected.
@@ -196,12 +197,12 @@ not on a measured advantage. Two consequences:
 
 - `llm_search` keeps its settings frozen (`old_docs/README_CPSEQ_LLM_SEARCH.md`) and stays
   runnable. Do not delete its proposals or journals.
-- Its larger pool (13.1 against 7.7) means it carries *more* selection inflation than
-  the primary arm and still matched it. At equal pool size it may be ahead. §3's
-  pool-size finding — held-out value improving up to N≈20 — applies to both, so a
-  scale-up at matched, larger pools is what would actually separate them.
+- Its larger draw count (13.1 against 7.7) means it carries *more* selection inflation than
+  the primary arm and still matched it. At equal draw counts it may be ahead. §3's
+  draw-count finding — held-out value improving up to N≈20 — applies to both, so a
+  scale-up at matched, larger draw counts is what would actually separate them.
 
-**What would settle it:** both arms at a matched pool of ~20 draws per complex, on the
+**What would settle it:** both arms at a matched ~20 draws per complex, on the
 complexes that have a baseline, scored under one protocol. That is the smallest
 experiment that distinguishes them; anything less re-reads a tie.
 
@@ -318,7 +319,7 @@ splitting a complex, and **never from running two arms concurrently on the same
 ranking and reporting on the same folds bakes in the noise that won the selection.
 Measured on the pilot: naive best per complex median −11.60 and negative in 10/10,
 cross-fitted −5.97 and negative in 8/10 when arms are pooled. Selection inflation grows
-with pool size — subsampling the random control's pool gave a selected-to-held-out gap of
+with the number of draws searched — subsampling the random control's draws gave a selected-to-held-out gap of
 1.77 REU at N=2 rising to 6.48 at N=40.
 
 **Why one arm at a time.** Pooling lets the weakest arm's lucky draw win a complex's
@@ -327,8 +328,8 @@ reads +3.59 pooled, where the winner came from `llm_mask_random_fill`, but −7.
 `random_mask_mpnn_fill` alone and −6.98 for `llm_search` alone. Pooling turned two
 successes into one failure.
 
-**Pool size is worth spending on.** Held-out value improved with draws searched up to
-N≈20 and flattened after, while the pilot ran at a mean pool of 7.7 per complex. More
+**Draw count is worth spending on.** Held-out value improved with draws searched up to
+N≈20 and flattened after, while the pilot ran at a mean of 7.7 draws per complex. More
 draws per complex is the cheapest available improvement.
 
 ---

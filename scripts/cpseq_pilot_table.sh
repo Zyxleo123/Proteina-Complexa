@@ -5,8 +5,11 @@
 # default. Section 3 of that document specifies it; `--pilot` is the four flags
 # that implement it:
 #
-#   --pool all           select from every draw the arm produced for a complex,
-#                        not from the first B of the stream
+#   --draws all          choose the winner from every DRAW the arm produced for
+#                        that target -- a draw is one proposed mutant sequence --
+#                        rather than from the first B of the stream. Best-of-N is
+#                        better for larger N, so two arms are only comparable at
+#                        comparable draw counts.
 #   --directions 2       select on ranks [0,5) measure on [5,10), then the
 #                        reverse, and average the two per complex
 #   --min-ref-valid 3    a reference with fewer than 3 valid folds is a complex
@@ -56,10 +59,10 @@ cd "$REPO"
 echo "=== pilot-estimator arm table ==="
 echo "out_dir: $OUT_DIR"
 echo "gate:    $GATE"
-echo "rule:    --pilot (= --pool all --directions 2 --min-ref-valid 3"
+echo "rule:    --pilot (= --draws all --directions 2 --min-ref-valid 3"
 echo "                    --energy-key refined_dG_separated)"
 echo
-printf '%-24s %s\n' "arm" "cplx |   dG REU     w/l    sign p | no_base  pool"
+printf '%-24s %s\n' "arm" "cplx |   dG REU     w/l    sign p | no_base  draws"
 
 for arm in $ARMS; do
   json_arg=()

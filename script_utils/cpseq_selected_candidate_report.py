@@ -77,13 +77,16 @@ def main() -> int:
     # --- the four axes on which this report's estimator differs from the one that chose
     # the arm (README_CPSEQ_MPNN_FILL_SETTINGS.md section 3). Defaults reproduce this
     # script's long-standing behaviour exactly, so no number already recorded moves.
-    ap.add_argument("--pool", choices=("rungs", "all"), default="rungs",
-                    help="'rungs' selects from the first B draws of the stream, one row "
-                         "per B, and requires those B complete at depth. 'all' selects "
-                         "from every draw the arm produced for that complex, which is "
-                         "what the pilot table did -- an arm that proposed 7 draws on "
-                         "one complex and 12 on another contributes both, so the pool "
-                         "size is a property of the run rather than of the row.")
+    ap.add_argument("--draws", "--pool", dest="draws",
+                    choices=("budget", "all"), default="budget",
+                    help="how many of a complex's DRAWS -- the mutant sequences the "
+                         "search proposed for that target -- the winner is chosen from. "
+                         "'budget' uses the first B of the stream, one table row per B, "
+                         "and requires those B complete at depth. 'all' uses every draw "
+                         "the arm produced for that complex, which is what the pilot "
+                         "table did: an arm that proposed 7 draws on one target and 12 "
+                         "on another contributes both, so the count is a property of the "
+                         "run rather than of the row. `--pool` is a deprecated alias.")
     ap.add_argument("--directions", type=int, choices=(1, 2), default=1,
                     help="1 selects on ranks [0,half) and measures on [half,depth). "
                          "2 also runs the reverse and averages the two per complex, "
@@ -99,7 +102,7 @@ def main() -> int:
                          "cpseq_ladder_report.ENERGY_KEY (the screening objective). The "
                          "pilot table used refined_dG_separated.")
     ap.add_argument("--pilot", action="store_true",
-                    help="shorthand for the estimator that chose the arm: --pool all "
+                    help="shorthand for the estimator that chose the arm: --draws all "
                          "--directions 2 --min-ref-valid 3 "
                          "--energy-key refined_dG_separated. Set explicitly by any of "
                          "those flags, which win over this one.")
@@ -108,8 +111,8 @@ def main() -> int:
 
     if args.pilot:
         given = set(sys.argv[1:])
-        if "--pool" not in given:
-            args.pool = "all"
+        if not {"--draws", "--pool"} & given:
+            args.draws = "all"
         if "--directions" not in given:
             args.directions = 2
         if "--min-ref-valid" not in given:
@@ -126,7 +129,7 @@ def main() -> int:
     state = build(per_parent, draw_arm=args.arm,
                   scoring_version=args.scoring_version,
                   **({"energy_key": args.energy_key} if args.energy_key else {}))
-    rungs = [int(x) for x in args.rungs.split(",")] if args.pool == "rungs" else [0]
+    rungs = [int(x) for x in args.rungs.split(",")] if args.draws == "budget" else [0]
 
     # (select_lo, select_hi, measure_lo, measure_hi) per direction.
     splits = [(0, half, half, depth)]
@@ -135,7 +138,7 @@ def main() -> int:
 
     print(f"=== cross-fit-selected candidate vs unchanged peptide ===")
     print(f"out_dir: {out_dir}   arm: {args.arm}")
-    print(f"estimator: pool={args.pool} directions={args.directions} "
+    print(f"estimator: draws={args.draws} directions={args.directions} "
           f"min_ref_valid={args.min_ref_valid} "
           f"energy_key={args.energy_key or 'default'}")
     for lo, hi, mlo, mhi in splits:
@@ -149,7 +152,7 @@ def main() -> int:
     print()
     print(f"  {'B':>3} {'cplx':>5} | {'dG REU':>8} {'w/l':>8} {'sign p':>9} "
           f"| {'d(valid)':>9} {'w/l':>8} {'sign p':>9} "
-          f"| {'unmeas':>6} {'unserved':>8} {'no_base':>8} {'pool':>5}")
+          f"| {'unmeas':>6} {'unserved':>8} {'no_base':>8} {'draws':>6}")
 
     def pick_and_measure(cands, ref, sel, meas):
         """Select on `sel`, measure candidate and reference on `meas`.
@@ -192,7 +195,7 @@ def main() -> int:
         n_cplx = 0
         n_unserved = 0
         n_no_baseline = 0
-        pools = []
+        n_draws_seen = []
         for _pid, s in state.items():
             draws = s["draws"]
             ref = s["reference"]
@@ -203,7 +206,7 @@ def main() -> int:
             if args.min_ref_valid and ref.n_pass(depth) < args.min_ref_valid:
                 n_no_baseline += 1
                 continue
-            if args.pool == "all":
+            if args.draws == "all":
                 cands = [draws[k] for k in sorted(draws)]
             else:
                 if complete_prefix(draws, depth) < B:
@@ -233,7 +236,7 @@ def main() -> int:
                 n_unserved += 1
                 continue
             n_cplx += 1
-            pools.append(len(cands))
+            n_draws_seen.append(len(cands))
 
             # Validity first, and for every served complex -- including the ones the
             # energy comparison has to drop. A pass rate of zero is a real answer.
@@ -261,12 +264,12 @@ def main() -> int:
                 e_l += 1
 
         row = {
-            "B": B if args.pool == "rungs" else "all",
+            "B": B if args.draws == "budget" else "all",
             "n_complexes": n_cplx,
             "n_unserved": n_unserved,
             "n_no_baseline": n_no_baseline,
-            "mean_pool": st.fmean(pools) if pools else None,
-            "pool": args.pool,
+            "mean_draws": st.fmean(n_draws_seen) if n_draws_seen else None,
+            "draws": args.draws,
             "directions": args.directions,
             "min_ref_valid": args.min_ref_valid,
             "energy_key": args.energy_key,
@@ -288,10 +291,10 @@ def main() -> int:
         vm = "-" if row["validity_median_delta"] is None else f"{row['validity_median_delta']:+9.3f}"
         ep = "-" if row["energy_sign_p"] is None else f"{row['energy_sign_p']:9.2e}"
         vp = "-" if row["validity_sign_p"] is None else f"{row['validity_sign_p']:9.2e}"
-        pl = "-" if row["mean_pool"] is None else f"{row['mean_pool']:5.1f}"
+        dr = "-" if row["mean_draws"] is None else f"{row['mean_draws']:6.1f}"
         print(f"  {str(row['B']):>3} {n_cplx:>5} | {em} {f'{e_w}/{e_l}':>8} {ep} "
               f"| {vm} {f'{v_w}/{v_l}':>8} {vp} "
-              f"| {unmeas:>6} {n_unserved:>8} {n_no_baseline:>8} {pl:>5}")
+              f"| {unmeas:>6} {n_unserved:>8} {n_no_baseline:>8} {dr:>6}")
 
     print("\n  dG REU     selected candidate's median energy minus the peptide's, both")
     print("             over the held-out folds. Negative = the search's pick is better.")
@@ -301,7 +304,10 @@ def main() -> int:
     print("             has no held-out energy. Counted in validity, not in energy.")
     print("  no_base    reference below --min-ref-valid: no baseline to beat. Excluded")
     print("             from both columns, because it is a missing measurement.")
-    print("  pool       mean candidates selected from, per complex.")
+    print("  draws      mean DRAWS per complex: the mutant sequences the search")
+    print("             proposed for that target, i.e. how many the winner was picked")
+    print("             from. Best-of-N is better for larger N, so two arms are only")
+    print("             comparable at comparable draw counts.")
     print("  Energies are Rosetta ref2015 REU, NOT measured binding free energies.")
 
     # Named after the arm and the gate, so reporting a second arm or a second scoring
