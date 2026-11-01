@@ -39,6 +39,13 @@
 > **Use v3.** Verified 2026-11-01 — see §5.2, whose open question is now answered and the
 > answer is not the one it expected.
 >
+> **Published bundles** (journals only; every number redraws from them, no structure
+> needed, and each replays with no repo and no `/data`):
+> `b2:proteina/cpseq/results/llm_ladder_pilot_table.tar.zst` (5.4 MB, the §0.2 arm table)
+> and `b2:proteina/cpseq/results/pepbench_corpus_pot_v3.tar.zst` (12 MB, §0.3's 391
+> complexes). Built by `scripts/cpseq_result_bundle.sh`, which measures each bundle's
+> caveats from the journals it packs rather than copying another run's.
+>
 > **−7.82 is superseded by −5.23 (§0.2).** It was a pilot number on 10 of 20 complexes
 > selected from the arm's whole pool, and that estimator is now implemented as
 > `cpseq_selected_candidate_report.py --pilot`. Re-measured on the same gate and cohort
@@ -118,7 +125,52 @@ What survives and what does not:
 have a reference with fewer than 3 valid folds, so every row above is 10 of 20.
 
 Redraw: `cpseq_selected_candidate_report.py --out-dir /data/user_data/yixiz/cpseq/llm_ladder
---scoring-version v3-cis-amide-muco-windows --arm <arm> --pilot`.
+--scoring-version v3-cis-amide-muco-windows --arm <arm> --pilot`, or
+`bash scripts/cpseq_pilot_table.sh` for all five.
+
+## 0.3 What exists at scale, and which axis moves a number
+
+**There is a corpus-scale result, and it is not an arm result.** `pepbench_corpus_pot`,
+v3, same search and same report, under this section's own estimator:
+
+| | complexes | ΔdG | w/l | sign p | d(valid) |
+|---|---|---|---|---|---|
+| `random_control` vs peptide, `--pilot` | **391** | **−1.43 REU** | 250/141 | **3.9e-8** | +0.000 (p = 0.76) |
+
+Best-of-8 random substitution beats the unchanged native peptide at 39x the arm table's
+complex count, with no validity cost. **No proposer has ever been run on those 391
+complexes**, which is the gap: §0.2's −5.23 and this −1.43 are different cohorts at
+different pool sizes and are not comparable. 391 of them already have a paid-for v3
+reference at full depth, so the baseline for an arm run at scale is already bought.
+
+**Why the same run reads −2.21 or −1.43.** One axis changed at a time, `random_control`,
+v3, so a number seen elsewhere can be placed:
+
+| estimator | n | ΔdG | w/l | unmeas | no_base |
+|---|---|---|---|---|---|
+| default, B=8 | 400 | −2.21 | 249/124 | 6 | 21 |
+| `--pool all` | 418 | −2.24 | 257/127 | 13 | 21 |
+| `--min-ref-valid 3` | 374 | −2.24 | 246/122 | 4 | 29 |
+| `--directions 2` | 400 | **−1.60** | 249/**136** | **0** | 15 |
+| full `--pilot` | 391 | −1.43 | 250/141 | 0 | 27 |
+
+- **`--pool all` is a no-op here.** The corpus arm drew exactly 8, so B=8 *is* the whole
+  pool. This is the axis that dominates on `llm_ladder`, where pools are 10–59.
+- **`--min-ref-valid 3` is a no-op on the estimate**, dropping 26 complexes and moving
+  nothing. The ~29 % of corpus targets with a thin baseline are not carrying the effect.
+  A reassuring null, and not the one expected.
+- **`--directions 2` is the whole difference.** `unmeas` goes 6 → 0 and w/l goes
+  249/124 → 249/**136**: twelve losses appear and no wins. The single direction drops a
+  complex whose pick passed no fold in ranks 5–9; running the reverse gives it a second
+  chance at a measurement, and the rescued complexes are almost all losses. Dropping them
+  was quietly optimistic, so the two-direction number is smaller because it stops hiding
+  them — not because anything was re-folded.
+- **`--energy-key` is a no-op, ruled out.** `best_valid_dG_separated` and
+  `refined_dG_separated` are equal on all 14,602 v3 rows across both run directories where
+  both exist; they differ only in being null on an invalid fold, which `median_energy_in`
+  already drops. They would diverge at `diffusion_samples > 1`; every run here is at 1.
+
+So three axes, not four, and on the corpus only one of the three bites.
 
 ## 0.1 `llm_search` is RETAINED, not eliminated
 

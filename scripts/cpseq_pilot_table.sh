@@ -14,6 +14,15 @@
 #   --energy-key refined_dG_separated
 #                        the pilot's field, not the screening objective
 #
+# The fourth is a NO-OP on every run measured so far, and is kept only so the
+# rule is stated in full. `best_valid_dG_separated` and `refined_dG_separated`
+# are equal on all 14,602 v3 rows of `llm_ladder` and `pepbench_corpus_pot`
+# where both exist -- they differ only in being null on an invalid fold, and
+# `median_energy_in` already drops those. Verified by running the table both
+# ways: identical to the digit. They would diverge under `diffusion_samples > 1`,
+# where `best_valid` is a best-of-samples and `refined` is one structure; every
+# run here is at 1.
+#
 # Without `--pilot` the same script answers a different question -- per-budget B
 # off a nested prefix -- and those numbers are not comparable to these.
 #

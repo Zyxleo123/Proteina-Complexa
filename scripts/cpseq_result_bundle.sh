@@ -125,15 +125,84 @@ $([ "$WITH_SCORES" = "1" ] && echo "- \`scores/$GATE/\` — per-fold score recor
 
 Parents included: ${#PIDS[@]} ($PARENTS).
 
-## Known caveats
-
-- The gate must be named: this run holds v3, v4 and v5 rows, and the report
-  refuses to print a comparison from a mixed set.
-- 195 of the 200 v4 reference rows were never actually scored (null geometry,
-  \`valid: false\`). Do not read a v4 pass rate off this run.
-- 4 of the 10 complexes with a baseline have 0 or 1 valid reference fold in one
-  cross-fit direction. Per-complex signs are solid; magnitudes are soft.
 EOF
+
+# The caveats are MEASURED from the journals going into the bundle, not copied
+# from another run's. A bundle carrying the wrong run's caveats is worse than one
+# carrying none, because it reads as if someone checked.
+python3 - "$STAGE/$NAME" "$GATE" >> "$STAGE/$NAME/REPLAY.md" <<'PY'
+import collections, glob, json, sys
+
+root, gate = sys.argv[1], sys.argv[2]
+gates = collections.Counter()
+unscored = collections.Counter()
+ref_valid = collections.defaultdict(dict)
+arms = collections.Counter()
+
+for f in glob.glob(f"{root}/state/*/outcomes.jsonl"):
+    for line in open(f):
+        try:
+            r = json.loads(line)
+        except Exception:
+            continue
+        sv = str(r.get("scoring_version"))
+        gates[sv] += 1
+        arms[r.get("arm")] += 1
+        if not r.get("valid") and r.get("closure_status") is None \
+                and r.get("violation") is None:
+            unscored[sv] += 1
+        if r.get("arm") == "reference" and sv == gate:
+            rk = r.get("seed_rank")
+            if rk is not None:
+                ref_valid[r["parent_id"]][int(rk)] = bool(r.get("valid"))
+
+out = ["## Known caveats, measured from the journals in this bundle\n"]
+
+out.append(f"Rows by gate: " + ", ".join(f"`{k}` {v:,}" for k, v in gates.most_common()))
+if len(gates) > 1:
+    out.append(
+        f"\nMore than one gate is present, so **the gate must be named**: these folds were "
+        f"judged by different rules and the report refuses to print a comparison from a "
+        f"mixed set. Every number quoted for this bundle is under `{gate}`.")
+out.append("")
+
+if unscored:
+    out.append("**Unscored rows counted as failures.** These carry `valid: false` with "
+               "null geometry, i.e. a rescore that never ran, and `n_pass()` cannot tell "
+               "them from a rejection:\n")
+    for k, v in unscored.most_common():
+        out.append(f"- `{k}`: {v:,} rows")
+    out.append("")
+
+if ref_valid:
+    depth = max((max(d) + 1) for d in ref_valid.values())
+    half = depth // 2
+    withb = {p: d for p, d in ref_valid.items() if sum(d.values()) >= 3}
+    thin = {}
+    for p, d in withb.items():
+        a = sum(v for k, v in d.items() if k < half)
+        b = sum(v for k, v in d.items() if k >= half)
+        if min(a, b) <= 1:
+            thin[p] = (a, b)
+    out.append(f"**Baselines.** {len(withb)} of {len(ref_valid)} parents have a reference "
+               f"with >= 3 valid folds under `{gate}`. The rest have no baseline to beat, "
+               f"which is a missing measurement and not a negative result.\n")
+    if thin:
+        out.append(f"{len(thin)} of those {len(withb)} have 0 or 1 valid reference fold in "
+                   f"ONE of the two cross-fit halves, so that direction's baseline is a "
+                   f"median over a single structure. `--min-ref-valid` floors the full "
+                   f"depth, not each half. Treat per-complex signs as solid and magnitudes "
+                   f"as soft.\n")
+        shown = sorted(thin.items())[:12]
+        for p, (a, b) in shown:
+            out.append(f"- `{p}` {a}/{b}")
+        if len(thin) > len(shown):
+            out.append(f"- ... and {len(thin) - len(shown)} more")
+    out.append("")
+
+out.append("Arms present: " + ", ".join(f"`{k}` {v:,}" for k, v in arms.most_common()))
+print("\n".join(out))
+PY
 
 TARBALL="$STAGE/${NAME}.tar.zst"
 tar -C "$STAGE" -cf - "$NAME" | zstd -"$ZLEVEL" -T2 -q -o "$TARBALL"
