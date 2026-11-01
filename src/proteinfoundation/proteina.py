@@ -4,9 +4,11 @@ import os
 import random
 import re
 from functools import partial
+from pathlib import Path
 from typing import Literal
 
 import lightning as L
+import numpy as np
 import torch
 from jaxtyping import Float
 from lightning.pytorch.utilities.rank_zero import rank_zero_only
@@ -31,6 +33,7 @@ from proteinfoundation.eval.sampled_binder_metrics import (
     sampled_binder_metrics,
 )
 from proteinfoundation.eval.sequence_recovery_metrics import sequence_recovery_metrics
+from proteinfoundation.eval.sequence_similarity import blosum_metrics, per_position_records
 from proteinfoundation.eval.surface_metrics import batch_surface_agreement_from_ca
 from proteinfoundation.flow_matching.product_space_flow_matcher import ProductSpaceFlowMatcher
 from proteinfoundation.logging.metric_schema import finalize_metrics, init_metric_dict
@@ -2496,6 +2499,44 @@ class Proteina(L.LightningModule):
                     prefix=f"{prefix}/seq",
                 )
             )
+            # BLOSUM beside exact match, because identity in a 5-16-mer is substitutable and
+            # exact match charges a full miss for a conservative swap. `free_blosum_mean_miss`
+            # is the one that adds information: two models with the same free_recovery differ
+            # only in whether their misses are conservative or random.
+            metrics.update(
+                blosum_metrics(
+                    pred_aatype=aatype.long(),
+                    true_aatype=gen_batch["residue_type"].long(),
+                    mask=gen_mask,
+                    cond_mask=seq_cond_mask,
+                    prefix=f"{prefix}/seq",
+                )
+            )
+            # Per-position records. A pooled recovery rate cannot be decomposed afterwards, and
+            # the decomposition is the point: terminal anchor positions are largely a lookup
+            # (a disulfide anchor must be CYS), so a pooled number can be carried by exactly
+            # the positions that are not predictions. Written per batch, read offline, so
+            # positional recovery and the P(r | pos, L, chemistry) prior never need a resample.
+            # `cyclization_type` here is the REQUESTED type the model was handed, not its own
+            # prediction -- the prior must see the same conditioning the model did.
+            pp_dir = vg.get("seq_per_position_dir", None)
+            if pp_dir:
+                try:
+                    rec = per_position_records(
+                        pred_aatype=aatype.long(),
+                        true_aatype=gen_batch["residue_type"].long(),
+                        mask=gen_mask,
+                        cond_mask=seq_cond_mask,
+                        cyc_type=gen_batch.get("cyclization_type"),
+                    )
+                    pp_path = Path(pp_dir)
+                    pp_path.mkdir(parents=True, exist_ok=True)
+                    tag = f"{int(self.global_step)}_{int(getattr(self, '_seq_pp_batch', 0))}"
+                    np.savez_compressed(pp_path / f"seq_pos_{tag}.npz", **rec)
+                    self._seq_pp_batch = int(getattr(self, "_seq_pp_batch", 0)) + 1
+                except Exception as exc:  # noqa: BLE001
+                    # A diagnostic dump must never take down a validation pass.
+                    logger.warning(f"per-position sequence dump failed: {exc}")
 
         # Rosetta sidecar: dump a capped sample of complexes to disk so a SEPARATE CPU job can score
         # interface dG offline (see eval/val_gen_dump.py). OFF unless `val_generation.rosetta_dump_dir`

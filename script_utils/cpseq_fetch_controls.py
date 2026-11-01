@@ -174,14 +174,38 @@ def main() -> None:
     ap.add_argument("--out-dir", type=Path, required=True)
     ap.add_argument("--n", type=int, default=6, help="how many verified controls to keep")
     ap.add_argument("--max-download", type=int, default=120)
+    # Rebuilding the control set on a new cluster must not re-run the live search. The
+    # search is score-ranked against a corpus that changes, so a later query can return
+    # a different six -- and the tolerances are DERIVED from these structures, so a
+    # different six is a different acceptance gate under the same version label. That is
+    # exactly the divergence `cpseq_search.gate_sha256` exists to catch. Pin the ids and
+    # the set is reproducible; every one is still verified by measurement, so pinning
+    # chooses WHICH structures to measure and never what the measurement says.
+    ap.add_argument(
+        "--pdb-ids",
+        default=None,
+        help="comma-separated PDB ids to use instead of the RCSB search "
+             "(this project's frozen set: 5TU6,7K2M,7K2F,1SFI,1SLD,1SLE)",
+    )
+    ap.add_argument(
+        "--expect",
+        default=None,
+        help="comma-separated ID:chemistry asserted after measurement, e.g. "
+             "'5TU6:mainchain,1SLD:disulfide'. A drifted assignment changes the derived "
+             "tolerances, so it fails here rather than silently re-deriving the gate.",
+    )
     args = ap.parse_args()
 
     raw_dir = args.out_dir / "pdb"
     args.out_dir.mkdir(parents=True, exist_ok=True)
 
-    print("[controls] querying RCSB for short-peptide/protein complexes ...")
-    ids = rcsb_search()
-    print(f"[controls] {len(ids)} candidate entries")
+    if args.pdb_ids:
+        ids = [x.strip().upper() for x in args.pdb_ids.split(",") if x.strip()]
+        print(f"[controls] using {len(ids)} PINNED ids (no RCSB search): {', '.join(ids)}")
+    else:
+        print("[controls] querying RCSB for short-peptide/protein complexes ...")
+        ids = rcsb_search()
+        print(f"[controls] {len(ids)} candidate entries")
 
     accepted, rejected = [], []
     # Deduplicate by SYSTEM, not by entry. The first run returned 1SLD, 1VWB, 1VWN and
@@ -228,6 +252,27 @@ def main() -> None:
               f"{best['chemistry']} L={best['peptide_length']} "
               f"bond={best['closure']['bond_length_A']}A seq={best['sequence']}")
         time.sleep(0.2)
+
+    if args.expect:
+        want = {}
+        for item in args.expect.split(","):
+            if not item.strip():
+                continue
+            pid, chem = item.split(":")
+            want[pid.strip().upper()] = chem.strip()
+        got = {a["pdb_id"].upper(): a["chemistry"] for a in accepted}
+        bad = {k: (want[k], got.get(k, "MISSING")) for k in want if got.get(k) != want[k]}
+        extra = sorted(set(got) - set(want))
+        if bad or extra:
+            print("\n[controls] REFUSING: the control set does not match --expect.")
+            for k, (exp, act) in sorted(bad.items()):
+                print(f"    {k}: expected {exp}, measured {act}")
+            for k in extra:
+                print(f"    {k}: accepted but not expected ({got[k]})")
+            print("    The tolerances are derived from these structures, so an unexpected")
+            print("    set is a different acceptance gate. Nothing was written.")
+            raise SystemExit(1)
+        print(f"[controls] --expect satisfied for all {len(want)} controls")
 
     (args.out_dir / "controls.json").write_text(json.dumps(accepted, indent=2))
     (args.out_dir / "controls_rejected.json").write_text(json.dumps(rejected, indent=2))
