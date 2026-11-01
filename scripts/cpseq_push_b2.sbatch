@@ -91,8 +91,10 @@ if ! flock -n 9; then
 fi
 echo "holding the push lock"
 df -h "$CPSEQ" | tail -1
-echo "--- tree, apparent size (du overstates: NFS block padding) ---"
-du -sh --apparent-size "$CPSEQ" 2>/dev/null || true
+# No `du` here. It was in this script for one run and cost 1h44m of a 2h limit
+# (04:12:20 -> 05:56:36) walking the 47 GB tree over NFS before a single byte
+# was uploaded, which is most of why that job timed out. The tree size is a
+# nice-to-have; the manifests printed by the scan say what is being sent.
 
 rc=0
 bash "$PUSH" "$DEST" "$WHAT" || rc=$?

@@ -74,41 +74,76 @@ CORE_DIRS='state scores interfaces llm_proposals'
 FOLD_DIRS='predictions designs'
 
 build_lists() {
-  echo "--- scanning $CPSEQ (slow over NFS; cached in $LISTS) ---"
-  : > "$LISTS/core.files"
-  : > "$LISTS/folds.files"
+  echo "--- scanning $CPSEQ (one pruned traversal; cached in $LISTS) ---"
 
-  # Loose files at the top of the tree and at the top of each run directory:
-  # reports, cohort definitions, ladder/screen summaries, probe JSONL.
+  # Scan into a scratch directory and publish atomically at the end. A scan
+  # killed partway must leave NO usable cache: on 2026-11-01 job 11004355 was
+  # cut off by its time limit midway through the directory scan, which left a
+  # populated core.files next to an empty core.dirs. The old freshness test
+  # below was `-s core.files`, so the next two runs happily reused that
+  # half-written plan and uploaded the loose summaries and nothing else,
+  # reporting "0 directories expected" as though the tree were empty. Lists
+  # are now published only once complete, and freshness is a marker file.
+  local tmp="$LISTS/.scan.$$"
+  rm -rf "$tmp"; mkdir -p "$tmp"
+
+  # Shallow pass: loose summaries at the top of the tree and of each run
+  # directory -- reports, cohort definitions, ladder/screen summaries, probes.
   find "$CPSEQ" -maxdepth 2 -type f \
     \( -name '*.json' -o -name '*.jsonl' -o -name '*.csv' -o -name '*.tsv' \
        -o -name '*.txt' -o -name '*.log' \) \
-    -not -path "$LISTS/*" -printf '%P\n' >> "$LISTS/core.files"
+    -not -path "$LISTS/*" -printf '%P\n' > "$tmp/core.files" 2>/dev/null || true
 
-  # The per-run result directories, wherever they sit in the tree.
-  for d in $CORE_DIRS; do
-    find "$CPSEQ" -type d -name "$d" -printf '%P\n' >> "$LISTS/core.dirs" 2>/dev/null || true
-  done
-  for d in $FOLD_DIRS; do
-    find "$CPSEQ" -type d -name "$d" -printf '%P\n' >> "$LISTS/folds.dirs" 2>/dev/null || true
-  done
+  # Deep pass: ONE traversal for every result directory name, with -prune so
+  # the walk stops at each match instead of descending through the hundreds of
+  # thousands of small files inside it. The previous version ran a separate
+  # full-tree `find` per directory name -- six traversals of a 47 GB NFS tree,
+  # each walking into every match. That is what ran past the time limit.
+  local cexpr=() fexpr=()
+  for d in $CORE_DIRS; do cexpr+=( -o -name "$d" ); done
+  for d in $FOLD_DIRS; do fexpr+=( -o -name "$d" ); done
+  find "$CPSEQ" -path "$LISTS" -prune -o \
+    \( -type d \( "${cexpr[@]:1}" \) -printf 'C %P\n' -prune \) -o \
+    \( -type d \( "${fexpr[@]:1}" \) -printf 'F %P\n' -prune \) \
+    > "$tmp/dirs.raw" 2>/dev/null || true
+
+  sed -n 's/^C //p' "$tmp/dirs.raw" > "$tmp/core.dirs"
+  sed -n 's/^F //p' "$tmp/dirs.raw" > "$tmp/folds.dirs"
+  : > "$tmp/folds.files"
 
   # `transfer/` is the staged HighFold3 input set: small, and it is what a
   # second predictor would be re-run from, so it travels with the core.
-  [ -d "$CPSEQ/transfer" ] && echo "transfer" >> "$LISTS/core.dirs"
+  [ -d "$CPSEQ/transfer" ] && echo "transfer" >> "$tmp/core.dirs"
 
-  sort -u -o "$LISTS/core.dirs" "$LISTS/core.dirs" 2>/dev/null || true
-  sort -u -o "$LISTS/folds.dirs" "$LISTS/folds.dirs" 2>/dev/null || true
-  sort -u -o "$LISTS/core.files" "$LISTS/core.files"
-  echo "    core: $(wc -l < "$LISTS/core.files") loose files, $(wc -l < "$LISTS/core.dirs" 2>/dev/null || echo 0) dirs"
-  echo "    folds: $(wc -l < "$LISTS/folds.dirs" 2>/dev/null || echo 0) dirs"
+  sort -u -o "$tmp/core.dirs" "$tmp/core.dirs"
+  sort -u -o "$tmp/folds.dirs" "$tmp/folds.dirs"
+  sort -u -o "$tmp/core.files" "$tmp/core.files"
+
+  # A scan that found no result directories at all is far more likely to be a
+  # broken scan than an empty tree. Refuse to publish it as a plan.
+  if [ ! -s "$tmp/core.dirs" ] && [ ! -s "$tmp/folds.dirs" ]; then
+    echo "FATAL: scan found no $CORE_DIRS or $FOLD_DIRS directories under $CPSEQ." >&2
+    echo "  Not publishing an empty plan. Check the tree layout before retrying." >&2
+    ls -la "$CPSEQ" | head -20 >&2
+    rm -rf "$tmp"
+    return 1
+  fi
+
+  for f in core.files core.dirs folds.dirs folds.files; do
+    mv -f "$tmp/$f" "$LISTS/$f"
+  done
+  rm -rf "$tmp"
+  date -u +%FT%TZ > "$LISTS/.scan_complete"
+
+  echo "    core: $(wc -l < "$LISTS/core.files") loose files, $(wc -l < "$LISTS/core.dirs") dirs"
+  echo "    folds: $(wc -l < "$LISTS/folds.dirs") dirs"
 }
 
-if [ "${REBUILD:-0}" = "1" ] || [ ! -s "$LISTS/core.files" ]; then
-  rm -f "$LISTS/core.dirs" "$LISTS/folds.dirs"
+if [ "${REBUILD:-0}" = "1" ] || [ ! -f "$LISTS/.scan_complete" ]; then
+  rm -f "$LISTS/.scan_complete"
   build_lists
 else
-  echo "--- reusing cached lists in $LISTS (REBUILD=1 to re-scan) ---"
+  echo "--- reusing cached lists in $LISTS from $(cat "$LISTS/.scan_complete") (REBUILD=1 to re-scan) ---"
 fi
 
 existing="$(rclone lsf "$DEST" --recursive 2>/dev/null || true)"
