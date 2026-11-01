@@ -55,7 +55,7 @@ Execution status
 ----------------
 This adapter builds inputs and the command line. Running it needs the AF3 runtime, which
 is a separate build; `scripts/cpseq_env_highfold3.sbatch` attempts it and
-`docs/README_CPSEQ_DATASET.md` records how far it got. The version constraint is real and
+`docs/old_docs/README_CPSEQ_DATASET.md` records how far it got. The version constraint is real and
 narrow: HighFold3's bytecode requires CPython 3.11, while current AF3 (131ab9e7) sets
 `requires-python = ">=3.12"`. The AF3 revision contemporaneous with HighFold3's snapshot,
 `a8ecdb2d` (2025-09-08), requires `>=3.11` with `jax==0.4.34` and `dm-haiku==0.0.13`, so
@@ -126,7 +126,7 @@ def build_input_json(
     """AF3-format input with the PEPTIDE FIRST, which HighFold3's encoding requires.
 
     MSAs are supplied inline/by path because AF3's genetic databases do not fit the
-    quota (see `docs/RESOURCES_COLLECTED.md`); AF3 accepts `unpairedMsaPath`, so the
+    quota (see `docs/old_docs/RESOURCES_COLLECTED.md`); AF3 accepts `unpairedMsaPath`, so the
     alignments computed once per target are reused here exactly as the other arms reuse
     them. The peptide gets an explicitly empty MSA rather than a search.
     """

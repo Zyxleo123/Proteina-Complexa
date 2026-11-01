@@ -20,7 +20,7 @@ too, but kept in a SEPARATE vector -- `staging_profile()`.  They are the confoun
 signal: PepBench receptors are whole chains at a median 223 residues while CPSea receptors
 are 14 A pocket crops at 139, so a classifier handed both vectors at once will reach a high
 AUC on the staging artifact and name the wrong feature as the difference.  See
-`docs/README_POSE_DECOY_INVENTORY.md` section 2.5 and its resolution at 4.5.
+`docs/old_docs/README_POSE_DECOY_INVENTORY.md` section 2.5 and its resolution at 4.5.
 
 Runs in `.venv` (mdtraj / numpy).  No OpenMM, no PyRosetta, no GPU.
 """
@@ -489,7 +489,7 @@ def receptor_segments(rec_resseq: list[int], gap: int = SEGMENT_GAP) -> tuple[in
     """(n_segments, longest run, fragments shorter than 5) over receptor residue numbering.
 
     The pocket crop preserves original numbering, so a deleted residue shows up as a jump
-    in resSeq.  These are the live statistics in `docs/README_TARGET_DISTRIBUTION_MATCHING.md`
+    in resSeq.  These are the live statistics in `docs/old_docs/README_TARGET_DISTRIBUTION_MATCHING.md`
     -- `n_segments` plateaus across every crop radius from 6 to 18 A and therefore does not
     discriminate, while `max_run` and `frag<5` do.
     """

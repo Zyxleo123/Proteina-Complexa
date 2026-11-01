@@ -2,7 +2,7 @@
 
 THE QUESTION. The one-pass editor exports at ~1% `chain_intact` in every adversarial arm
 while the control exports at ~79%, and the 0.02 nm bond tolerance is NOT the culprit -- it
-is calibrated on a plateau and natives sit 6x inside it (docs/README_CP2LP.md). So the
+is calibrated on a plateau and natives sit 6x inside it (docs/old_docs/README_CP2LP.md). So the
 generated backbones are genuinely broken. This probe asks which input breaks them.
 
 THE MECHANISM UNDER TEST. The editor emits a per-residue Cartesian residual and adds it to

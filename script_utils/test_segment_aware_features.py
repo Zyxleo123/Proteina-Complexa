@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Non-GPU validation checks for segment-aware CPSea feature construction.
 
-Validates the behavior described in docs/README_DATA_SEQ_BREAK_ISSUE.md:
+Validates the behavior described in docs/old_docs/README_DATA_SEQ_BREAK_ISSUE.md:
   - target REAL_BREAKs (and NUMBERING_ONLY jumps) create new segment_id values
   - pairwise seq_sep is all-zero across a target segment boundary
   - pairwise seq_sep is all-zero for binder-target pairs

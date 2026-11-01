@@ -17,7 +17,7 @@
 # WHAT CHANGED FROM THE ROLLOUT ARMS, AND WHY.
 #
 # The rollout generator integrated a 24-step differentiable trajectory and exported from a
-# 200-step sampler. MEASURED consequence (docs/README_CP2LP.md, "the geometry tell"):
+# 200-step sampler. MEASURED consequence (docs/old_docs/README_CP2LP.md, "the geometry tell"):
 # generated peptides carried backbone bond deviations of 0.058-1.93 nm against real LPs'
 # 0.0010-0.0205 -- completely disjoint distributions, generated minimum 3.3x above the real
 # maximum, on 0 of 40,133 batches did they overlap. A single scalar threshold separated the

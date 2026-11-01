@@ -61,7 +61,7 @@ _cp2lp_defaults() {
     # comparing against. Guarded by `test_preamble_run_names_track_the_configs`.
     #
     # --- legacy rollout arms (differentiable trajectory, 200-step export). Kept so the
-    # three measured generations in docs/README_CP2LP.md stay reproducible.
+    # three measured generations in docs/old_docs/README_CP2LP.md stay reproducible.
     gan)         CONFIG_NAME="${CONFIG_NAME:-example/training_cp2lp_gan}";          RUN_NAME="${RUN_NAME:-cp2lp_gan_v2}" ;;
     contactonly) CONFIG_NAME="${CONFIG_NAME:-example/training_cp2lp_contactonly}";  RUN_NAME="${RUN_NAME:-cp2lp_contactonly_v2}" ;;
     # --- one-pass direct editor: the common fork, then the five disjoint arms.

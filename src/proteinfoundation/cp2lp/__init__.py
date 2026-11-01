@@ -16,7 +16,7 @@ There are two generator modes. ``onepass`` is a DIRECT EDITOR: one network evalu
 turns the encoded source CP into an edited state via zero-initialised residual heads, with
 ``t`` pinned at a constant and no sampler on either the training or the export path.
 ``rollout`` is the original differentiable-trajectory generator, kept unchanged for the
-historical comparison. See ``docs/README_CP2LP.md``.
+historical comparison. See ``docs/old_docs/README_CP2LP.md``.
 
 Layout:
     conditioning   the persistent source-CP condition (``x_src_cp``) and the LINEAR

@@ -36,7 +36,7 @@ Usage:
         results_dir=./evaluation_results/my_monomer_run
 
     # Analyze with custom success thresholds (use a config file override)
-    # See docs/CONFIGURATION_GUIDE.md for threshold format
+    # See docs/old_docs/CONFIGURATION_GUIDE.md for threshold format
 
     # Dryrun to see what would be computed
     python analyze.py --config-name analyze dryrun=true

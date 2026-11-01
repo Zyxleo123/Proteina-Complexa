@@ -103,7 +103,7 @@ for arm in ${STAGE_ARMS//,/ }; do
     # POTFlow and PepGLAD declare no dependencies at all. Guessing a set here would
     # bury that fact; the arm's own notes record what its imports need.
     echo "[env] ${arm}: NO packaging and NO requirements.txt -- venv created empty." >&2
-    echo "[env] ${arm}: see docs/README_LPGEN.md for the import-derived dependency list." >&2
+    echo "[env] ${arm}: see docs/old_docs/README_LPGEN.md for the import-derived dependency list." >&2
   fi
 
   echo "[env] ${arm}: verifying"

@@ -87,7 +87,7 @@ two force fields and three restraint schemes written and debugged.
 
 `scripts/restage_lnr_pocket.py` crops the receptor to a heavy-atom shell at `--radius` while
 **preserving original residue numbering**, so deleted residues appear as numbering gaps —
-CPSea's own convention. `docs/README_TARGET_DISTRIBUTION_MATCHING.md` carries the calibration:
+CPSea's own convention. `docs/old_docs/README_TARGET_DISTRIBUTION_MATCHING.md` carries the calibration:
 
 | set | segments | max_run | seg_med | frag<5 | tgt_len |
 |---|---|---|---|---|---|

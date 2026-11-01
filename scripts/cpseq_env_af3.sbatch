@@ -53,7 +53,7 @@ AF3_SRC="${AF3_SRC:-$ZFS/upstream/alphafold3}"
 AF3_REV="${AF3_REV:-131ab9e7420066523c62546199243f7a9b3e3e78}"
 AF3_REPO="${AF3_REPO:-https://github.com/google-deepmind/alphafold3}"
 # Model parameters. 1.02 GB zstd-compressed; this URL is the one this project has always
-# used (docs/RESOURCES_COLLECTED.md). Using them means accepting Google DeepMind's AF3
+# used (docs/old_docs/RESOURCES_COLLECTED.md). Using them means accepting Google DeepMind's AF3
 # model-parameter terms, which are non-commercial and forbid redistribution -- so the
 # .bin stays on scratch and is never committed, copied into the repo, or pushed to B2.
 AF3_WEIGHTS_URL="${AF3_WEIGHTS_URL:-https://storage.googleapis.com/alphafold3/af3.bin.zst}"
@@ -235,7 +235,7 @@ else
 # AlphaFold 3 model parameters
 
 Fetched from `https://storage.googleapis.com/alphafold3/af3.bin.zst`, the source this
-project has always recorded for them (`docs/RESOURCES_COLLECTED.md`).
+project has always recorded for them (`docs/old_docs/RESOURCES_COLLECTED.md`).
 
 Use is governed by Google DeepMind's AlphaFold 3 Model Parameters Terms of Use. The
 terms this project operates under:

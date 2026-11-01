@@ -150,7 +150,7 @@ complexa init
 complexa download
 ```
 
-For **evaluation** (e.g. RF3 refolding or RF3 reward during generation), set `RF3_CKPT_PATH` and `RF3_EXEC_PATH` in your environment or `.env`. See [Evaluation & Analysis Guide](docs/EVALUATION_METRICS.md#environment-variables) for the full list of environment variables.
+For **evaluation** (e.g. RF3 refolding or RF3 reward during generation), set `RF3_CKPT_PATH` and `RF3_EXEC_PATH` in your environment or `.env`. See [Evaluation & Analysis Guide](docs/old_docs/EVALUATION_METRICS.md#environment-variables) for the full list of environment variables.
 
 ## Configuration
 
@@ -255,7 +255,7 @@ After configuring checkpoint paths and environment variables, verify everything 
 complexa validate design configs/search_binder_local_pipeline.yaml
 ```
 
-> **Detailed config reference**: See [Configuration Guide](docs/CONFIGURATION_GUIDE.md) for all YAML fields — search algorithms, reward model weights, evaluation settings, analysis thresholds, and training configs.
+> **Detailed config reference**: See [Configuration Guide](docs/old_docs/CONFIGURATION_GUIDE.md) for all YAML fields — search algorithms, reward model weights, evaluation settings, analysis thresholds, and training configs.
 
 ## Quick Start
 
@@ -371,7 +371,7 @@ There are four design pipelines, each with its own config and model:
 | AME (Motif + Ligand) | `search_ame_local_pipeline.yaml` | AME model (LoRA) | Scaffold functional motifs with ligand context |
 | Monomer Motif | `search_motif_local_pipeline.yaml` | AME model (LoRA) | Scaffold structural motifs into monomer proteins |
 
-Each pipeline runs four stages: **generate → filter → evaluate → analyze**. Run the full pipeline with `complexa design`, or run stages individually (`complexa generate`, `complexa filter`, etc.). See the [Inference Guide](docs/INFERENCE.md) for individual stages, and advanced usage.
+Each pipeline runs four stages: **generate → filter → evaluate → analyze**. Run the full pipeline with `complexa design`, or run stages individually (`complexa generate`, `complexa filter`, etc.). See the [Inference Guide](docs/old_docs/INFERENCE.md) for individual stages, and advanced usage.
 
 ## Data
 
@@ -484,17 +484,17 @@ The Teddymer dimer IDs used for training are listed in [`assets/data/teddymer_va
 
 | Document | What it covers |
 |----------|---------------|
-| [Configuration Guide](docs/CONFIGURATION_GUIDE.md) | All YAML config examples: search, rewards, evaluation, analysis, training |
-| [Inference Guide](docs/INFERENCE.md) | Running locally, custom targets, troubleshooting |
-| [Search Metadata & Visualization](docs/SEARCH_METADATA.md) | Metadata tag conventions, output size formulas, trajectory query examples |
-| [Evaluation & Analysis Guide](docs/EVALUATION_METRICS.md) | Evaluation pipeline, metrics, result CSVs, success criteria |
-| [Sweep System](docs/SWEEP.md) | Parameter sweeps without modifying source code |
-| [Training Guide](docs/TRAINING.md) | Model training instructions |
-| [Agent Skills](docs/AGENT_SKILLS.md) | Claude Code agent skills (`.claude/skills/`) that drive the `complexa` CLI agentically |
+| [Configuration Guide](docs/old_docs/CONFIGURATION_GUIDE.md) | All YAML config examples: search, rewards, evaluation, analysis, training |
+| [Inference Guide](docs/old_docs/INFERENCE.md) | Running locally, custom targets, troubleshooting |
+| [Search Metadata & Visualization](docs/old_docs/SEARCH_METADATA.md) | Metadata tag conventions, output size formulas, trajectory query examples |
+| [Evaluation & Analysis Guide](docs/old_docs/EVALUATION_METRICS.md) | Evaluation pipeline, metrics, result CSVs, success criteria |
+| [Sweep System](docs/old_docs/SWEEP.md) | Parameter sweeps without modifying source code |
+| [Training Guide](docs/old_docs/TRAINING.md) | Model training instructions |
+| [Agent Skills](docs/old_docs/AGENT_SKILLS.md) | Claude Code agent skills (`.claude/skills/`) that drive the `complexa` CLI agentically |
 
 ## Evaluation Types
 
-Each pipeline automatically runs the appropriate evaluation. Six evaluation types cover different design tasks -- from standard protein binders to joint motif-binder assessments with ligand clash detection. See the [Evaluation & Analysis Guide](docs/EVALUATION_METRICS.md#protein-types--result-types) for the full type mapping, default thresholds, and success criteria.
+Each pipeline automatically runs the appropriate evaluation. Six evaluation types cover different design tasks -- from standard protein binders to joint motif-binder assessments with ligand clash detection. See the [Evaluation & Analysis Guide](docs/old_docs/EVALUATION_METRICS.md#protein-types--result-types) for the full type mapping, default thresholds, and success criteria.
 
 ## Project Structure
 

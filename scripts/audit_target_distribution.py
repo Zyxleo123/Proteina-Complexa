@@ -13,7 +13,7 @@ arm is launched.
 Segments are computed with the featurizer's own rule (segment_utils.compute_segment_info):
 a new segment starts on a chain change, a numbering jump, or a C_{i-1}->N_i distance above
 2.0 A. The physical term dominates in practice -- a spatial crop leaves real backbone gaps --
-so numbering alone is usually redundant. See docs/README_TARGET_DISTRIBUTION_MATCHING.md.
+so numbering alone is usually redundant. See docs/old_docs/README_TARGET_DISTRIBUTION_MATCHING.md.
 
 Usage:
     python scripts/audit_target_distribution.py \

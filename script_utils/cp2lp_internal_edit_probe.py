@@ -1,6 +1,6 @@
 """Does the internal-coordinate edit space actually fix `chain_intact`? Matched-size test.
 
-THE EXPERIMENT. The diagnosis (docs/README_CP2LP.md, "Why the chain is not intact") says the
+THE EXPERIMENT. The diagnosis (docs/old_docs/README_CP2LP.md, "Why the chain is not intact") says the
 CA track is the damage channel and that a free Cartesian residual cannot avoid wrecking it:
 ~30-40% of the residual is incoherent, the trace leaves both of its native windows, and
 `chain_intact` is 0.0000 against an AE round-trip ceiling of 0.9844. The proposed fix is to

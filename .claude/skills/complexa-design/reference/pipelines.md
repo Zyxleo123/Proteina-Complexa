@@ -150,7 +150,7 @@ workflow.
 
 ## Evaluation types (summary)
 
-From `docs/EVALUATION_METRICS.md`, the types reachable from the three design
+From `docs/old_docs/EVALUATION_METRICS.md`, the types reachable from the three design
 pipelines:
 
 1. **Protein binder** (`protein_type: binder`, `result_type: protein_binder`) —

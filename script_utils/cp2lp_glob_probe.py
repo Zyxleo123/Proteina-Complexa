@@ -5,7 +5,7 @@ arm fixed a real steric defect (interfacial overlap 0.35-0.88x the control at ma
 size) and `d_acc` did not budge: 0.9872 vs 0.9879. The torsion backbone arm reaches
 near-perfect chain geometry (C-N 0.9978, intra 0.9994, tau 0.9998, angles 0.9899) and still
 scores 0.9840 -- no better than the ca_internal population at ~1.6 broken bonds per
-peptide. Both of the two tells docs/README_CP2LP.md names have now been manipulated, and
+peptide. Both of the two tells docs/old_docs/README_CP2LP.md names have now been manipulated, and
 neither moved the number. So `d_acc` is reading something else.
 
 THE SUSPECT, and it is in the feature list rather than in the data. `build_features` puts

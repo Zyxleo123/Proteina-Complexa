@@ -59,7 +59,7 @@ from proteinfoundation.cpseq.smiles import CyclicPeptide, cyclic_peptide
 
 TOOL = "af3"
 
-# Pinned upstream revision, matching `docs/RESOURCES_COLLECTED.md` and the env built by
+# Pinned upstream revision, matching `docs/old_docs/RESOURCES_COLLECTED.md` and the env built by
 # `scripts/cpseq_env_af3.sbatch`. Recorded on every prediction record: a prediction is
 # only comparable to another made by the same weights and the same code.
 AF3_REV = "131ab9e7420066523c62546199243f7a9b3e3e78"

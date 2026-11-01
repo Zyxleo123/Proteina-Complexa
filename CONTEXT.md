@@ -192,7 +192,7 @@ Parquet is an **index only** — coordinates live in PDB files.
 
 ## Paper training reference (released `complexa.ckpt`)
 
-README / `docs/TRAINING.md` do **not** give CPSea-specific step counts. The **ICLR 2026 paper (Appendix G)** documents the released protein-binder stack:
+README / `docs/old_docs/TRAINING.md` do **not** give CPSea-specific step counts. The **ICLR 2026 paper (Appendix G)** documents the released protein-binder stack:
 
 ### Flow model (binder generation)
 
@@ -420,7 +420,7 @@ Proteina-Complexa/
 ## Related work in this repo
 
 **Sequence → target → cyclic-peptide outcome dataset** — see
-[`docs/README_CPSEQ_DATASET.md`](docs/README_CPSEQ_DATASET.md).
+[`docs/old_docs/README_CPSEQ_DATASET.md`](docs/old_docs/README_CPSEQ_DATASET.md).
 
 Given an LP reference sequence and a target, it predicts cyclic-peptide/target complexes
 across three predictors (Boltz-2, AfCycDesign, HighFold3) and labels them with validity,
@@ -440,6 +440,6 @@ Two findings from it that affect other work here:
 ## External references
 
 - CPSea paper / data: [GitHub](https://github.com/YZY010418/CPSea), [Zenodo](https://zenodo.org/records/17324994)
-- Proteina training: [`docs/TRAINING.md`](docs/TRAINING.md)
+- Proteina training: [`docs/old_docs/TRAINING.md`](docs/old_docs/TRAINING.md)
 - Paper Appendix G (architecture + training steps): [arXiv](https://arxiv.org/html/2603.27950)
 - README CPSea section: [`README.md`](README.md#cpsea-cyclic-peptide-binders)

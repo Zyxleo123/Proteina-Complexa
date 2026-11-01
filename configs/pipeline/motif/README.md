@@ -120,6 +120,6 @@ python script_utils/generate_inference_configs.py \
 ```
 
 
-See `docs/SWEEP.md` for full sweep documentation.
+See `docs/old_docs/SWEEP.md` for full sweep documentation.
 
 The `slurm_utils/launch_protein_binder_search_from_local_conda.sh` does all of this for you for the launcher and it can be replicated for motifs.

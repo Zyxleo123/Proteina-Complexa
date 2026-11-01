@@ -106,8 +106,8 @@ esac
 
 # The migration instructions travel WITH the data. A reader who finds the bucket and not
 # the repo still needs to know what the pocket format is and which venv trap to expect.
-if [ -f "$(dirname "$0")/../docs/README_CPSEQ_MLM_MIGRATION.md" ]; then
-  rclone copy "$(dirname "$0")/../docs/README_CPSEQ_MLM_MIGRATION.md" "$DEST/" -P
+if [ -f "$(dirname "$0")/../docs/old_docs/README_CPSEQ_MLM_MIGRATION.md" ]; then
+  rclone copy "$(dirname "$0")/../docs/old_docs/README_CPSEQ_MLM_MIGRATION.md" "$DEST/" -P
 fi
 [ -f "$ROOT/RUN_STATUS.md" ] && rclone copy "$ROOT/RUN_STATUS.md" "$DEST/" -P
 

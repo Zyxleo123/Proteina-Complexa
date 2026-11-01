@@ -71,7 +71,7 @@ def compute_segment_info(
         coord_mask: [n, 37] boolean atom presence mask.
         cn_break_cutoff: distance (Angstrom) above which a C_i -> N_{i+1} bond
             is considered physically broken. Default 2.0 (see
-            ``docs/README_DATA_SEQ_BREAK_ISSUE.md``: a normal peptide bond is
+            ``docs/old_docs/README_DATA_SEQ_BREAK_ISSUE.md``: a normal peptide bond is
             ~1.3 Å).
 
     Returns:

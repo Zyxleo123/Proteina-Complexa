@@ -12,7 +12,7 @@
 # and never switched on in any shipped run.
 #
 # WHAT THAT COST, measured. Scoring native CPSea head-to-tail structures with this project's
-# own geometry code (docs/README_CPSEQ_DATASET.md):
+# own geometry code (docs/old_docs/README_CPSEQ_DATASET.md):
 #
 #   source                        median |omega|   trans-like   CIS-like   pass +/-8.44 deg
 #   experimental crystals (n=4)       175.0 deg        100%          0%          100%

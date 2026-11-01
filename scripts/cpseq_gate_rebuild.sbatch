@@ -19,7 +19,7 @@
 # babel, and the B2 bucket carries the docs and nothing else -- so it has to be rebuilt.
 # Rebuilt, not reinvented: the control SET is pinned to the six entries this project
 # froze (so the derivation sees the same structures), and the result is checked against
-# the audit numbers published in docs/README_CPSEQ_PEPBENCH_SCALEUP.md section 4. If the
+# the audit numbers published in docs/old_docs/README_CPSEQ_PEPBENCH_SCALEUP.md section 4. If the
 # rebuilt gate reproduces those, it is the same gate; if it does not, the run stops here
 # rather than carrying an unexplained threshold into every downstream number.
 #
@@ -124,7 +124,7 @@ echo "[3/3] auditing the frozen gate on the controls and 150 native CPSea macroc
   --out "$GATE_DIR/gate_audit_v3.json"
 
 # The published numbers this has to reproduce, from
-# docs/README_CPSEQ_PEPBENCH_SCALEUP.md section 4. Printed side by side rather than
+# docs/old_docs/README_CPSEQ_PEPBENCH_SCALEUP.md section 4. Printed side by side rather than
 # asserted silently: a mismatch here means the rebuilt gate is NOT the gate the -7.82
 # REU baseline was measured under, and every comparison downstream would be against a
 # moved bar.

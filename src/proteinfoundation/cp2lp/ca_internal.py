@@ -2,7 +2,7 @@
 
 WHY THIS EXISTS. The one-pass editor adds a free per-residue Cartesian residual to the CA
 track (`editor.apply_residuals`) and a frozen decoder then builds N, C and O from it.
-MEASURED (docs/README_CP2LP.md, "Why the chain is not intact"): ~30-40% of that residual is
+MEASURED (docs/old_docs/README_CP2LP.md, "Why the chain is not intact"): ~30-40% of that residual is
 *incoherent*, i.e. it changes CA(i)-CA(i+1) separations, and the resulting trace is off its
 native manifold in BOTH of the trace's constraints at once -- bonds from 1.0 to 7.2 A against
 a native 3.838 +- 0.054 A, and bend angles down to 25.6 deg against a native floor of 74.5.

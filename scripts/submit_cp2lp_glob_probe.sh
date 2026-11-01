@@ -4,7 +4,7 @@
 # WHAT IT ANSWERS. Every CP->LP arm pins `d_acc` near 0.98 and nothing moves it. The
 # clash-norm arm fixed a real steric defect and `d_acc` did not budge (0.9872 vs 0.9879);
 # the torsion arm reaches near-perfect chain geometry and still scores 0.9840. Both of the
-# two tells docs/README_CP2LP.md names have now been manipulated and neither moved the
+# two tells docs/old_docs/README_CP2LP.md names have now been manipulated and neither moved the
 # number -- so `d_acc` is reading something else.
 #
 # The suspect is in the feature list, not in the data: `build_features` feeds D the terminal

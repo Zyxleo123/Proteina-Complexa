@@ -20,7 +20,7 @@ TWO GENERATOR MODES, SELECTED BY ``cp2lp.mode``.
 ``rollout`` (legacy, still the default, unchanged)
     The original generator: a short differentiable ODE trajectory with DRaFT-K gradients
     and export from a 200-step sampler. Kept so the three measured generations in
-    ``docs/README_CP2LP.md`` stay reproducible. It is not part of the five-arm comparison
+    ``docs/old_docs/README_CP2LP.md`` stay reproducible. It is not part of the five-arm comparison
     -- the generator objective differs too, so it is historical context rather than a
     clean architecture ablation.
 
@@ -178,7 +178,7 @@ class CP2LPGenerator(Proteina):
 
         # `rollout` is the ORIGINAL generator: a short differentiable ODE trajectory,
         # DRaFT-K gradients, export from a 200-step sampler. Kept, unchanged, and still the
-        # default, so the three measured generations in docs/README_CP2LP.md remain
+        # default, so the three measured generations in docs/old_docs/README_CP2LP.md remain
         # reproducible. `onepass` is the direct editor -- one network evaluation, a residual
         # edit of the encoded source CP, no sampler anywhere. The two modes share the
         # losses, the discriminator and the export gate and nothing else.
@@ -1464,7 +1464,7 @@ class CP2LPGenerator(Proteina):
                 # G UPDATES in one-pass mode, `global_step` in the legacy one. The legacy
                 # arms were trained and measured against `global_step`, and silently
                 # doubling their effective warmup would make a rerun differ from the runs
-                # docs/README_CP2LP.md reports. New mode, corrected counter.
+                # docs/old_docs/README_CP2LP.md reports. New mode, corrected counter.
                 progress = (
                     int(self.g_updates)
                     if self.cp2lp_mode in ("onepass", "backbone")

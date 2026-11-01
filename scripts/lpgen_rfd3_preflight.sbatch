@@ -11,7 +11,7 @@
 # model build, the data path, the loss, the backward pass and the optimizer, and it is the
 # run that produces the peak-memory and step-throughput numbers used to size a tranche.
 #
-# Resource notes (measured, see docs/README_LPGEN.md):
+# Resource notes (measured, see docs/old_docs/README_LPGEN.md):
 #   * `precision: bf16-mixed` runs on every GPU class here, but bf16 is EMULATED below
 #     Ampere -- functional and faster than fp32, yet ~an order of magnitude off native. Use
 #     a5000/a6000/h200 for anything whose timing you intend to extrapolate.

@@ -24,7 +24,7 @@
 # measured in a regime the model was never trained in. Use the 14 A crop, which reproduces
 # the training distribution on max_run, seg_med, seg_p90 and frag<5 at once; the 18 A set
 # (CPSea_data/lnr_pocket) matches on segment COUNT only and still runs max_run 54 vs 32.
-# See docs/README_TARGET_DISTRIBUTION_MATCHING.md and scripts/restage_lnr_pocket.py.
+# See docs/old_docs/README_TARGET_DISTRIBUTION_MATCHING.md and scripts/restage_lnr_pocket.py.
 #
 # What this run asks
 # ------------------

@@ -38,7 +38,7 @@ target-family split without inventing one.
 
 RF3 is **public** at files.ipd.uw.edu and needs no credential. Do not confuse it
 with RFD3, lpgen's diffusion weights, which do come from a private foundry
-registry -- that is the thing `docs/CLUSTER_MIGRATION.md` calls unfetchable.
+registry -- that is the thing `docs/old_docs/CLUSTER_MIGRATION.md` calls unfetchable.
 
 `GITLAB_TOKEN` is read only by `env/docker-ops.sh` for `docker login`, so it is
 not needed on the uv runtime.

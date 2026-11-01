@@ -50,7 +50,7 @@ echo
 echo "=== AUDIT: do the new sets match the training distribution? ==="
 # Read max_run and frag<5, not `segments` -- segment COUNT plateaus at every crop radius and
 # will look matched even when the run lengths are 20 residues too long. See
-# docs/README_TARGET_DISTRIBUTION_MATCHING.md.
+# docs/old_docs/README_TARGET_DISTRIBUTION_MATCHING.md.
 "$PY" scripts/audit_target_distribution.py \
   --set "CPSea_ctl (ref)=CPSea_data/control/cpsea_val_control.parquet" \
   --set "LNR orig full=${SRC_FULL}" \
