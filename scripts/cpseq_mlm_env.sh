@@ -80,3 +80,26 @@ export CPSEQ_MLM_SEED="${CPSEQ_MLM_SEED:-42}"
 # Clusters withheld from TRAIN, one id per line. Empty means the parquet split is the only
 # holdout; set it to the eval targets' clusters before any number is quoted as held out.
 export CPSEQ_MLM_HOLDOUT_CLUSTERS="${CPSEQ_MLM_HOLDOUT_CLUSTERS:-}"
+
+# --- probes: substitution tolerance, calibration, and the data-side ceiling.
+# These answer "is the plateau the task or the model", so they are configured here rather
+# than in the job scripts: the dump is a GPU pass whose output every later CPU reduction
+# reads, and a knob that differed between them would silently compare two panels.
+export CPSEQ_MLM_PROBE_DIR="${CPSEQ_MLM_PROBE_DIR:-$CPSEQ_MLM_ROOT/probes}"
+# Which run and checkpoint the probes read. Empty CKPT means the highest hf_step* in the
+# run, resolved numerically by the dump script.
+export CPSEQ_MLM_PROBE_RUN="${CPSEQ_MLM_PROBE_RUN:-cpseq_mlm_pocket}"
+export CPSEQ_MLM_PROBE_CKPT="${CPSEQ_MLM_PROBE_CKPT:-}"
+# Dump the shuffled-pocket control too. The pocket gain deserves the same error analysis as
+# the headline: a gain that is "differently wrong" is not the same result as a gain that is
+# chemically sensible, and only the dump can tell them apart.
+export CPSEQ_MLM_PROBE_SHUFFLE="${CPSEQ_MLM_PROBE_SHUFFLE:-1}"
+# Bootstrap draws for the CLUSTERED confidence intervals. 2000 is enough for a 95%
+# percentile interval to be stable in the third decimal, which is finer than any difference
+# this 4757-position panel can resolve.
+export CPSEQ_MLM_PROBE_NBOOT="${CPSEQ_MLM_PROBE_NBOOT:-2000}"
+# Cached train-side priors, so the reduction is re-runnable without re-reading 2.4M rows.
+export CPSEQ_MLM_PRIORS_CACHE="${CPSEQ_MLM_PRIORS_CACHE:-$CPSEQ_MLM_PROBE_DIR/priors_train.json}"
+# Splits the ceiling probe groups over. Both, because a ceiling is a property of the task
+# and more rows mean more duplicate contexts to estimate it from.
+export CPSEQ_MLM_AMBIG_GLOBS="${CPSEQ_MLM_AMBIG_GLOBS:-train_*.jsonl,val_*.jsonl}"

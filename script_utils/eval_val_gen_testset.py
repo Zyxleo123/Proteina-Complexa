@@ -435,6 +435,12 @@ def main() -> int:
         # this opt-in re-enables it because only the seq-cond pass runs here -- nothing to pollute.
         vg.seq_cond = {"enabled": True, "keep_frac": args.keep_frac}
         vg.rosetta_dump_seqcond = True
+        # One record per residue (pos, length, requested chemistry, true/pred residue, revealed).
+        # Aggregate rates cannot be decomposed after the fact, and the decomposition is what
+        # matters: a pooled recovery can be carried entirely by terminal anchor positions that a
+        # lookup table gets for free. Writing it here makes positional recovery, BLOSUM and the
+        # P(r | pos, L, chemistry) prior CPU work on existing files, never a resample.
+        vg.seq_per_position_dir = str(Path(args.out_dir) / "seq_per_position")
     if cfg_exp.get("rollout_finetune") is not None:
         cfg_exp.rollout_finetune.enabled = False  # a training term; must not fire in a scoring run
 
