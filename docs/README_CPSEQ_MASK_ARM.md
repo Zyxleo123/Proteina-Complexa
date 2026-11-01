@@ -1,5 +1,20 @@
 # Arm E — the LLM names the positions, a learned model fills them
 
+> ## STANDARD — this document and `README_CPSEQ_MPNN_FILL_SETTINGS.md`
+>
+> **These two are the current record for the mask/fill arms**, and together they supersede
+> any earlier description of them. This document is the mechanism and the proposer
+> measurements; the settings document is the locked configuration, the arm choice, and the
+> gate decision. Read its banner for where the arms live, which scripts report them, and
+> why **v3** is the gate — the four arms are in `/data/user_data/yixiz/cpseq/llm_ladder`,
+> not in the `pepbench_corpus*` directories.
+>
+> The arm shipped past this document: the LLM-mask arms it describes are now measured
+> against `random_mask_mpnn_fill`, where **random position choice beat the LLM's** at a
+> matched filler. That contrast, not §1's case for splitting the proposal, is the live
+> result. §4 and §6 below remain the record for why the CPSea unmasking model and the
+> co-generator are both unusable as fillers.
+
 Splitting the proposal in two. The LLM reads the same PLIP/Biopython interface tables arm D
 reads and answers with **positions only**; a model trained on complexes chooses the residues.
 
@@ -10,7 +25,7 @@ Started 2026-10-29. Everything below was verified by execution unless it says ot
 
 ## 1. Why split it
 
-Arm D (`README_CPSEQ_LLM_SEARCH.md`) asks one model to do two jobs. The record says it is
+Arm D (`old_docs/README_CPSEQ_LLM_SEARCH.md`) asks one model to do two jobs. The record says it is
 good at one of them and bad at the other:
 
 - **Good at reading the interface.** §6 records it locating the overlap and the empty
@@ -68,7 +83,7 @@ mask, `/data/user_data/yixiz/cpseq/mask_pilot/`.
 
 **24 of 24 legal masks, 0 malformed**, against arm D's 16 malformed on the same complexes.
 
-Diversity, against `README_CPSEQ_LLM_SEARCH.md` §6's table for the same parents:
+Diversity, against `old_docs/README_CPSEQ_LLM_SEARCH.md` §6's table for the same parents:
 
 | complex | distinct positions, arm D | arm E | median pairwise Hamming, D → E |
 |---|---|---|---|

@@ -1,12 +1,59 @@
 # Locked settings — random mask, ProteinMPNN fill
 
+> ## STANDARD — read this first, with `README_CPSEQ_MASK_ARM.md`
+>
+> **These two documents are the current record for the mask/fill arms.** Together they
+> supersede any earlier arm description for this work. `README_CPSEQ_MASK_ARM.md` is how
+> the arm works and what the proposer probes measured; this document is the settings and
+> the arm choice. Everything else named below is a dependency, not an alternative:
+> `old_docs/README_CPSEQ_LLM_SEARCH.md` for `llm_search` (whose §14.5 withdrawals still stand),
+> `old_docs/README_CPSEQ_PEPBENCH_SCALEUP.md` for the corpus runs.
+>
+> **Where the arms live.** All four mask/fill arms are in
+> `/data/user_data/yixiz/cpseq/llm_ladder`, on the 20-complex LNR+PepBench cohort — **not**
+> in `pepbench_corpus` or `pepbench_corpus_pot`, which hold `random_control` and
+> `reference` only and are a different question (random draw vs native peptide, corpus
+> scale). Looking for the arms in the corpus directories finds nothing and is the
+> confusion this banner exists to prevent.
+>
+> | arm | rows | what it is |
+> |---|---|---|
+> | `random_mask_mpnn_fill` | 4,931 | **primary** (§0) |
+> | `llm_mask_mpnn_fill` | 4,563 | LLM picks positions, MPNN fills |
+> | `llm_mask_random_fill` | 4,837 | LLM picks positions, random fills |
+> | `llm_search` | 3,150 | arm D, retained co-leading (§0.1) |
+> | `random_control` | 11,998 | arm A baseline |
+> | `reference` | 400 | the unchanged peptide, 200 v3 + 200 v4 |
+>
+> **Report with the repo's own scripts, naming the gate and the arm** — the protocol is
+> theirs, not the caller's:
+> ```
+> python script_utils/cpseq_selected_candidate_report.py --out-dir <dir> \
+>     --arm <arm> --scoring-version v3-cis-amide-muco-windows     # best vs peptide
+> python script_utils/cpseq_arm_compare.py --out-dir <dir> \
+>     --arm-a random_control --arm-b <arm> --scoring-version v3-cis-amide-muco-windows
+> ```
+> Both refuse to print a comparison from a gate-mixed directory, and `llm_ladder` is
+> gate-mixed (v3 22,642 / v5 6,150 / v4 1,087).
+>
+> **Use v3.** Verified 2026-11-01 — see §5.2, whose open question is now answered and the
+> answer is not the one it expected.
+>
+> **−7.82 is superseded by −5.23 (§0.2).** It was a pilot number on 10 of 20 complexes
+> selected from the arm's whole pool, and that estimator is now implemented as
+> `cpseq_selected_candidate_report.py --pilot`. Re-measured on the same gate and cohort
+> the primary arm reads **−5.23 REU, 10/0, p = 0.0020**; `llm_search` reproduces its
+> −7.23 exactly. The default (no `--pilot`) rungs table answers a different question —
+> per-budget B, not whole-pool — and its numbers are not comparable to either. §0.2,
+> §5.2 and §5.3 bound all of them.
+
 The configuration the scale-up runs. Fixed 2026-10-30 after the pilot; every value below
 is the one the pilot result was measured under, or is flagged as a change that still
 needs a decision (§5).
 
 **Scope.** §1–§4 specify the primary arm, `random_mask_mpnn_fill`. `llm_search` is
 retained as a co-leading arm because the pilot does not separate the two (§0.1); its own
-settings live in `README_CPSEQ_LLM_SEARCH.md` and are unchanged by this document. §2, §3
+settings live in `old_docs/README_CPSEQ_LLM_SEARCH.md` and are unchanged by this document. §2, §3
 and the one-writer-per-complex rule apply to **both** arms, since they are what makes any
 two arms comparable.
 
@@ -28,7 +75,50 @@ sizes with the filler held constant, so **random position choice beat the LLM's 
 choice**. The second contrast, −7.82 against `llm_mask_random_fill` −3.34, says the fill
 model is doing the work.
 
-Read these numbers only with §0.1, §5.1 and §5.2 in hand.
+Read these numbers only with §0.1, §0.2, §5.1 and §5.2 in hand.
+
+## 0.2 Re-measured 2026-11-01 on the same estimator. The arm ordering changed.
+
+§3's estimator is now implemented, as `cpseq_selected_candidate_report.py --pilot`
+(`--pool all --directions 2 --min-ref-valid 3 --energy-key refined_dG_separated`), so
+§0's table is redrawable for the first time. Same gate (v3), same cohort, same rule:
+
+| arm | §0 ΔdG | **re-measured** | §0 improves | **w/l now** | sign p | §0 pool | pool now |
+|---|---|---|---|---|---|---|---|
+| `llm_search` | −7.23 | **−7.23** | 9/10 | **9/1** | 0.022 | 13.1 | 15.7 |
+| `llm_mask_random_fill` | −3.34 | **−5.99** | 6/7 | **8/1** | 0.039 | 7.7 | 11.7 |
+| `random_mask_mpnn_fill` | **−7.82** | **−5.23** | 10/10 | **10/0** | **0.0020** | 7.7 | 10.7 |
+| `random_control` | −5.27 | −3.65 | 9/10 | 8/1 | 0.039 | 42.0 | 59.2 |
+| `llm_mask_mpnn_fill` | −3.49 | −2.16 | 9/10 | 7/2 | 0.180 | 7.5 | 9.8 |
+
+**`llm_search` reproduces to the digit**, which is what certifies the implementation: it
+is the one arm with no v5 rows (3,150 v3 / 0 v5). Every arm that moved is an arm whose
+folds were later split across gates — `random_mask_mpnn_fill` 2,204 v3 / 1,840 v5,
+`llm_mask_mpnn_fill` 2,613 / 1,950, `llm_mask_random_fill` 2,477 / 2,360 — so its v3 pool
+today is a ~55 % subset of what the pilot measured, selected by which folds a later
+rescore happened to touch. That is the leading explanation for the movement and it is
+fixable: see §5.2's v5→v3 recommendation.
+
+What survives and what does not:
+
+- **Survives.** `random_mask_mpnn_fill` is still the only arm negative on every complex
+  with a baseline (10/0, p = 0.0020, the lowest of the five), still from a pool a fifth
+  of the control's. The §0 contrast against `llm_mask_mpnn_fill` at matched filler also
+  survives, −5.23 against −2.16, so **random position choice still beats the LLM's**.
+- **Does not survive.** §0's second contrast, "the fill model is doing the work"
+  (−7.82 against `llm_mask_random_fill` −3.34), **reverses**: −5.23 against −5.99. On
+  today's v3 rows the random fill is marginally better than the MPNN fill, and §0's
+  −3.34 was measured on 7 complexes against the others' 10.
+- **Changes sign.** §0.1 put `random_mask_mpnn_fill` 0.59 REU ahead of `llm_search` and
+  called it a tie at 0.24 SE. It is now 2.0 REU behind. The tie verdict stands — this is
+  the same quantity moving within its spread — but the primary-arm choice now rests
+  entirely on 10/0 against 9/1 and on proposal cost, with no energy margin at all.
+
+**`no_base` is 10 for all five arms**, confirming §5.3 exactly: the same ten complexes
+have a reference with fewer than 3 valid folds, so every row above is 10 of 20.
+
+Redraw: `cpseq_selected_candidate_report.py --out-dir /data/user_data/yixiz/cpseq/llm_ladder
+--scoring-version v3-cis-amide-muco-windows --arm <arm> --pilot`.
 
 ## 0.1 `llm_search` is RETAINED, not eliminated
 
@@ -52,7 +142,7 @@ disjoint complexes: `llm_search` is far better on `pepbench_C_A_pdb2jz3` (−17.
 So the choice of primary rests on **10/10 against 9/10 and a cheaper proposal stage**,
 not on a measured advantage. Two consequences:
 
-- `llm_search` keeps its settings frozen (`README_CPSEQ_LLM_SEARCH.md`) and stays
+- `llm_search` keeps its settings frozen (`old_docs/README_CPSEQ_LLM_SEARCH.md`) and stays
   runnable. Do not delete its proposals or journals.
 - Its larger pool (13.1 against 7.7) means it carries *more* selection inflation than
   the primary arm and still matched it. At equal pool size it may be ahead. §3's
@@ -247,6 +337,46 @@ whether post-relax validity gives the ten complexes that currently have **no usa
 baseline** one for the first time. If it does, the evaluable set roughly doubles and the
 whole table needs the retest. If it does not, there is no case for rescoring the ~21,000
 remaining folds.
+
+#### ANSWERED 2026-11-01: it does not. Stay on v3, and do not rescore.
+
+Job `10994185`'s own output cannot answer it — **195 of its 200 reference rows have
+`validity_reasons: null` and every geometry field null**, i.e. `valid: false` because they
+were never scored, not because they failed. Those rows are indistinguishable from
+rejections to `n_pass()`, which counts `r["valid"]`, so any v4 reading of `llm_ladder`
+silently treats 195 unscored folds as failures. The 5 that did score are 0/5 valid.
+
+The question is answerable from `pepbench_corpus`, where the v4 rescore did complete.
+Reference folds, per gate, targets at full depth 10:
+
+| gate | targets | ≥3 valid reference folds | zero valid |
+|---|---|---|---|
+| `v3-cis-amide-muco-windows` | 70 | **50 (71%)** | 7 |
+| `v4-postrelax-validity` | 201 | **17 (8.5%)** | 113 |
+
+Per-fold reference pass rate across the three runs, scored rows only — the gate choice
+dominates every effect any arm could have:
+
+| gate | `pepbench_corpus` | `pepbench_corpus_pot` | `llm_ladder` |
+|---|---|---|---|
+| v3 | 43.8 % | 70.8 % | 31 % |
+| v4 | 7.3 % | 6.1 % | 0/5 scored |
+| v5 | — | 97.1 % | — |
+
+v4 does not double the evaluable set; it removes it. §5.3's problem — a complex with no
+baseline is not a negative result — gets about eight times worse under v4, because the
+native peptide itself almost never passes. v5 fails the opposite way (97–98 %, the gate
+rather than the designs). **v3 is the only one of the three where both the reference and
+the draws pass often enough to be compared**, which is why the banner says v3.
+
+Two consequences. The ~21,000 remaining folds should not be rescored, per this section's
+own stopping rule. And the v5 rows already written are not a bonus: they split
+`llm_mask_mpnn_fill` 2,613 v3 / 1,950 v5 and `random_mask_mpnn_fill` 2,204 / 1,840, so
+under a single gate those arms reach only B=4–8 on 4–11 complexes of a plan that went to
+B=64. Rescoring **v5 back to v3** on the mask arms is the one rescore with a case for it.
+
+Redraw: the tables above come from `state/*/outcomes.jsonl` in each run directory, keyed
+on `arm`, `scoring_version`, `valid`, and whether `closure_status` is null.
 
 ### 5.3 Half the complexes are unmeasurable
 
