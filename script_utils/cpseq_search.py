@@ -65,6 +65,7 @@ from proteinfoundation.cpseq.evaluate import (  # noqa: E402
     TargetContext,
     evaluate,
     load_target_contexts,
+    scoring_behaviour,
 )
 from proteinfoundation.cpseq.search import (  # noqa: E402
     ARM_GUIDED,
@@ -182,6 +183,22 @@ def gate_sha256(path: Path) -> str:
     thresholds = {k: v for k, v in doc.items()
                   if k not in ("copied_from", "copy_rationale", "frozen_on")}
     return hashlib.sha256(json.dumps(thresholds, sort_keys=True).encode()).hexdigest()
+
+
+def cohort_scoring_version(cohort: dict) -> str:
+    """The scoring protocol this cohort's folds must be scored under.
+
+    Read from the cohort, never from a flag on the folding stage, for the same reason
+    `use_potentials` and the tolerance hash are: a shard that disagreed with its own
+    cohort about the protocol would write rows that are not comparable to the rest, and
+    the journal key carries no protocol, so nothing downstream would notice.
+
+    Cohorts written before this key existed fall back to the module default, which is
+    what they were in fact scored under.
+    """
+    version = cohort.get("scoring_version") or SCORING_PROTOCOL_VERSION
+    scoring_behaviour(version)  # raises on an unknown version rather than defaulting
+    return version
 
 
 def ladder_plan(
@@ -970,6 +987,7 @@ def cmd_screen(args) -> int:
         boltz_python=args.boltz_python,
         boltz_cache=args.boltz_cache,
         allow_cys=bool(cohort.get("allow_cys", False)),
+        scoring_version=cohort_scoring_version(cohort),
     )
     store = Store(
         root=out_dir,
@@ -1034,6 +1052,7 @@ def cmd_confirm(args) -> int:
         chemistry=args.chemistry, diffusion_samples=args.samples,
         boltz_python=args.boltz_python, boltz_cache=args.boltz_cache,
         allow_cys=bool(cohort.get("allow_cys", False)),
+        scoring_version=cohort_scoring_version(cohort),
     )
     store = Store(
         root=out_dir,
@@ -1295,7 +1314,13 @@ def cmd_ladder_cohort(args) -> int:
         # is not comparable fold-for-fold with one without, and the journal key carries no
         # inference settings, so the two must live in separate output directories.
         "use_potentials": bool(args.use_potentials),
-        "scoring_protocol_version_for_energies": SCORING_PROTOCOL_VERSION,
+        # The protocol every fold of this cohort is scored under. Read back by each
+        # stage when it builds its `Protocol`, so a shard cannot drift from its cohort.
+        # Validated at cohort-build time (below) rather than on first use, so a typo
+        # costs a second here instead of a shard-hours into a run.
+        "scoring_version": args.scoring_version,
+        "scoring_behaviour": scoring_behaviour(args.scoring_version),
+        "scoring_protocol_version_for_energies": args.scoring_version,
         "allow_cys": args.allow_cys,
         "alphabet": "".join(default_alphabet(allow_cys=args.allow_cys)),
         "design_note": (
@@ -1861,6 +1886,7 @@ def cmd_ladder(args) -> int:
         # the inference settings would write folds that are not comparable to the rest
         # and nothing downstream would notice.
         use_potentials=bool(cohort.get("use_potentials", False)),
+        scoring_version=cohort_scoring_version(cohort),
     )
     sources = cohort["parent_sources"]
     store = Store(
@@ -2220,6 +2246,16 @@ def main() -> int:
                          f"folded at. This is the number that decides whether a "
                          f"per-candidate result is a measurement or a coin flip.")
     lc.add_argument("--allow-cys", action="store_true")
+    lc.add_argument("--scoring-version", default=SCORING_PROTOCOL_VERSION,
+                    help=f"the scoring protocol every fold of this cohort is scored "
+                         f"under (default {SCORING_PROTOCOL_VERSION}). Fixed on the "
+                         f"COHORT rather than passed per shard, for the same reason "
+                         f"`use_potentials` is: two shards disagreeing about the "
+                         f"protocol would write rows that are not comparable and "
+                         f"nothing downstream would notice. Naming an older version is "
+                         f"a normal thing to do -- the published -7.82 REU baseline is "
+                         f"a `v3-cis-amide-muco-windows` number, so reproducing it "
+                         f"means scoring under v3 and not merely labelling rows v3.")
     lc.add_argument("--use-potentials", action="store_true",
                     help="enable Boltz-2's physical-plausibility steering for every fold "
                          "of this cohort. Off everywhere else in this project, which is "
