@@ -42,6 +42,7 @@ from pathlib import Path
 
 import numpy as np
 
+from proteinfoundation.cpseq.adapters.boltz_chunkfix import CHUNKFIX_REV, shadow_env
 from proteinfoundation.cpseq.chemistry import (
     CHEMISTRIES,
     DISULFIDE,
@@ -82,9 +83,34 @@ class Boltz2Config:
     # ligands (boltz's own doc caps it at ~56-128 atoms and says protein/RNA/DNA targets
     # give unreliable output), so it is not a peptide-affinity teacher.
     affinity: bool = False
+    # How many samples the denoiser runs at once. `None` leaves the flag off, which is
+    # boltz's own default and is what every prediction before 2026-11-03 was made with.
+    # Worth only ~6% at ds=10 (139 s at one chunk against 148 s at six, job 95853), so
+    # it is set to control the BATCH SIZE -- a correctness choice at high `ds` -- rather
+    # than for speed.
+    max_parallel_samples: int | None = None
+    # Shadow the chunk-count correction in front of the installed boltz. See
+    # `boltz_chunkfix`: without it the chunk count is a remainder, so `diffusion_samples`
+    # cannot be raised at all. Hashed, because a different batch size is not bitwise
+    # identical even though it is the same computation.
+    chunk_fix: bool = False
+    # Where the shadow lives. NOT hashed: it is a path to a build whose content the
+    # `chunk_fix` flag and `CHUNKFIX_REV` already pin, and hashing it would make the same
+    # prediction cached under two keys on two filesystems.
+    chunk_fix_root: str | None = field(default=None, compare=False)
 
     def to_dict(self) -> dict:
-        return {
+        """The hashed settings. See README_CPSEQ_FOLD_PIPELINE_STANDARD sec. 3.
+
+        The two 2026-11-03 fields appear ONLY when set away from their defaults. That is
+        deliberate and is the one place this dict is allowed to be conditional: ~29k
+        cached predictions were keyed by this dict before the fields existed, and adding
+        a key unconditionally would change every one of their hashes and re-predict the
+        lot. A default-valued field describes a run made exactly as those were, so its
+        absence is accurate. Any run that actually turns one on is keyed apart from them,
+        which is what sec. 3 requires.
+        """
+        d = {
             "diffusion_samples": self.diffusion_samples,
             "recycling_steps": self.recycling_steps,
             "sampling_steps": self.sampling_steps,
@@ -92,6 +118,11 @@ class Boltz2Config:
             "seed": self.seed,
             "affinity": self.affinity,
         }
+        if self.max_parallel_samples is not None:
+            d["max_parallel_samples"] = self.max_parallel_samples
+        if self.chunk_fix:
+            d["chunk_fix"] = CHUNKFIX_REV
+        return d
 
 
 def chemistry_supported(chemistry: str) -> bool:
@@ -256,7 +287,28 @@ def _predict_cmd(
     ]
     if config.use_potentials:
         cmd.append("--use_potentials")
+    if config.max_parallel_samples is not None:
+        cmd += ["--max_parallel_samples", str(config.max_parallel_samples)]
     return cmd
+
+
+def _run_env(config: Boltz2Config) -> dict | None:
+    """The subprocess environment: `None` unless the chunk-fix shadow has to go in front.
+
+    A `chunk_fix` config with no root is a programming error rather than a reason to run
+    unpatched: the prediction would be keyed as patched and not be, which is precisely
+    the two-regimes-under-one-key failure sec. 3 of the pipeline standard exists to
+    prevent. So it raises instead of falling back.
+    """
+    if not config.chunk_fix:
+        return None
+    if not config.chunk_fix_root:
+        raise ValueError(
+            "chunk_fix is set but chunk_fix_root is empty: the prediction would be "
+            "hashed as patched while running the installed (buggy) chunk count. Call "
+            "boltz_chunkfix.ensure_patched_boltz() and pass its `root`."
+        )
+    return shadow_env(None, config.chunk_fix_root)
 
 
 def predict_many(
@@ -313,9 +365,12 @@ def predict_many(
         boltz_cache=boltz_cache, devices=devices, accelerator=accelerator,
         preprocessing_threads=preprocessing_threads,
     )
+    env = _run_env(config)
     t0 = time.time()
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_s)
+        proc = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=timeout_s, env=env
+        )
         status = "ok" if proc.returncode == 0 else "predictor_error"
         rec = {
             "status": status,
@@ -334,6 +389,8 @@ def predict_many(
             "stdout_tail": "",
             "stderr_tail": f"timed out after {timeout_s}s",
         }
+    # Which code produced these structures, not just which flags were asked for.
+    rec["pythonpath_shadow"] = config.chunk_fix_root if config.chunk_fix else None
 
     # Boltz puts each input's results under `boltz_results_<stage>/predictions/<stem>/`.
     # Locate by stem rather than assuming the wrapper directory's name.
@@ -373,15 +430,20 @@ def predict(
 
     import time
 
+    env = _run_env(config)
+    shadow = config.chunk_fix_root if config.chunk_fix else None
     t0 = time.time()
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_s)
+        proc = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=timeout_s, env=env
+        )
         status = "ok" if proc.returncode == 0 else "predictor_error"
         return {
             "status": status,
             "returncode": proc.returncode,
             "runtime_s": round(time.time() - t0, 2),
             "cmd": " ".join(cmd),
+            "pythonpath_shadow": shadow,
             # Tails only: a full boltz log per task would dwarf the dataset.
             "stdout_tail": proc.stdout[-4000:],
             "stderr_tail": proc.stderr[-4000:],
@@ -392,6 +454,7 @@ def predict(
             "returncode": None,
             "runtime_s": round(time.time() - t0, 2),
             "cmd": " ".join(cmd),
+            "pythonpath_shadow": shadow,
             "stdout_tail": "",
             "stderr_tail": f"timed out after {timeout_s}s",
         }

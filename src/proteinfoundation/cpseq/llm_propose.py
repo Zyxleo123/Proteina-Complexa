@@ -70,8 +70,17 @@ from proteinfoundation.cpseq.search import (
     within_budget,
 )
 
-# The cluster's shared copy. Checked for existence before use; nothing here downloads.
-DEFAULT_MODEL_PATH = "/data/models/huggingface/meta-llama/Llama-3.1-8B-Instruct"
+# Checked for existence before use; nothing here downloads. The first readable path
+# wins. The scratch copy leads because the cluster's shared `/data/models` tree is not
+# mounted on every partition this runs on -- a mask round that lands on the wrong node
+# died at model load, which costs a whole array task to discover.
+MODEL_SEARCH_PATHS = (
+    "/zfsauton/scratch/yixiz/models/Llama-3.1-8B-Instruct",
+    "/data/models/huggingface/meta-llama/Llama-3.1-8B-Instruct",
+)
+DEFAULT_MODEL_PATH = next(
+    (p for p in MODEL_SEARCH_PATHS if os.path.isdir(p)), MODEL_SEARCH_PATHS[0]
+)
 MODEL_ID = "meta-llama/Llama-3.1-8B-Instruct"
 
 # Decoding. Sampling rather than greedy because one round needs a BATCH of distinct
@@ -1136,11 +1145,20 @@ class LlamaProposer:
         self._tok = AutoTokenizer.from_pretrained(self.model_path)
         if self._tok.pad_token_id is None:
             self._tok.pad_token = self._tok.eos_token
+        # Load to CPU, then move. NOT `device_map=self.device`: in transformers 5.x any
+        # `device_map` routes through `accelerate`, which is not installed in this venv and is
+        # not a declared dependency, so the load died with
+        #   ValueError: Using a `device_map` ... requires `accelerate`
+        # (job 96930). `self.device` is a single plain device string ("cuda"), never a shard
+        # map, so `device_map` bought nothing here that `.to()` does not do -- it is for
+        # splitting a model across devices. Moving afterwards costs one transient host-RAM
+        # copy of the weights (~16 GB bf16 for 8B, against the job's 64 GB) and leaves
+        # `self._model.device`, which the generate path reads, correct either way.
         self._model = AutoModelForCausalLM.from_pretrained(
             self.model_path,
             dtype=getattr(torch, self.dtype),
-            device_map=self.device,
         )
+        self._model.to(self.device)
         self._model.eval()
         self.load_seconds = time.time() - t0
 

@@ -202,6 +202,13 @@ class Protocol:
     boltz_cache: str = "/data/user_data/yixiz/boltz_cache"
     timeout_s: int = 7200
     allow_cys: bool = False
+    # Denoiser batch size, and the chunk-count correction that makes it mean what it
+    # says. Both default to off, which is the regime every prediction before 2026-11-03
+    # was made in; `boltz_chunkfix` explains why `chunk_fix` is hashed. `chunk_fix_root`
+    # is filled in by the driver from `ensure_patched_boltz`, not configured by hand.
+    max_parallel_samples: int | None = None
+    chunk_fix: bool = False
+    chunk_fix_root: str | None = None
 
     def boltz_config(self, seed: int) -> Boltz2Config:
         return Boltz2Config(
@@ -210,6 +217,9 @@ class Protocol:
             sampling_steps=self.sampling_steps,
             use_potentials=self.use_potentials,
             seed=seed,
+            max_parallel_samples=self.max_parallel_samples,
+            chunk_fix=self.chunk_fix,
+            chunk_fix_root=self.chunk_fix_root,
         )
 
     def to_dict(self) -> dict:
@@ -224,6 +234,8 @@ class Protocol:
             "predictor_revision": BOLTZ_REV,
             "energy_units": ENERGY_UNITS,
             "allow_cys": self.allow_cys,
+            "max_parallel_samples": self.max_parallel_samples,
+            "chunk_fix": self.chunk_fix,
         }
 
 
@@ -572,6 +584,47 @@ def prefetch_predictions(
     return out
 
 
+def prediction_cached(
+    *,
+    candidate_sequence: str,
+    target: TargetContext,
+    prediction_seed: int,
+    protocol: Protocol,
+    store: Store,
+) -> bool:
+    """True when a usable prediction for this fold is already on disk.
+
+    The same "already paid for" test `prefetch_predictions` applies, exposed so a caller
+    can know whether `evaluate` would predict or merely score. That matters for one
+    caller in particular: a parallel SCORING pass must not hand work to several processes
+    that would each discover a missing prediction and reach for the GPU at once.
+    `GPU_LOCK` is a lock within one process and cannot serialise them, so the check
+    belongs in the parent, before the work is handed out.
+
+    Only `status == "ok"` counts, for the reason `evaluate` documents at length: a
+    cached failure is infrastructure and must be retried, never remembered.
+    """
+    cfg = protocol.boltz_config(prediction_seed)
+    yaml_text = build_input_yaml(
+        peptide_sequence=candidate_sequence,
+        receptor_sequences=target.receptor_sequences,
+        chemistry=protocol.chemistry,
+        pocket_contacts=target.pocket_contacts,
+        receptor_msa_path=target.receptor_msa_path,
+        target_template_path=target.target_template_cif,
+    )
+    rec_path = (
+        store.prediction_dir(target.parent_id, input_hash(yaml_text, cfg))
+        / "record.json"
+    )
+    if not rec_path.exists():
+        return False
+    try:
+        return json.loads(rec_path.read_text()).get("status") == "ok"
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def evaluate(
     *,
     original_sequence: str,
@@ -582,6 +635,11 @@ def evaluate(
     store: Store,
     force_predict: bool = False,
     force_score: bool = False,
+    # Skip the relax on folds a prerelax-gated protocol has already failed. Off by
+    # default: it changes what a row CARRIES (no refined energy, no deformation, no
+    # prerelax-to-postrelax gap) for the folds it touches, so it has to be asked for.
+    # See `score_structure(skip_relax=...)` for the measured saving and the cost.
+    skip_invalid_relax: bool = False,
 ) -> dict:
     """Predict and score one candidate sequence. Never raises on a model failure.
 
@@ -740,8 +798,21 @@ def evaluate(
 
     # --- 3. scoring (cached separately, by protocol version) -------------------------
     score_path = store.score_path(protocol.scoring_version, ihash)
+    cached_score: dict | None = None
     if score_path.exists() and not force_score:
-        scored = json.loads(score_path.read_text())
+        cached_score = json.loads(score_path.read_text())
+        # A record written under `skip_invalid_relax` is INCOMPLETE, and a full pass must
+        # not read it as a hit. It has no refined energy and no deformation, so treating
+        # it as scored would leave the fold permanently unrelaxed while every later run
+        # reported a cache hit -- the same shape of bug as caching a crashed prediction
+        # above, which made 72 folds unrecoverable until it was fixed. So: a skipped
+        # record satisfies only another skipping pass, and is a miss for a pass that
+        # wants the relax.
+        if cached_score.get("relax_skipped") and not skip_invalid_relax:
+            rec["cache"]["score_recompute_over_skipped_record"] = True
+            cached_score = None
+    if cached_score is not None:
+        scored = cached_score
         rec["cache"]["score"] = "hit"
     else:
         tol = store.tolerance(protocol.chemistry)
@@ -764,6 +835,16 @@ def evaluate(
                     else {"valid": False, "reasons": [f"no tolerance for {protocol.chemistry}"], "checks": {}}
                 )
                 behaviour = scoring_behaviour(protocol.scoring_version)
+                # The relax is skippable only when the verdict above is the FINAL one.
+                # Under a postrelax-gated protocol (v4, v5) the relaxed complex is what
+                # gets judged, so `verd` is provisional and skipping would decide the
+                # fold on a structure the protocol does not grade -- which is why the
+                # stage is checked here and not just the flag.
+                skip_this = bool(
+                    skip_invalid_relax
+                    and behaviour["validity_stage"] == "prerelax"
+                    and not verd["valid"]
+                )
                 sc = score_structure(
                     pdb,
                     binder_chain=BINDER_CHAIN,
@@ -773,6 +854,7 @@ def evaluate(
                     refined_out_path=f"{stem}_refined.pdb",
                     isolated_out_path=f"{stem}_isolated_relaxed.pdb",
                     relax_restraint=behaviour["relax_restraint"],
+                    skip_relax=skip_this,
                 )
                 # Validity is judged on the RELAXED complex, because that is the
                 # structure `refined_dG_separated` was computed on. Judging the raw
@@ -883,6 +965,7 @@ def evaluate(
                     "is_thermodynamic_free_energy", False
                 )
                 row["scorer_protocol"] = sc.get("protocol")
+                row["relax_skipped"] = bool(sc.get("relax_skipped"))
             except Exception as exc:  # noqa: BLE001
                 row |= {
                     "scoring_status": "scorer_error",
@@ -896,6 +979,11 @@ def evaluate(
             "input_hash": ihash,
             "scoring_version": protocol.scoring_version,
             "energy_units": ENERGY_UNITS,
+            # True when ANY sample in this record went unrelaxed, so the cache read
+            # above can refuse it for a pass that wants the relax. Recorded on the
+            # record and not inferred from the rows, because a reader should not have
+            # to know which of 30 fields being None means "not computed".
+            "relax_skipped": any(s.get("relax_skipped") for s in per_sample),
             "samples": per_sample,
         }
         score_path.write_text(json.dumps(scored, indent=2))
@@ -950,6 +1038,66 @@ def evaluate(
 
     rec["wall_time_s"] = round(time.time() - t_start, 2)
     return rec
+
+
+def single_fold_views(rec: dict) -> list[dict]:
+    """Project one multi-sample record into one record per sample.
+
+    This is what makes the collapsed trunk admissible rather than merely faster. The
+    ladder's unit of evidence is an INDEPENDENT FOLD: `cpseq_ladder_report.py` keys folds
+    by rank, counts `n_pass` out of `n_folds`, applies a `k`-of-`n` reliability rule and
+    splits the folds in half to hold one out. All of that is a per-fold row axis. A
+    collapsed prediction -- one trunk, `depth` diffusion draws -- aggregates to a SINGLE
+    `valid` boolean and a single best energy, so writing it as one row would reduce a
+    depth-10 rung to one fold and silently turn the reliability rate back into the coin
+    flip the ladder run exists to replace.
+
+    So the seed axis collapses at the PREDICTION and is restored at the ROW: each sample
+    becomes a fold view carrying its own verdict, its own energy and its own violation,
+    aggregated over itself alone. The samples are draws from the diffusion noise, which
+    is what the seeds were perturbing, and job 95853 phase 2 is the measurement that they
+    are draws from the same distribution.
+
+    The shared prediction cost is DIVIDED among the views rather than repeated on each.
+    It was paid once; copying it to all of them would multiply the fold count by the
+    prediction time in any report that sums it, and report the lever as costing what it
+    saves. `prediction_runtime_shared_s` keeps the undivided number next to the share.
+
+    A record with no samples -- a crash, a timeout, a rejected sequence -- is returned as
+    itself, once. There are no folds to attribute it to, and `depth` copies of one
+    technical failure would inflate every failure denominator by the collapse factor.
+    """
+    samples = rec.get("samples") or []
+    if len(samples) <= 1:
+        return [rec]
+
+    n = len(samples)
+    total_pred = rec.get("prediction_runtime_s")
+    total_wall = rec.get("wall_time_s")
+    views: list[dict] = []
+    for s in samples:
+        v = dict(rec)
+        v["samples"] = [s]
+        v["n_samples"] = 1
+        v["n_valid"] = 1 if s.get("valid") else 0
+        v["valid"] = bool(s.get("valid"))
+        v["n_valid_prerelax"] = 1 if s.get("prerelax_valid") else 0
+        v["valid_prerelax"] = bool(s.get("prerelax_valid"))
+        e = s.get("refined_dG_separated")
+        v["best_valid_dG_separated"] = e if (s.get("valid") and e is not None) else None
+        v["min_violation"] = s.get("violation")
+        # The fold's identity within the collapsed prediction. This is what takes the
+        # place of the seed rank in the journal key, so it has to be the sample's own
+        # index and not its position in this list.
+        v["fold_index"] = s.get("sample_index")
+        v["n_folds_sharing_prediction"] = n
+        v["prediction_runtime_shared_s"] = total_pred
+        if total_pred is not None:
+            v["prediction_runtime_s"] = round(total_pred / n, 3)
+        if total_wall is not None:
+            v["wall_time_s"] = round(total_wall / n, 3)
+        views.append(v)
+    return views
 
 
 def _write_design_records(

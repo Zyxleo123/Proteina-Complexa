@@ -63,6 +63,67 @@ ARM_LLM_MASK_RAND = "llm_mask_random_fill"
 KIND = "mask_fill"
 
 
+def resolve_fill(fill: str, arm: str) -> str:
+    """Which filler runs for `arm`: `"mpnn"` or `"random"`.
+
+    `by-name` is the original dispatch and stays the default, so the three pilot arms
+    behave exactly as they did: only `llm_mask_random_fill` fills randomly. An explicit
+    `mpnn`/`random` overrides it, which is what lets a sweep arm carry a label naming its
+    own setting instead of borrowing another arm's name to inherit its filler -- a
+    borrowed name is permanent, because the label is what lands in the journal.
+    """
+    if fill in ("mpnn", "random"):
+        return fill
+    if fill != "by-name":
+        raise ValueError(f"unknown fill mode {fill!r}")
+    return "random" if arm == ARM_LLM_MASK_RAND else "mpnn"
+
+
+def ancestor_backbone(
+    out_dir: Path, parent_id: str, sequence: str, work: Path, *, tag: str = "ancestor",
+) -> Path | None:
+    """The run's own fold of `sequence` for this parent, decompressed if need be.
+
+    The evolutionary generalisation of `reference_backbone`. An elite's mask should be
+    read off the ELITE's structure, not off the native one: the whole premise of
+    breeding from it is that its backbone is a different -- and better -- place in the
+    space, and threading its sequence onto the native fold would discard exactly the
+    information that makes it an elite.
+
+    Any arm's fold is acceptable here, unlike the reference lookup, which pins
+    `arm == "reference"`. An elite is whichever sequence scored best; the arm that
+    happened to propose it is not part of its identity.
+
+    Returns None when the sequence has no fold on disk, which the caller must treat as
+    "fall back to the reference backbone" rather than as an error -- a retained run
+    gzips or drops raw complexes, so a perfectly good elite can simply have no structure
+    left to read.
+    """
+    journal = out_dir / "state" / parent_id / "outcomes.jsonl"
+    if not journal.exists():
+        return None
+    for line in journal.read_text().splitlines():
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if row.get("technical_failure") or row.get("sequence") != sequence:
+            continue
+        raw = row.get("raw_pdb_path")
+        if not raw:
+            continue
+        src, gz = Path(raw), Path(str(raw) + ".gz")
+        dst = work / f"{parent_id}_{tag}.pdb"
+        if src.exists():
+            shutil.copyfile(src, dst)
+            return dst
+        if gz.exists():
+            with gzip.open(gz, "rb") as fh, open(dst, "wb") as out:
+                shutil.copyfileobj(fh, out)
+            return dst
+    return None
+
+
 def reference_backbone(out_dir: Path, parent_id: str, original: str, work: Path) -> Path | None:
     """The run's own reference fold for this parent, decompressed if need be.
 
@@ -98,9 +159,15 @@ def reference_backbone(out_dir: Path, parent_id: str, original: str, work: Path)
 
 
 def matched_random_masks(
-    sizes: list[int], length: int, seed: int, compare_to: set[tuple[int, ...]] | None = None
+    sizes: list[int], length: int, seed: int,
+    compare_to: set[tuple[int, ...]] | None = None, compare_label: str = "supplied",
 ) -> list[tuple[int, ...]]:
-    """Uniform masks at the SAME sizes the LLM chose.
+    """Uniform masks at the SAME sizes the supplied mask set used.
+
+    `compare_label` names what the overlap is being counted against, and defaults to the
+    neutral word rather than "LLM". The supplied masks are NOT always an LLM's: the
+    filler sweep feeds a random shared set, and a log that calls those "LLM masks" is a
+    provenance error that outlives the run -- the log is what a later reader has.
 
     Matched on size because `search.match_counts` exists for exactly this reason: a
     difference between the two runs must not be an artefact of one of them mutating
@@ -135,8 +202,9 @@ def matched_random_masks(
     if compare_to:
         overlap = len([m for m in out if m in compare_to])
         if overlap:
-            print(f"    note: {overlap}/{len(out)} random mask(s) coincide with an LLM "
-                  f"mask (expected on a short peptide; not excluded)", flush=True)
+            print(f"    note: {overlap}/{len(out)} random mask(s) coincide with a "
+                  f"{compare_label} mask (expected on a short peptide; not excluded)",
+                  flush=True)
     return out
 
 
@@ -246,7 +314,19 @@ def main() -> int:
                     help="per-parent mask records from cpseq_llm_mask_round.py")
     ap.add_argument("--round", type=int, default=1, dest="round_index")
     ap.add_argument("--arms", default=f"{ARM_LLM_MASK_MPNN},{ARM_RAND_MASK_MPNN}",
-                    help="comma-separated subset of the three arms")
+                    help="comma-separated subset of the three arms. A name outside the "
+                         "three is allowed and is used as the arm LABEL -- needed for a "
+                         "sweep, where several arms differ only in a filler setting and "
+                         "each needs its own label in the journal. Such a name requires "
+                         "--masks-dir (it has no matched-control mask rule of its own) "
+                         "and --fill (its fill type cannot be inferred from the name).")
+    ap.add_argument("--fill", choices=("mpnn", "random", "by-name"), default="by-name",
+                    help="which filler to use, overriding the name-based dispatch. "
+                         "`by-name` (the default) preserves the original behaviour "
+                         "exactly: random fill for the one arm whose name says so, MPNN "
+                         "for the others. Naming it explicitly is what lets a sweep arm "
+                         "carry an honest label instead of borrowing another arm's name "
+                         "to get its filler.")
     # ONE sequence per mask, and the diversity comes from the masks. Arm C draws two per
     # mask because it varies the BACKBONE as well; here the backbone is fixed on purpose,
     # and at T=0.2 MPNN is near-deterministic -- measured on `lnr_2v8x`, both draws were
@@ -261,11 +341,21 @@ def main() -> int:
     ap.add_argument("--omit-aas", default="XC")
     ap.add_argument("--seed", type=int, default=1234)
     ap.add_argument("--parents", default="", help="comma-separated; default all in masks-dir")
+    ap.add_argument("--run-tag", default="",
+                    help="suffix for this run's scratch directory under mask_fill/. The "
+                         "per-arm proposal files are already arm-disjoint, but the "
+                         "run-level proposals.jsonl and summary.json are NOT: two runs "
+                         "over the same round would overwrite each other's. Concurrent "
+                         "runs (a sweep where arms differ only in a filler setting) must "
+                         "each pass a distinct tag. Default empty keeps the original "
+                         "single-run layout.")
     args = ap.parse_args()
 
     arms = [a for a in args.arms.split(",") if a]
     alpha = default_alphabet(allow_cys=False)
-    work = args.out_dir / "mask_fill" / f"round{args.round_index}" / "work"
+    round_dir = (args.out_dir / "mask_fill"
+                 / f"round{args.round_index}{'__' + args.run_tag if args.run_tag else ''}")
+    work = round_dir / "work"
     work.mkdir(parents=True, exist_ok=True)
 
     want = set(p for p in args.parents.split(",") if p) or None
@@ -276,14 +366,14 @@ def main() -> int:
     # run -- there are no LLM masks to fill or to match -- and its sizes are drawn from
     # the pilot's distribution instead. See `sampled_mask_sizes`.
     standalone = args.masks_dir is None
-    jobs: list[tuple[str, str, list[tuple[int, ...]] | None]] = []
+    jobs: list[tuple[str, str, list[tuple[int, ...]] | None, list[str] | None]] = []
     if standalone:
         needs_llm = [a for a in arms if a != ARM_RAND_MASK_MPNN]
         if needs_llm:
             print(f"FATAL: {', '.join(needs_llm)} need --masks-dir; only "
                   f"{ARM_RAND_MASK_MPNN} runs standalone", file=sys.stderr)
             return 1
-        jobs = [(pid, original, None) for pid, original in
+        jobs = [(pid, original, None, None) for pid, original in
                 journal_parents(args.out_dir, want)]
         if not jobs:
             print(f"FATAL: no parent in {args.out_dir} has a reference fold on disk",
@@ -306,11 +396,25 @@ def main() -> int:
             if not masks:
                 print(f"[fill] {rec['parent_id']}: no masks in {mf.name}; skipped")
                 continue
-            jobs.append((rec["parent_id"], rec["original_sequence"], masks))
+            # `mask_ancestors` is the evolutionary part, and it is OPTIONAL: a round
+            # that bred from elites writes one ancestor per mask, a round that did not
+            # writes none and every mask is read against the original. Defaulting to
+            # the original is what keeps every pre-ES mask file readable unchanged.
+            anc = rec.get("mask_ancestors") or []
+            if anc and len(anc) != len(masks):
+                print(f"[fill] {rec['parent_id']}: {len(anc)} ancestors for "
+                      f"{len(masks)} masks in {mf.name}; REFUSING rather than guessing "
+                      f"which mask belongs to which elite")
+                continue
+            ancestors = list(anc) or [rec["original_sequence"]] * len(masks)
+            jobs.append((rec["parent_id"], rec["original_sequence"], masks, ancestors))
 
     rows: list[dict] = []
     summary: list[dict] = []
-    for pid, original, llm_masks in jobs:
+    # `given_masks`: the masks supplied via --masks-dir, whoever chose them. Named for
+    # their ROLE and not for a presumed author -- an LLM round writes them, and so does
+    # `cpseq_make_shared_masks.py` for a filler sweep, where they are uniform random.
+    for pid, original, given_masks, mask_ancestors in jobs:
         L, budget = len(original), budget_for(len(original))
 
         bb = reference_backbone(args.out_dir, pid, original, work)
@@ -321,17 +425,39 @@ def main() -> int:
             print(f"[fill] {pid}: NO REFERENCE BACKBONE on disk -- excluded from this arm")
             summary.append({"parent_id": pid, "excluded": "no_reference_backbone"})
             continue
-        threaded = work / f"{pid}_threaded.pdb"
-        thread_sequence_onto_backbone(
-            bb, threaded, peptide_chain=PEPTIDE_CHAIN, original=original
-        )
+        # One threaded structure per DISTINCT ancestor. A non-evolutionary round has
+        # exactly one (the original) and this is the old behaviour unchanged; an
+        # evolutionary round has one per elite, each read off that elite's OWN fold when
+        # the run still has it. Falling back to the reference backbone is explicit and
+        # reported, because an elite silently masked on the native structure would be a
+        # different experiment wearing this one's name.
+        wanted = sorted(set(mask_ancestors or [original]) | {original})
+        threaded_for: dict[str, Path] = {}
+        backbone_for: dict[str, str] = {}
+        for i, anc in enumerate(wanted):
+            if anc == original:
+                anc_bb, src = bb, "reference"
+            else:
+                anc_bb = ancestor_backbone(args.out_dir, pid, anc, work, tag=f"anc{i}")
+                src = "own fold" if anc_bb is not None else "reference (no own fold)"
+                if anc_bb is None:
+                    anc_bb = bb
+            dst = work / f"{pid}_threaded_{i}.pdb"
+            thread_sequence_onto_backbone(
+                anc_bb, dst, peptide_chain=PEPTIDE_CHAIN, original=anc
+            )
+            threaded_for[anc] = dst
+            backbone_for[anc] = anc_bb.name
+            if anc != original:
+                print(f"[fill] {pid}: elite {anc} masked on its {src}")
+        threaded = threaded_for[original]
 
         # `hash()` is salted per process for str, so it cannot appear in a seed that has
         # to reproduce: the pilot's own control masks are not regenerable because of it.
         # `proposal_seed` is the project's stable per-(parent, arm, round) seed.
         mask_seed = int(proposal_seed(pid, ARM_RAND_MASK_MPNN, args.round_index, 0)
                         % 10**6)
-        if llm_masks is None:
+        if given_masks is None:
             sizes = sampled_mask_sizes(args.n_masks, budget, seed=mask_seed)
             if not sizes:
                 print(f"[fill] {pid}: L={L} gives budget {budget}; no mask fits, excluded")
@@ -341,27 +467,45 @@ def main() -> int:
             print(f"\n=== {pid}  {original}  L={L} budget={budget}  "
                   f"{len(ctrl_masks)} sampled masks {sorted(sizes)}", flush=True)
         else:
-            sizes = [len(m) for m in llm_masks]
+            sizes = [len(m) for m in given_masks]
             ctrl_masks = matched_random_masks(
-                sizes, L, seed=mask_seed, compare_to=set(llm_masks),
+                sizes, L, seed=mask_seed, compare_to=set(given_masks),
+                compare_label="supplied",
             )
             print(f"\n=== {pid}  {original}  L={L} budget={budget}  "
-                  f"{len(llm_masks)} llm masks {sizes}", flush=True)
+                  f"{len(given_masks)} supplied masks {sizes} "
+                  f"(from {args.masks_dir.name})", flush=True)
 
         for arm in arms:
-            masks = llm_masks if arm != ARM_RAND_MASK_MPNN else ctrl_masks
+            masks = given_masks if arm != ARM_RAND_MASK_MPNN else ctrl_masks
+            if masks is None:
+                # Only ARM_RAND_MASK_MPNN has a mask rule of its own in standalone mode.
+                # Any other arm reads them from --masks-dir, so reaching here means a
+                # custom arm was named without one, and filling nothing silently would
+                # look like an arm that proposed badly rather than one never fed.
+                print(f"[fill] {pid} {arm}: no masks available -- a custom arm name "
+                      f"needs --masks-dir; skipped")
+                continue
+            use_random = resolve_fill(args.fill, arm) == "random"
             produced: list[tuple[str, str]] = []
             for k, mask in enumerate(masks):
-                if arm == ARM_LLM_MASK_RAND:
+                # The mask's ancestor, positionally. The random-mask control reuses the
+                # SAME ancestor as the mask it is matched to: it controls for position
+                # choice, so letting it breed from a different sequence would confound
+                # the one axis it exists to isolate.
+                anc = (mask_ancestors[k] if mask_ancestors and k < len(mask_ancestors)
+                       else original)
+                anc_pdb = threaded_for.get(anc, threaded)
+                if use_random:
                     seqs = random_fill(
-                        original, mask, alpha, args.seqs_per_mask,
+                        anc, mask, alpha, args.seqs_per_mask,
                         seed=int(proposal_seed(pid, arm, args.round_index, k) % 10**6),
                     )
                     got = [(s, "random fill") for s in seqs]
                 else:
                     fixed = [i for i in range(L) if i not in mask]
                     designs = run_mpnn(
-                        pdb_path=threaded,
+                        pdb_path=anc_pdb,
                         fixed_positions=fixed,
                         out_dir=work / f"{pid}_{arm}_m{'-'.join(map(str, mask))}",
                         n_seq=args.seqs_per_mask,
@@ -393,12 +537,37 @@ def main() -> int:
                         ),
                         "n_mutations": sum(1 for i in range(L) if seq[i] != original[i]),
                         "noop": seq == original,
-                        "backbone": str(bb.name), "note": note,
+                        # The backbone actually used, which for an elite bred on its
+                        # own fold is NOT the reference. Recording the reference here
+                        # regardless would claim every offspring was masked on the
+                        # native structure.
+                        "backbone": backbone_for.get(anc, bb.name), "note": note,
+                        # Ancestry, recorded and never inferred: without it a later
+                        # reader cannot tell an elite's offspring from a fresh draw,
+                        # and "did the improvement descend from the elite that was
+                        # supposed to produce it" becomes unanswerable.
+                        "ancestor_sequence": (None if anc == original else anc),
+                        "n_mutations_from_ancestor": sum(
+                            1 for i in range(L) if seq[i] != anc[i]
+                        ),
+                        # Per ROW, not only in the run summary. A filler sweep puts
+                        # several arms in one directory, and a row that cannot say which
+                        # filler and which temperature produced it is unattributable once
+                        # the summary for its run has been overwritten by the next one.
+                        "fill": "random" if use_random else "mpnn",
+                        "mpnn_temperature": (None if use_random else args.temperature),
+                        "mpnn_model": (None if use_random else args.model_name),
+                        "masks_shared_from": (
+                            str(args.masks_dir) if args.masks_dir else None),
                     })
             # The shared legality screen, against the ORIGINAL. A legal mask can still
             # produce an illegal sequence, and that rejection belongs to the filler.
+            # `already` carries the ancestors too. A fill that reproduces the elite it
+            # was bred from is not a new candidate -- it is a wasted draw dressed as
+            # one -- and counting it would let a generation "produce" its own parents.
             kept, rejected = screen_candidates(
-                produced, original=original, alphabet=alpha, already={original}
+                produced, original=original, alphabet=alpha,
+                already={original} | set(mask_ancestors or ()),
             )
             # FIRST occurrence only. `screen_candidates` already dropped the repeats, but
             # matching its output back by sequence STRING would re-accept every copy --
@@ -425,7 +594,7 @@ def main() -> int:
                 "rejection_reasons": sorted({r["reason"] for r in rejected}),
             })
 
-    dest = args.out_dir / "mask_fill" / f"round{args.round_index}"
+    dest = round_dir
     dest.mkdir(parents=True, exist_ok=True)
     path = dest / "proposals.jsonl"
     with path.open("w") as fh:

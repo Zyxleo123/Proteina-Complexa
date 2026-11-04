@@ -82,6 +82,28 @@ MAX_TOKENS = 5120
 
 SUPPORTED_CHEMISTRIES = ("mainchain",)
 
+# How the peptide is handed to AF3. These are not two encodings of one thing -- they put
+# the peptide in different parts of the model.
+#
+#   "ligand"   a SMILES whose ring bond IS the closure. Measured on 4 crystal controls x
+#              5 seeds: the ring closes correctly (1.372 A, trans, in window) but AF3
+#              does not honour the stated stereochemistry -- 18 of 20 folds carry
+#              D-amino acids EVEN AFTER relax, so 0/20 pass a gate requiring all-L under
+#              bond-only relax and 2/20 under junction-restrained. Kept selectable so
+#              that result stays reproducible, not because it is recommended.
+#
+#   "polymer"  a protein chain, with the head-to-tail bond declared in `bondedAtomPairs`.
+#              AF3 then builds each residue from its own CCD template (`L-PEPTIDE
+#              LINKING`), so the L configuration is correct BY CONSTRUCTION rather than
+#              inferred for a generic molecule. Also drops the peptide from ~8-9 tokens
+#              per residue to 1, and puts it back in the distribution AF3 was trained on.
+#
+# The two are mutually exclusive in AF3 itself, not just here: `folding_input.py` refuses
+# a bond that touches a SMILES ligand ('unsupported SMILES ligand'), so the closure can
+# be expressed either in the chemistry or as a declared bond, never both.
+REPRESENTATIONS = ("polymer", "ligand")
+DEFAULT_REPRESENTATION = "polymer"
+
 
 class AF3InputError(ValueError):
     """The requested prediction cannot be expressed as a valid AF3 job."""
@@ -171,14 +193,23 @@ def build_input_json(
     sequence: str,
     chemistry: str = "mainchain",
     config: AF3Config | None = None,
+    representation: str = DEFAULT_REPRESENTATION,
 ) -> tuple[str, CyclicPeptide, dict]:
     """The AF3 input JSON for one candidate. Returns (json_text, peptide, token_budget).
+
+    `representation` picks how the peptide is expressed -- see REPRESENTATIONS. The
+    default is "polymer", because the ligand route was measured not to preserve the
+    stereochemistry it states.
 
     Raises rather than degrading: a job that silently loses its template, its alignment
     or its ring would still predict something, and that something would be scored and
     reported as this arm's output.
     """
     config = config or AF3Config()
+    if representation not in REPRESENTATIONS:
+        raise AF3InputError(
+            f"representation {representation!r} is not one of {REPRESENTATIONS}"
+        )
     if not chemistry_supported(chemistry):
         raise AF3InputError(
             f"chemistry {chemistry!r} is not expressible here (have "
@@ -188,14 +219,24 @@ def build_input_json(
     if not receptor_chains:
         raise AF3InputError("no receptor chain: this arm predicts a complex, not a peptide")
 
+    # Built in both modes: it validates the sequence against the canonical alphabet and
+    # supplies the token accounting and the expected ring size. In polymer mode its
+    # SMILES is NOT sent to AF3 -- the closure travels as a declared bond instead.
     peptide = cyclic_peptide(sequence, chemistry=chemistry)
     budget = token_estimate(receptor_chains, peptide)
+    budget["representation"] = representation
+    if representation == "polymer":
+        # One token per residue, not one per heavy atom.
+        budget["peptide_tokens"] = peptide.length
+        budget["total_tokens"] = budget["receptor_tokens"] + peptide.length
+        budget["tokens_saved_vs_ligand"] = peptide.n_heavy_atoms - peptide.length
+    else:
+        budget["peptide_tokens"] = peptide.n_heavy_atoms
     if budget["total_tokens"] > MAX_TOKENS:
         raise AF3InputError(
             f"{budget['total_tokens']} tokens exceeds the {MAX_TOKENS} ceiling "
-            f"({budget['receptor_tokens']} receptor + {budget['ligand_tokens']} ligand; "
-            f"the peptide costs {budget['ligand_tokenisation_multiplier']}x what it "
-            f"would as a polymer chain)"
+            f"({budget['receptor_tokens']} receptor + {budget['peptide_tokens']} peptide, "
+            f"representation={representation})"
         )
 
     sequences: list[dict] = []
@@ -228,17 +269,46 @@ def build_input_json(
             }]
         sequences.append({"protein": entry})
 
-    # The peptide, as a molecule. `smiles` carries the closing bond, so no bondedAtomPairs
-    # entry is needed and none is emitted -- the ring is internal to this one entity.
-    sequences.append({"ligand": {"id": LIGAND_CHAIN_ID, "smiles": peptide.smiles}})
-
-    job = {
+    job: dict = {
         "name": name,
         "modelSeeds": list(config.model_seeds),
         "sequences": sequences,
         "dialect": "alphafold3",
         "version": 1,
     }
+
+    if representation == "ligand":
+        # The peptide as a molecule. `smiles` carries the closing bond, so no
+        # bondedAtomPairs entry is needed and none may be emitted -- AF3 refuses a bond
+        # touching a SMILES ligand.
+        sequences.append({"ligand": {"id": LIGAND_CHAIN_ID, "smiles": peptide.smiles}})
+    else:
+        if PEPTIDE_CHAIN in {c.chain_id for c in receptor_chains}:
+            raise AF3InputError(
+                f"a receptor chain already uses {PEPTIDE_CHAIN!r}, which is where the "
+                f"peptide chain has to go. Rename the receptor chains rather than "
+                f"letting two chains collide."
+            )
+        # The peptide as a protein chain. No alignment: a 5-16mer has no meaningful
+        # homologs to align, and '' is AF3's way of saying "single sequence, do not go
+        # looking" -- which is also required here, since the genetic databases are not
+        # installed. Stated explicitly rather than omitted, because an unset MSA makes
+        # AF3 run its own data pipeline.
+        sequences.append({"protein": {
+            "id": PEPTIDE_CHAIN,
+            "sequence": peptide.sequence,
+            "unpairedMsa": "",
+            "pairedMsa": "",
+            "templates": [],
+        }})
+        # The closure, declared. Residue ids are 1-based within the chain, and `N`/`C`
+        # are the CCD backbone atom names, so this is the same N-to-C amide the SMILES
+        # expressed as a ring bond -- but now AF3 builds both residues from its own
+        # L-amino-acid templates, which is the entire point of this representation.
+        job["bondedAtomPairs"] = [
+            [[PEPTIDE_CHAIN, 1, "N"], [PEPTIDE_CHAIN, peptide.length, "C"]]
+        ]
+
     return json.dumps(job, indent=2, sort_keys=True), peptide, budget
 
 
@@ -476,6 +546,110 @@ def _pdb_atom_line(
     )
 
 
+def _write_polymer_pdb(
+    *,
+    atoms: list[CifAtom],
+    peptide: CyclicPeptide,
+    out_path: str | Path,
+    peptide_chain: str,
+) -> dict:
+    """Convert a polymer-representation AF3 model to PDB, and check it is the peptide.
+
+    Verification here is by SEQUENCE and by the closing bond, which is what the polymer
+    representation makes checkable: the peptide chain must hold exactly the residues that
+    were requested, in order, and residues 1 and L must actually be in bonding distance
+    -- AF3 is given the closure as a declared bond, but a declared bond is an input, not
+    a guarantee about the output.
+    """
+    peptide_atoms = [a for a in atoms if a.auth_asym_id == peptide_chain]
+    receptor = [a for a in atoms if a.auth_asym_id != peptide_chain
+                and a.comp_id != "HOH"]
+    if not peptide_atoms:
+        raise AF3MappingError(
+            f"no atoms in peptide chain {peptide_chain!r}; chains present: "
+            f"{sorted({a.auth_asym_id for a in atoms})}"
+        )
+
+    three_to_one = {
+        "ALA": "A", "CYS": "C", "ASP": "D", "GLU": "E", "PHE": "F", "GLY": "G",
+        "HIS": "H", "ILE": "I", "LYS": "K", "LEU": "L", "MET": "M", "ASN": "N",
+        "PRO": "P", "GLN": "Q", "ARG": "R", "SER": "S", "THR": "T", "VAL": "V",
+        "TRP": "W", "TYR": "Y",
+    }
+    by_residue: dict[int, list[CifAtom]] = {}
+    for atom in peptide_atoms:
+        try:
+            by_residue.setdefault(int(atom.auth_seq_id), []).append(atom)
+        except ValueError:
+            continue
+    numbers = sorted(by_residue)
+    observed = "".join(
+        three_to_one.get(by_residue[n][0].comp_id, "?") for n in numbers
+    )
+    if observed != peptide.sequence:
+        raise AF3MappingError(
+            f"peptide chain {peptide_chain!r} holds {observed!r}, requested "
+            f"{peptide.sequence!r}. AF3 returned a different peptide than was asked for."
+        )
+
+    lines: list[str] = []
+    serial = 1
+    serial_of: dict[tuple[int, str], int] = {}
+    for atom in receptor:
+        try:
+            res_seq = int(atom.auth_seq_id)
+        except ValueError:
+            continue
+        lines.append(_pdb_atom_line(
+            serial, atom.atom_name, atom.comp_id, atom.auth_asym_id, res_seq,
+            atom.x, atom.y, atom.z, atom.b_factor, atom.element,
+        ))
+        serial += 1
+    lines.append("TER")
+    for number in numbers:
+        for atom in by_residue[number]:
+            lines.append(_pdb_atom_line(
+                serial, atom.atom_name, atom.comp_id, peptide_chain, number,
+                atom.x, atom.y, atom.z, atom.b_factor, atom.element,
+            ))
+            serial_of[(number, atom.atom_name)] = serial
+            serial += 1
+    lines.append("TER")
+
+    first, last = numbers[0], numbers[-1]
+    key_n, key_c = (first, "N"), (last, "C")
+    missing = [k for k in (key_n, key_c) if k not in serial_of]
+    if missing:
+        raise AF3MappingError(
+            f"peptide chain is missing backbone atom(s) {missing}, so the closure cannot "
+            f"be written or measured"
+        )
+    lines.append(f"CONECT{serial_of[key_n]:5d}{serial_of[key_c]:5d}")
+    lines.append("END")
+
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text("\n".join(lines) + "\n")
+
+    n_atom = next(a for a in by_residue[first] if a.atom_name == "N")
+    c_atom = next(a for a in by_residue[last] if a.atom_name == "C")
+    closure = ((n_atom.x - c_atom.x) ** 2 + (n_atom.y - c_atom.y) ** 2
+               + (n_atom.z - c_atom.z) ** 2) ** 0.5
+    return {
+        "pdb_path": str(out_path),
+        "representation": "polymer",
+        "receptor_chains": sorted({a.auth_asym_id for a in receptor}),
+        "peptide_chain": peptide_chain,
+        "n_receptor_atoms": sum(1 for a in receptor if a.auth_seq_id.lstrip("-").isdigit()),
+        "n_peptide_atoms": len(peptide_atoms),
+        "peptide_sequence": observed,
+        "af3_closure_bond_A": round(closure, 3),
+        "mapping_verified": "peptide chain sequence matches the request residue for "
+                            "residue; no atom permutation is involved in this "
+                            "representation",
+    }
+
+
 def write_complex_pdb(
     *,
     cif_path: str | Path,
@@ -483,6 +657,7 @@ def write_complex_pdb(
     out_path: str | Path,
     peptide_chain: str = PEPTIDE_CHAIN,
     ligand_comp_prefix: str = "LIG_",
+    representation: str = DEFAULT_REPRESENTATION,
 ) -> dict:
     """Rewrite an AF3 model as a PDB the shared evaluator can read unchanged.
 
@@ -499,6 +674,16 @@ def write_complex_pdb(
     computable per residue.
     """
     atoms = read_model_cif(cif_path)
+
+    if representation == "polymer":
+        # Nothing to reconstruct: AF3 returned the peptide AS a chain, with CCD residue
+        # and atom names already. So this is a format conversion and not a mapping, which
+        # is the second reason to prefer this representation -- there is no permutation
+        # that could silently attach a coordinate to the wrong atom.
+        return _write_polymer_pdb(
+            atoms=atoms, peptide=peptide, out_path=out_path,
+            peptide_chain=peptide_chain,
+        )
     ligand = [a for a in atoms if a.comp_id.startswith(ligand_comp_prefix)]
     receptor = [a for a in atoms if not a.comp_id.startswith(ligand_comp_prefix)]
     if not ligand:

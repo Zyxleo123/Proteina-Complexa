@@ -38,11 +38,27 @@ N_MASKS="${MASK_N_MASKS:-12}"
 ARMS="${MASK_ARMS:-llm_mask_mpnn_fill,random_mask_mpnn_fill,llm_mask_random_fill}"
 SEQS_PER_MASK="${MASK_SEQS_PER_MASK:-1}"
 MPNN_TEMP="${MASK_MPNN_TEMP:-0.2}"
+# Scratch-dir suffix under mask_fill/. The PER-ARM proposal files (mask_proposals/<arm>/)
+# are arm-disjoint, and those are what the ladder reads -- but the run-level
+# proposals.jsonl, meta.json and work/ under mask_fill/round<N>/ are NOT, so a second arm
+# over the same round silently overwrites the first arm's copies. Pass a distinct tag
+# whenever a round is filled more than once. Empty keeps the original single-run layout.
+RUN_TAG="${MASK_RUN_TAG:-}"
 PY="${PYTHON_EXEC:-$(pwd)/.venv/bin/python}"
+
+# Shadow the venv's broken torchaudio. This venv pairs torch 2.7.0 with torchaudio 2.11.0,
+# whose C extension does not match, and `transformers` 5.x reaches torchaudio on the path to
+# EVERY model class (modeling_llama -> modeling_layers -> processing_utils -> modeling_utils
+# -> loss.loss_utils -> loss_rnnt -> import torchaudio). The `is_torchaudio_available()`
+# guard checks package METADATA, which is present, so the guard passes and the import dies:
+#   OSError: .../torchaudio/lib/_torchaudio.abi3.so: undefined symbol: torch_library_impl
+# This killed job 96118 at stage 1 (Llama-3.1-8B load), stranding the whole afterok chain.
+# See script_utils/_compat_stubs/torchaudio/__init__.py.
+export PYTHONPATH="$(pwd)/script_utils/_compat_stubs${PYTHONPATH:+:$PYTHONPATH}"
 
 echo "=== $(date) $(hostname) job=${SLURM_JOB_ID:-none} ==="
 nvidia-smi -L || true
-echo "  out=$MASK_OUT_DIR round=$ROUND n_masks=$N_MASKS arms=$ARMS"
+echo "  out=$MASK_OUT_DIR round=$ROUND n_masks=$N_MASKS arms=$ARMS run_tag=${RUN_TAG:-<none>}"
 echo "  requested: gpu=${SLURM_JOB_GRES:-?} cpus=${SLURM_CPUS_PER_TASK:-?} mem=64G"
 
 [[ -f "$MASK_OUT_DIR/cohort.json" ]] || {
@@ -74,6 +90,7 @@ echo "--- stage 2: fill ---"
   --arms "$ARMS" \
   --seqs-per-mask "$SEQS_PER_MASK" \
   --temperature "$MPNN_TEMP" \
+  ${RUN_TAG:+--run-tag "$RUN_TAG"} \
   ${MASK_PARENTS:+--parents "$MASK_PARENTS"}
 
 echo "=== $(date) finished ==="

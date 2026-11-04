@@ -424,6 +424,7 @@ def score_structure(
     isolated_out_path: str | Path | None = None,
     deformation_cache: dict | None = None,
     relax_restraint: str = JUNCTION_RESTRAINT,
+    skip_relax: bool = False,
 ) -> dict:
     """Score one predicted complex. Returns a record; raises only on programmer error.
 
@@ -540,6 +541,37 @@ def score_structure(
     except Exception as exc:  # noqa: BLE001
         rec["status"] = "raw_scoring_failed"
         rec["reason"] = f"{type(exc).__name__}: {exc}"
+        return rec
+
+    # --- the relax, when the caller still wants one ----------------------------------
+    #
+    # Everything above is the RAW analysis of the structure as predicted, and it is
+    # cheap: measured 1.5 s with packstat off and 2.2 s with it on. Everything below is
+    # two FastRelax runs -- the restrained complex here and the free peptide in the
+    # deformation proxy -- and that is where the time goes. Measured over the 22,642 v3
+    # folds of `llm_ladder`: 29.6 s median per fold scored, against 37.8 s of Boltz-2
+    # prediction, so scoring is 54 % of that run's 327 job-hours.
+    #
+    # `skip_relax` is for the caller that already knows the relax cannot change its
+    # answer. Under a PRERELAX-gated scoring protocol the verdict is read off the
+    # structure the predictor produced, so a fold that fails it is already decided and
+    # the refined energy can never reach the gate or `best_valid_dG_separated`. Measured
+    # on the same run: 60.9 % of folds are invalid and 58.2 % of scoring hours were spent
+    # relaxing them.
+    #
+    # It is NOT a free switch and must never be the default. The record it returns has
+    # no `refined`, no `refinement_displacement` and no `deformation`, so it cannot be
+    # rescored to a post-relax protocol (v4, v5) and it carries no prerelax-to-postrelax
+    # gap for the complexes that were skipped. `evaluate` is responsible for keeping such
+    # a record out of the way of a later full pass -- see `relax_skipped` there.
+    if skip_relax:
+        rec["status"] = "ok_raw_only"
+        rec["relax_skipped"] = True
+        rec["reason"] = (
+            "caller passed skip_relax: the raw analysis above is complete and both "
+            "FastRelax runs were not attempted, so there is no refined energy, no "
+            "refinement displacement and no deformation proxy in this record"
+        )
         return rec
 
     # --- shared finite refinement ---------------------------------------------------

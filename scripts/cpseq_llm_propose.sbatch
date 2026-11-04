@@ -83,7 +83,13 @@ done
 
 OUT_DIR="${OUT_DIR:?set OUT_DIR=<run directory holding cohort.json>}"
 ROUND="${ROUND:?set ROUND=<proposal round, 1-based>}"
-MODEL="${MODEL:-/data/models/huggingface/meta-llama/Llama-3.1-8B-Instruct}"
+# Scratch copy first: /data/models is not mounted on every partition, and a mask round
+# that lands on the wrong node dies at model load, costing a whole array task to learn.
+if [[ -d /zfsauton/scratch/yixiz/models/Llama-3.1-8B-Instruct ]]; then
+  MODEL="${MODEL:-/zfsauton/scratch/yixiz/models/Llama-3.1-8B-Instruct}"
+else
+  MODEL="${MODEL:-/data/models/huggingface/meta-llama/Llama-3.1-8B-Instruct}"
+fi
 BATCH_SIZE="${BATCH_SIZE:-0}"   # 0 = ELITES x OFFSPRING_PER_ELITE
 ELITES="${ELITES:-4}"
 OFFSPRING_PER_ELITE="${OFFSPRING_PER_ELITE:-4}"
@@ -98,6 +104,13 @@ SHARD_INDEX="${SHARD_INDEX:-${SLURM_ARRAY_TASK_ID:-0}}"
 SHARD_COUNT="${SHARD_COUNT:-1}"
 PARENTS="${PARENTS:-}"
 PY="${PY:-$REPO/.venv/bin/python}"
+
+# Shadow the venv's broken torchaudio (torch 2.7.0 vs torchaudio 2.11.0; the C extension does
+# not match). `transformers` 5.x reaches torchaudio on the path to every model class, and the
+# `is_torchaudio_available()` guard only checks metadata, so it passes and the import dies with
+#   OSError: .../torchaudio/lib/_torchaudio.abi3.so: undefined symbol: torch_library_impl
+# Same signature that killed job 96118 in cpseq_mask_arm.sbatch; this script loads the same LLM.
+export PYTHONPATH="$REPO/script_utils/_compat_stubs${PYTHONPATH:+:$PYTHONPATH}"
 
 echo "=============================================================="
 echo "host          : $(hostname)"

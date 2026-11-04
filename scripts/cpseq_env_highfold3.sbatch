@@ -1,14 +1,12 @@
 #!/usr/bin/env bash
 #SBATCH --job-name=cpseq_env_hf3
-#SBATCH --partition=preempt
-#SBATCH --account=bapoczos
-#SBATCH --qos=preempt_cpu_qos
-#SBATCH --cpus-per-task=4
-#SBATCH --mem=24G
-#SBATCH --time=3:00:00
+#SBATCH --partition=cpu
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=48G
+#SBATCH --time=4:00:00
 #SBATCH --requeue
 #SBATCH --open-mode=append
-#SBATCH --output=/home/yixiz/slurm_logs/cpseq_env_hf3_%j.out
+#SBATCH --output=/zfsauton/scratch/yixiz/cpseq_af3/logs/cpseq_env_hf3_%j.out
 #
 # Build the HighFold3 runtime: AlphaFold3 under CPython 3.11, with HighFold3's model
 # files overlaid, per its README ("refer to the conda version of AlphaFold3
@@ -38,14 +36,16 @@
 
 set -euo pipefail
 
-ZFS="${ZFS:-/data/user_data/yixiz}"
+ZFS="${ZFS:-/zfsauton/scratch/yixiz}"
 ENV_ROOT="${ENV_ROOT:-$ZFS/envs/highfold3}"
 VENV="$ENV_ROOT/.venv"
-PY311="${PY311:-$ZFS/pythons/python/bin/python3.11}"
+PY311="${PY311:-$HOME/.local/share/uv/python/cpython-3.11-linux-x86_64-gnu/bin/python3.11}"
 AF3_SRC="${AF3_SRC:-$ZFS/upstream/alphafold3}"
 AF3_REV="${AF3_REV:-a8ecdb2d7a433c5e9f8510a0f52434a0c55018c4}"
 AF3_WORKTREE="${AF3_WORKTREE:-$ZFS/upstream/alphafold3_hf3}"
 HF3_SRC="${HF3_SRC:-$ZFS/upstream/highfold3}"
+HF3_REPO="${HF3_REPO:-https://github.com/hongliangduan/HighFold3}"
+AF3_REPO="${AF3_REPO:-https://github.com/google-deepmind/alphafold3}"
 HF3_REV="${HF3_REV:-2ff1ea31e59f3bac70e45aadde60a4a8fed6e199}"
 MARKERS="$ENV_ROOT/markers"
 mkdir -p "$MARKERS"
@@ -60,6 +60,21 @@ cmake --version | head -1
 gcc --version | head -1
 
 [ -x "$PY311" ] || { echo "FATAL: no CPython 3.11 at $PY311" >&2; exit 1; }
+
+# Clone what is missing. The babel build could assume both trees; a fresh cluster has
+# neither, and the AF3 clone here sits at 131ab9e7 (the rev the PLAIN AF3 env uses) while
+# HighFold3 needs a worktree at a8ecdb2d -- one clone serves both.
+mkdir -p "$(dirname "$AF3_SRC")"
+[ -d "$AF3_SRC/.git" ] || { echo "[af3] cloning $AF3_REPO"; git clone --quiet "$AF3_REPO" "$AF3_SRC"; }
+if [ ! -d "$HF3_SRC/.git" ]; then
+  echo "[hf3] cloning $HF3_REPO"
+  git clone --quiet "$HF3_REPO" "$HF3_SRC"
+fi
+git -C "$HF3_SRC" fetch --quiet origin || true
+git -C "$HF3_SRC" checkout --quiet --detach "$HF3_REV" || {
+  echo "FATAL: cannot check out highfold3 $HF3_REV" >&2; exit 1; }
+# a8ecdb2d must be fetchable from the clone before the worktree is created.
+git -C "$AF3_SRC" fetch --quiet origin || true
 
 # ------------------------------------------------------- AF3 source at the pinned rev
 # A worktree, so the pinned 131ab9e clone's HEAD is left alone.

@@ -37,8 +37,11 @@ from cpseq_llm_propose import (  # noqa: E402
 from proteinfoundation.cpseq.llm_propose import (  # noqa: E402
     DEFAULT_MODEL_PATH,
     LlamaProposer,
+    DEFAULT_ELITE_MIN_DISTANCE,
+    DEFAULT_N_ELITES,
     history_from_outcomes,
     propose_mask_round,
+    select_elites,
 )
 from proteinfoundation.cpseq.search import default_alphabet  # noqa: E402
 
@@ -62,6 +65,17 @@ def main() -> int:
     ap.add_argument("--round", type=int, default=1, dest="round_index")
     ap.add_argument("--model", default=DEFAULT_MODEL_PATH)
     ap.add_argument("--n-masks", type=int, default=8)
+    ap.add_argument("--n-elites", type=int, default=DEFAULT_N_ELITES,
+                    help="how many elites this round breeds from, sharing --n-masks "
+                         "between them. 0 disables evolution and proposes from the "
+                         "native sequence, which is what rounds before this flag did. "
+                         "The default is live even in generation 1, where it is a no-op: "
+                         "the reference is the only scored sequence, so it is the only "
+                         "elite and the round starts from the original either way.")
+    ap.add_argument("--elite-min-distance", type=int, default=DEFAULT_ELITE_MIN_DISTANCE,
+                    help="Hamming veto between elites, so the elite set cannot collapse "
+                         "into several neighbours of one sequence and spend a whole "
+                         "generation re-exploring one basin.")
     ap.add_argument("--max-attempts", type=int, default=4)
     ap.add_argument("--temperature", type=float, default=0.9)
     ap.add_argument("--fold-depth", type=int, default=10,
@@ -119,20 +133,70 @@ def main() -> int:
             rows, stage=STAGE_LADDER, max_fold_rank=max_fold_rank
         )
 
-        masks, record = propose_mask_round(
-            proposer=llm,
-            original=original,
-            budget=budget,
-            round_index=args.round_index,
-            parent_id=pid,
-            reference_summary=ref_summary,
-            history=history,
-            alphabet=alpha,
-            pdb_id=(ref or {}).get("pdb_id"),
-            max_attempts=args.max_attempts,
-            prompt_dir=prompts,
-            n_requested=args.n_masks,
-        )
+        # The elites this generation breeds from. `--n-elites 0` restores the
+        # non-evolutionary behaviour exactly: one call, starting from the native
+        # sequence, which is what every round before this one did.
+        #
+        # Generation 1 needs no special case. The only scored sequence in the journal is
+        # the reference, so `select_elites` returns the original and `start_from` is the
+        # original -- byte-identical to the non-evolutionary path. The search only
+        # starts moving once a round has scored offspring to rank.
+        elites = (select_elites(history, n_elites=args.n_elites, 
+                                min_distance=args.elite_min_distance)
+                  if args.n_elites > 0 else [])
+        if not elites:
+            elites = [None]
+
+        shares = [args.n_masks // len(elites)] * len(elites)
+        for i in range(args.n_masks - sum(shares)):
+            shares[i] += 1
+
+        masks, record, ancestors = [], None, []
+        for elite, share in zip(elites, shares):
+            if share < 1:
+                continue
+            got, rec = propose_mask_round(
+                proposer=llm,
+                original=original,
+                budget=budget,
+                round_index=args.round_index,
+                parent_id=pid,
+                reference_summary=ref_summary,
+                history=history,
+                alphabet=alpha,
+                pdb_id=(ref or {}).get("pdb_id"),
+                max_attempts=args.max_attempts,
+                prompt_dir=prompts,
+                n_requested=share,
+                parent_candidate=elite,
+            )
+            masks.extend(got)
+            ancestors.extend([rec["start_from"]] * len(got))
+            if record is None:
+                record = rec
+                record["per_elite"] = []
+            else:
+                # Merge rather than overwrite: the malformed and rejected counts are
+                # how a round reports that the model is struggling, and keeping only
+                # the last elite's would hide most of it.
+                record["malformed"].extend(rec["malformed"])
+                record["rejections"].extend(rec["rejections"])
+            record["per_elite"].append({
+                "start_from": rec["start_from"],
+                "parent_candidate": rec.get("parent_candidate"),
+                "parent_energy": rec.get("parent_energy"),
+                "headroom": rec.get("headroom"),
+                "requested": share, "n_masks": len(got),
+            })
+
+        if record is None:
+            print(f"[mask] {pid}: --n-masks={args.n_masks} left every elite a zero "
+                  f"share; nothing proposed")
+            continue
+
+        record["masks"] = [",".join(str(i) for i in m.mask) for m in masks]
+        record["mask_ancestors"] = ancestors
+        record["n_elites"] = len([e for e in elites if e is not None])
         record["reference_interface_ok"] = bool(ref_summary and ref_summary.get("ok"))
         record["max_fold_rank_shown"] = max_fold_rank
         record["n_history"] = len(history)
@@ -141,6 +205,7 @@ def main() -> int:
         sizes = [len(m.mask) for m in masks]
         print(f"[mask] {pid:24s} L={len(original):2d} budget={budget:2d}  "
               f"{len(masks)}/{args.n_masks} masks {sizes}  "
+              f"{record['n_elites']} elite(s)  "
               f"{len(record['malformed'])} malformed, {len(record['rejections'])} rejected"
               f"{'  iface=MISSING' if not record['reference_interface_ok'] else ''}",
               flush=True)

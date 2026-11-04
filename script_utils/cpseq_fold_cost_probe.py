@@ -73,9 +73,15 @@ from proteinfoundation.cpseq.adapters.boltz2 import (  # noqa: E402
     _predict_cmd,
 )
 
-# The one line of upstream this probe changes, and what it becomes.
-CHUNK_BUG = "sample_ids.chunk(\n                    multiplicity % max_parallel_samples + 1\n                )"
-CHUNK_FIX = "sample_ids.chunk(\n                    max(1, -(-multiplicity // max_parallel_samples))\n                )"
+# The one line of upstream this probe changes, and what it becomes. Imported rather than
+# retyped since the patch was promoted to production in `adapters/boltz_chunkfix.py`: two
+# copies of a matched-exact string would drift, and the way they would drift is that the
+# probe measures the patched code while production silently runs unpatched under a key
+# that says otherwise. One definition, so a future upstream reformat breaks both loudly.
+from proteinfoundation.cpseq.adapters.boltz_chunkfix import (  # noqa: E402
+    CHUNK_BUG,
+    CHUNK_FIX,
+)
 
 
 def build_patched_boltz(site_boltz: Path, dest: Path) -> dict:
@@ -380,9 +386,22 @@ def main() -> None:
     ap.add_argument("--wall-budget-s", type=int, default=6000,
                     help="stop starting phase-3 configurations once this much of the "
                          "job's wall clock is gone; 0 disables the guard")
-    ap.add_argument("--skip-cost", action="store_true")
+    ap.add_argument("--skip-cost", action="store_true",
+                    help="skip phases 1 AND 3. Kept with its original meaning so an "
+                         "existing command line is unchanged; to run one of them use "
+                         "--skip-phase1 / --skip-phase3.")
+    ap.add_argument("--skip-phase1", action="store_true",
+                    help="skip the single-input cost model only. Phase 3 is what "
+                         "separates the per-invocation F from the per-input trunk K, and "
+                         "job 95853 never reached it -- so `--skip-phase1 "
+                         "--skip-equivalence` is the way to run phase 3 on its own. "
+                         "(--skip-cost would skip phase 3 too, which is why this exists.)")
+    ap.add_argument("--skip-phase3", action="store_true",
+                    help="skip the batched-invocation confirmations only.")
     ap.add_argument("--skip-equivalence", action="store_true")
     args = ap.parse_args()
+    skip_phase1 = args.skip_cost or args.skip_phase1
+    skip_phase3 = args.skip_cost or args.skip_phase3
 
     base_yaml = Path(args.input_yaml).read_text()
     pep = peptide_of(base_yaml)
@@ -431,7 +450,7 @@ def main() -> None:
     # ceiling on max_parallel_samples -- and must not cost the configurations after it.
     pd = args.production_ds
     coll = pd * args.equiv_seeds          # the collapsed fold: all ten seeds at once
-    if not args.skip_cost:
+    if not skip_phase1:
         print(f"\n--- phase 1: cost model (single input, ds {pd} -> {coll}) ---", flush=True)
         for name, ds, mps, patched, kern in [
             # A1 is today, bit for bit: unpatched, so multiplicity 3 in chunks of one.
@@ -444,6 +463,21 @@ def main() -> None:
             (f"A5_ds{coll}_mps30_fix", coll, 30, True, False),
             (f"K1_prod_ds{pd}_mps5_kern", pd, 5, True, True),
             (f"K2_ds{coll}_mps15_kern", coll, 15, True, True),
+            # A1C: THE POSITIONAL CONTROL. Byte-identical to A1, run last instead of
+            # first, so it changes nothing and must reproduce A1.
+            #
+            # It does not. Measured 2026-11-03 (jobs 95853, 95856): the first invocation
+            # in a job pays a cold page cache on the 2.2 GB checkpoint plus CUDA JIT, and
+            # a sibling A/B whose two arms differed in NOTHING came back 177 s vs 47 s --
+            # 3.8x on position alone. A1 -> A2 was 227 s -> 45 s and was written up as
+            # "the chunk fix is worth 5x"; net of position it is worth about 1.3x.
+            #
+            # So A1C is the arm that says how much of A1 was warm-up, and no ratio
+            # against A1 may be quoted without it. The cost model T = F + n*(K + ds*s)
+            # assumes a constant per-invocation F -- that is a WARM F, and feeding it a
+            # cold first measurement is what produced the wrong answer.
+            # docs/README_CPSEQ_BENCHMARK_PRACTICE.md is the standing rule.
+            (f"A1C_prod_ds{pd}_mps5_control", pd, 5, False, False),
         ]:
             record(run_config(
                 name=name, yaml_texts=one, diffusion_samples=ds,
@@ -500,8 +534,28 @@ def main() -> None:
     # --------------------------------------- phase 3: 9-input confirmations (last)
     # Predictable from phase 1 via T = F + n*(K + ds*s); measured anyway because the
     # prediction is the thing being tested. Guarded by the wall clock.
-    if not args.skip_cost:
+    if not skip_phase3:
         print("\n--- phase 3: batched invocations ---", flush=True)
+        # A DISCARDED warm-up, and it is not optional.
+        #
+        # Cold start is ~3.8x on this cluster: in job 95853 the same unpatched ds=1
+        # single-input configuration took 227 s as the first arm (A1) and ~50 s warm, and
+        # that gap once faked a "5x chunk fix" until a positional control caught it. Phase
+        # 3 used to inherit a warm GPU from phases 1-2. Run on its own -- which is exactly
+        # what the A6-vs-A7 measurement now needs -- its FIRST arm would be the cold one,
+        # and that arm is A6, the baseline the whole comparison is read against. A cold A6
+        # would overstate today's cost and so overstate the saving.
+        #
+        # Named W0 so the summary filter (which keeps A/K/E_ prefixes) leaves it out. Its
+        # row is still written to the JSONL: a discarded measurement that is not recorded
+        # cannot be checked.
+        if budget_left(600):
+            record(run_config(
+                name="W0_warmup_discard", yaml_texts=dict(list(group.items())[:1]),
+                diffusion_samples=pd, max_parallel_samples=5, seed=42, patched=False,
+                kernels=False, preprocessing_threads=1, args=args,
+                patched_root=patched_root,
+            ))
         # P1/P2/P4 isolate what serialised preprocessing costs. Boltz preprocesses a
         # directory of inputs in parallel and each thread holds its own working set, so
         # 9 threads in a 32 GB task was SIGKILLed; production now pins it to 1. The
@@ -514,6 +568,13 @@ def main() -> None:
             (f"P2_9in_ds{pd}_mps5_thr2", pd, 5, False, False, 2, 600),
             (f"P4_9in_ds{pd}_mps5_thr4", pd, 5, False, False, 4, 600),
             (f"A7_9in_ds{coll}_mps15_fix", coll, 15, True, False, 1, 1500),  # proposal
+            # A6 AGAIN, last: the positional control. A6 and A7 differ by ds, mps and the
+            # patch, but they also differ by POSITION in the run, and this is the only arm
+            # that can tell those apart. If A6b does not reproduce A6, the A7/A6 ratio is
+            # measuring drift -- thermal, cache, or another job on the card -- and not the
+            # proposal. Sweeping the axis in both directions is the rule that caught the
+            # last spurious speedup here.
+            (f"A6b_9in_ds{pd}_mps5_thr1_control", pd, 5, False, False, 1, 600),
             (f"K3_9in_ds{coll}_mps15_kern", coll, 15, True, True, 1, 1500),
         ]:
             if not budget_left(reserve):

@@ -106,6 +106,13 @@ def main() -> int:
                          "--directions 2 --min-ref-valid 3 "
                          "--energy-key refined_dG_separated. Set explicitly by any of "
                          "those flags, which win over this one.")
+    ap.add_argument("--per-complex", action="store_true",
+                    help="also print one line per complex -- its energy delta, its "
+                         "validity delta and the status that classified it. Always "
+                         "written to the --json file regardless of this flag; this only "
+                         "puts it in the log. Read it when an aggregate moves between "
+                         "two runs and you need to know whether the COMPLEX SET moved "
+                         "with it.")
     ap.add_argument("--json", default=None)
     args = ap.parse_args()
 
@@ -196,23 +203,47 @@ def main() -> int:
         n_unserved = 0
         n_no_baseline = 0
         n_draws_seen = []
+        # One row per complex, recorded at whichever exit the complex reaches. Purely an
+        # accounting of values this loop already computes -- it adds no branch and
+        # changes no arithmetic, so the aggregate row below is bit-identical with and
+        # without it. It exists because the aggregate alone cannot be PAIRED: comparing
+        # two runs of this estimator (e.g. folding potentials off against on) needs the
+        # per-complex delta, and a second implementation of the estimator would be free
+        # to disagree with the one that reproduces the recorded -7.23.
+        #
+        # Skipped complexes are recorded too, with the status that skipped them. A
+        # complex that gains or loses its baseline between two runs is a change in WHICH
+        # complexes are being compared, which is exactly the kind of thing that makes an
+        # aggregate move for a reason that has nothing to do with the effect under test.
+        per_complex: list[dict] = []
+
+        def _note(pid: str, status: str, **kw) -> None:
+            per_complex.append({"parent_id": pid, "status": status, **kw})
+
         for _pid, s in state.items():
             draws = s["draws"]
             ref = s["reference"]
             if ref is None or ref.n_folds(depth) < depth:
+                _note(_pid, "reference_below_depth",
+                      ref_folds=(None if ref is None else ref.n_folds(depth)))
                 continue
             # A reference too rarely valid to measure is a complex with no baseline, not
             # a complex the arm lost on. Counted and reported, never scored.
             if args.min_ref_valid and ref.n_pass(depth) < args.min_ref_valid:
                 n_no_baseline += 1
+                _note(_pid, "no_baseline", ref_valid=ref.n_pass(depth),
+                      min_ref_valid=args.min_ref_valid)
                 continue
             if args.draws == "all":
                 cands = [draws[k] for k in sorted(draws)]
             else:
                 if complete_prefix(draws, depth) < B:
+                    _note(_pid, "prefix_below_budget",
+                          complete_prefix=complete_prefix(draws, depth), budget=B)
                     continue
                 cands = [draws[k] for k in sorted(draws) if k < B]
             if not cands:
+                _note(_pid, "no_draws")
                 continue
 
             des, dvs, served = [], [], False
@@ -234,14 +265,17 @@ def main() -> int:
                 # ship -- so the complex is counted as unserved rather than quietly
                 # skipped, which would score the rule only on the complexes it answered.
                 n_unserved += 1
+                _note(_pid, "unserved", n_draws=len(cands))
                 continue
             n_cplx += 1
             n_draws_seen.append(len(cands))
 
             # Validity first, and for every served complex -- including the ones the
             # energy comparison has to drop. A pass rate of zero is a real answer.
+            v_delta = None
             if dvs:
                 dv = st.fmean(dvs)
+                v_delta = dv
                 v_d.append(dv)
                 if dv > 0:
                     v_w += 1
@@ -255,6 +289,9 @@ def main() -> int:
                     n_no_baseline += 1
                 else:
                     unmeas += 1
+                _note(_pid, "no_baseline" if nobase else "unmeasurable",
+                      n_draws=len(cands), validity_delta=v_delta,
+                      ref_valid=ref.n_pass(depth), directions_measured=len(des))
                 continue
             de = st.fmean(des)
             e_d.append(de)
@@ -262,6 +299,13 @@ def main() -> int:
                 e_w += 1
             elif de > 0:
                 e_l += 1
+            # `directions_measured` is how many of the cross-fit directions produced an
+            # energy. At --directions 2 a complex with 1 here is averaged over a single
+            # direction, which is the soft-magnitude caveat `cpseq_pilot_table.sh`
+            # prints for 4 of the 10 -- carried per complex so a reader can see which.
+            _note(_pid, "ok", energy_delta=de, validity_delta=v_delta,
+                  n_draws=len(cands), ref_valid=ref.n_pass(depth),
+                  directions_measured=len(des))
 
         row = {
             "B": B if args.draws == "budget" else "all",
@@ -285,6 +329,9 @@ def main() -> int:
             "validity_wins": v_w, "validity_losses": v_l,
             "validity_sign_p": sign_test(v_w, v_l) if (v_w + v_l) else None,
             "splits": [list(s) for s in splits],
+            # Sorted so two runs' files diff cleanly; `state` is dict-ordered by
+            # whatever order the journals were read in, which is not stable across runs.
+            "per_complex": sorted(per_complex, key=lambda r: r["parent_id"]),
         }
         results.append(row)
         em = "-" if row["energy_median_delta"] is None else f"{row['energy_median_delta']:+8.2f}"
@@ -295,6 +342,22 @@ def main() -> int:
         print(f"  {str(row['B']):>3} {n_cplx:>5} | {em} {f'{e_w}/{e_l}':>8} {ep} "
               f"| {vm} {f'{v_w}/{v_l}':>8} {vp} "
               f"| {unmeas:>6} {n_unserved:>8} {n_no_baseline:>8} {dr:>6}")
+        if args.per_complex:
+            # Indented FOUR spaces, deliberately. `scripts/cpseq_pilot_table.sh` pulls
+            # the aggregate out of this stream with `sed -n '/^  all/p'`, which anchors
+            # on exactly two spaces, so these lines must not begin that way or they
+            # would be read as extra arm rows in the table.
+            for r in row["per_complex"]:
+                ed = r.get("energy_delta")
+                vd = r.get("validity_delta")
+                eds = "       -" if ed is None else f"{ed:+8.2f}"
+                vds = "      -" if vd is None else f"{vd:+7.3f}"
+                dirs = r.get("directions_measured")
+                flag = " [1 direction]" if dirs == 1 else ""
+                print(f"    {r['parent_id']:<28} {eds} {vds}  "
+                      f"draws={r.get('n_draws', '-'):<4} "
+                      f"ref_valid={r.get('ref_valid', '-'):<4} "
+                      f"{r['status']}{flag}")
 
     print("\n  dG REU     selected candidate's median energy minus the peptide's, both")
     print("             over the held-out folds. Negative = the search's pick is better.")

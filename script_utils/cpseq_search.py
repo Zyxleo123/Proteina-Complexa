@@ -50,6 +50,7 @@ import sys
 import threading
 import time
 from collections import defaultdict
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
 import pandas as pd
@@ -57,6 +58,9 @@ import pandas as pd
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from proteinfoundation.cpseq.retention import TIERS as RETENTION_TIERS  # noqa: E402
+from proteinfoundation.cpseq.adapters.boltz_chunkfix import (  # noqa: E402
+    ensure_patched_boltz,
+)
 from proteinfoundation.cpseq.evaluate import (  # noqa: E402
     SCORING_PROTOCOL_VERSION,
     prefetch_predictions,
@@ -65,7 +69,9 @@ from proteinfoundation.cpseq.evaluate import (  # noqa: E402
     TargetContext,
     evaluate,
     load_target_contexts,
+    prediction_cached,
     scoring_behaviour,
+    single_fold_views,
 )
 from proteinfoundation.cpseq.search import (  # noqa: E402
     ARM_GUIDED,
@@ -201,8 +207,60 @@ def cohort_scoring_version(cohort: dict) -> str:
     return version
 
 
+# The cost model, MEASURED and fully separated. T(n, ds) = F + n*(K + ds*s) with:
+#
+#   F = 23.2 s   per INVOCATION  -- process spawn, torch import, the 2.2 GB checkpoint
+#   K = 11.5 s   per INPUT       -- the trunk: template, MSA, pairformer, recycling+1
+#   s =  8.0 s   per SAMPLE      -- one diffusion draw
+#
+# Fitted from job 95978 phase 3 on an A6000: A6 (9 inputs, ds=1) 199.0 s against A7
+# (9 inputs, ds=10, patched) 850.5 s gives s and F+9K directly, and the single-input arm
+# splits them. F + K = 34.66 s here against job 95853 phase 1's independent 34.6 s --
+# 0.2% apart, which is the cross-run check that makes the split trustworthy rather than a
+# fit to one run. The earlier 34.6/10.4 pair was the UNBATCHED single-input cost with F
+# and K fused; these supersede it.
+#
+# K is the quantity the collapse saves, (depth-1) times per input. F is saved too but
+# only once per invocation, which is why the speedup falls with batch size: 2.34x at
+# n=9, 2.24x at 17, 2.16x at 65, asymptotically 2.13x.
+COLLAPSE_INVOCATION_S = 23.2
+COLLAPSE_TRUNK_S = 11.5
+COLLAPSE_PER_SAMPLE_S = 8.04
+
+# Fraction of the timeout one invocation may be planned to take. The cost above is a
+# single-input measurement on an A6000 and this queue's cards are mixed, so half leaves
+# room for a slower one rather than discovering it at the timeout.
+COLLAPSE_TIMEOUT_FRACTION = 0.5
+
+
+def collapsed_input_cost_s(diffusion_samples: int) -> float:
+    """Expected seconds for one INPUT at this sample count: its trunk plus its draws.
+
+    Marginal, so it excludes `F` -- that is paid once per invocation, and the caller that
+    sizes a batch adds it once rather than per input.
+    """
+    return COLLAPSE_TRUNK_S + COLLAPSE_PER_SAMPLE_S * diffusion_samples
+
+
+def prefetch_batch_cap(diffusion_samples: int, timeout_s: int) -> int:
+    """How many inputs may share one collapsed invocation.
+
+    A timeout does not degrade gracefully: the invocation returns nothing, the whole
+    batch is lost, and the scoring loop then predicts every one of its folds singly --
+    which throws away exactly the saving the collapse exists for. At depth 10 a 65-input
+    group is ~9000 s against the 7200 s default, so the group that was always safe at
+    ds=1 is not safe collapsed. Never below 1: a cap of 0 would mean "no batching", and
+    one input that cannot fit the timeout still has to be attempted.
+    """
+    budget = COLLAPSE_TIMEOUT_FRACTION * timeout_s - COLLAPSE_INVOCATION_S
+    return max(1, int(budget / collapsed_input_cost_s(diffusion_samples)))
+
+
 def ladder_plan(
-    sequences: list[str], seeds: tuple[int, ...], budgets: tuple[int, ...]
+    sequences: list[str],
+    seeds: tuple[int, ...],
+    budgets: tuple[int, ...],
+    collapse_seeds: bool = False,
 ) -> list[tuple[int, int, str, int]]:
     """Evaluation order as (budget_rung, seed_rank, sequence, seed).
 
@@ -232,6 +290,20 @@ def ladder_plan(
     journal, so a requeued task reproduces it exactly and `journal.has` skips what was
     already paid for, instead of planning fresh work on top of it (the overspend
     recorded in README_CPSEQ_SEARCH_PILOT sec. 5, from the proposer's side).
+
+    `collapse_seeds` emits ONE entry per sequence per rung instead of one per seed, at
+    `seeds[0]`, for a run that buys its depth from `diffusion_samples` in a single
+    invocation rather than from repeated seeds (README_CPSEQ_FOLD_PIPELINE_STANDARD
+    sec. 2). The seed-rank loop disappears because there is nothing left to iterate: the
+    depth is a property of the one prediction, and `single_fold_views` restores the
+    per-fold rows afterwards.
+
+    What that does to the ordering guarantee is worth stating, because it strengthens it
+    rather than weakening it. Uncollapsed, the unit of interruption is one FOLD, so a
+    killed task can leave a draw at 7 of 10 seeds and the rung has to be read at the
+    depth its shallowest draw reached. Collapsed, the unit is one SEQUENCE and its folds
+    are all-or-nothing, so every draw a run holds is at full depth by construction. The
+    rung still closes on a prefix of the draws; it just cannot be ragged inside.
     """
     draws = sequences[1:]
     out: list[tuple[int, int, str, int]] = []
@@ -241,13 +313,40 @@ def ladder_plan(
         if prev == 0:
             # The unchanged peptide, at full depth, before the first rung closes.
             block = sequences[:1] + block
-        for rank in range(len(seeds)):
+        if collapse_seeds:
             for seq in block:
-                out.append((rung, rank, seq, seeds[rank]))
+                out.append((rung, 0, seq, seeds[0]))
+        else:
+            for rank in range(len(seeds)):
+                for seq in block:
+                    out.append((rung, rank, seq, seeds[rank]))
         prev = rung
         if prev >= len(draws):
             break
     return out
+
+
+def _score_one(args: tuple) -> dict:
+    """Evaluate one fold, in a worker process. Module level so it pickles.
+
+    `TargetContext`, `Protocol` and `Store` are plain dataclasses of strings, paths and
+    dicts, so they travel to the worker as data with nothing to rebuild. PyRosetta is
+    initialised lazily inside the scorer, so each process pays that cost once and then
+    scores at full speed.
+
+    Nothing here writes the journal. The record comes back to the parent, which is the
+    only writer -- see the pool in `ladder` for why that is not negotiable.
+    """
+    original, seq, seed, target, protocol, store, skip_invalid = args
+    return evaluate(
+        original_sequence=original,
+        candidate_sequence=seq,
+        target=target,
+        prediction_seed=seed,
+        protocol=protocol,
+        store=store,
+        skip_invalid_relax=skip_invalid,
+    )
 
 
 # --------------------------------------------------------------------------------------
@@ -517,16 +616,35 @@ class Journal:
                     continue
 
     @staticmethod
-    def _key(row: dict) -> tuple[str, int, str, str]:
+    def _key(row: dict) -> tuple[str, int, str, str, int | None]:
         return (
             row["sequence"],
             row["prediction_seed"],
             row.get("stage", "screen"),
             row.get("arm", ""),
+            # The fold's slot inside its prediction, and the reason a collapsed run can
+            # resume against the ~29k rows written before collapse existed.
+            #
+            # A per-seed row is one fold from one prediction and has no slot, so the
+            # field is absent and the component is None -- which is exactly what every
+            # legacy row reads as, so legacy resume is bit-for-bit what it always was.
+            # A collapsed row is fold `k` of a `depth`-sample prediction at the FIRST
+            # seed, so it keys as (seq, seeds[0], stage, arm, k).
+            #
+            # The collision this prevents is the one that matters: without the slot, a
+            # collapsed fold at seeds[0] would key identically to the legacy single fold
+            # at seeds[0], `has` would report it done, and the run would write one fold
+            # where the plan asked for `depth` -- a ladder rung reported at full depth
+            # and holding one draw of the noise. The two regimes now simply never
+            # satisfy each other, so a mixed-regime complex re-folds what it has not
+            # paid for and skips what it has.
+            row.get("fold_index"),
         )
 
-    def has(self, sequence: str, seed: int, stage: str, arm: str) -> bool:
-        return (sequence, seed, stage, arm) in self.done
+    def has(
+        self, sequence: str, seed: int, stage: str, arm: str, fold_index: int | None = None
+    ) -> bool:
+        return (sequence, seed, stage, arm, fold_index) in self.done
 
     def arms_with_input_hash(self, ihash: str | None, arm: str) -> list[str]:
         """Other arms that already paid for this exact prediction."""
@@ -611,6 +729,14 @@ def outcome_row(
         "substitution_budget": rec.get("substitution_budget"),
         "identity_to_original": rec.get("identity_to_original"),
         "prediction_seed": rec.get("prediction_seed"),
+        # Set only on a collapsed run, where one prediction supplies several folds. None
+        # on a per-seed row, which is what makes it the journal key's back-compatible
+        # component -- see `Journal._key`.
+        "fold_index": rec.get("fold_index"),
+        "n_folds_sharing_prediction": rec.get("n_folds_sharing_prediction"),
+        # The undivided prediction cost, kept beside the per-fold share so the lever's
+        # saving is readable from the rows instead of being inferred from job wall time.
+        "prediction_runtime_shared_s": rec.get("prediction_runtime_shared_s"),
         "chemistry": rec.get("chemistry"),
         "status": rec.get("status"),
         "technical_failure": bool(rec.get("technical_failure", False)),
@@ -1314,6 +1440,22 @@ def cmd_ladder_cohort(args) -> int:
         # is not comparable fold-for-fold with one without, and the journal key carries no
         # inference settings, so the two must live in separate output directories.
         "use_potentials": bool(args.use_potentials),
+        # Where this cohort's fold depth comes from: `seed_depth` invocations, or one
+        # invocation drawing `seed_depth` diffusion samples from a single trunk
+        # (README_CPSEQ_FOLD_PIPELINE_STANDARD sec. 2).
+        #
+        # On the cohort and not on the `ladder` command line, for the same reason as
+        # `use_potentials` directly above: a shard that disagreed with its cohort would
+        # write folds that are not comparable to the rest, and nothing downstream would
+        # notice. Here that matters more than usual, because the two regimes also key
+        # APART in the journal -- so a disagreeing shard would not even collide loudly,
+        # it would quietly fold the same complex twice under two keys and report both.
+        "collapse_seeds": bool(getattr(args, "collapse_seeds", False)),
+        "chunk_fix": bool(getattr(args, "chunk_fix", False)),
+        "max_parallel_samples": (
+            int(args.max_parallel_samples)
+            if getattr(args, "max_parallel_samples", None) else None
+        ),
         # The protocol every fold of this cohort is scored under. Read back by each
         # stage when it builds its `Protocol`, so a shard cannot drift from its cohort.
         # Validated at cohort-build time (below) rather than on first use, so a typo
@@ -1330,6 +1472,16 @@ def cmd_ladder_cohort(args) -> int:
             "draw of the predictor's noise."
         ),
     }
+    if record["collapse_seeds"] and args.seed_depth > 4 and not record["chunk_fix"]:
+        print(f"[ladder-cohort] REFUSING: --collapse-seeds at depth {args.seed_depth} "
+              f"needs --chunk-fix. Upstream computes the denoiser chunk count as "
+              f"`multiplicity % max_parallel_samples + 1` where it means ceil(/), so at "
+              f"this depth with potentials on the batch size is whatever the remainder "
+              f"happens to be -- one chunk of {3 * args.seed_depth} rather than the "
+              f"batch anyone chose. Refused at cohort-build time because it is a "
+              f"property of the whole run, not of one shard.")
+        return 1
+
     path = out_dir / "cohort.json"
     path.write_text(json.dumps(record, indent=2))
     evals = len(cohort) * (args.draws + 1) * args.seed_depth
@@ -1341,6 +1493,22 @@ def cmd_ladder_cohort(args) -> int:
     print(f"[ladder-cohort] report also truncates the folds to {record['seed_tiers']}")
     print(f"[ladder-cohort] {evals} folds at full depth "
           f"(~{evals * 75 / 3600:.0f} GPU-h at the measured 75 s mean per fold)")
+    if record["collapse_seeds"]:
+        # What the collapse is worth, stated as the bound it actually measured rather
+        # than as a projection. Job 95853 phase 1 solved T = F + K + ds*s on a SINGLE
+        # input: s = 10.4 s per sample, F + K = 34.6 s fused. Production already batches
+        # ~17 inputs per invocation, which amortises F but NOT K -- every input still
+        # needs its own trunk -- and phase 3 (A6 against A7), the configuration that
+        # separates F from K, was cut off by the job's time limit. So the per-fold figure
+        # below is the unbatched one: it is an upper bound on the saving, and the real
+        # number is smaller by whatever share of 34.6 s is F. Do not quote it as a
+        # production speedup until phase 3 lands.
+        d = args.seed_depth
+        print(f"[ladder-cohort] collapsed: {evals // d} invocation(s) at "
+              f"diffusion_samples={d} supply those {evals} folds")
+        print(f"    unbatched per-fold bound: {(34.6 + 10.4 * d) / d:.1f} s against "
+              f"45.0 s uncollapsed ({45.0 * d / (34.6 + 10.4 * d):.1f}x) -- an UPPER "
+              f"bound; F and K are still fused, so the batched saving is smaller")
     # Cost per rung, so the stopping decision is informed rather than guessed at.
     prev = 0
     for b in record["budget_rungs"]:
@@ -1482,9 +1650,63 @@ def run_parent_ladder(
     # needs no GPU and can run under `preempt_cpu_qos`. Changes no result -- the caches
     # are keyed identically either way -- only who pays for what.
     predict_only: bool = False,
+    # Score this complex's folds in N worker processes instead of one. The existing
+    # parallelism is per PARENT (`cohort[shard_index::shard_count]`), which gives a task
+    # that holds a SINGLE complex no parallelism at all -- and that is exactly the shape
+    # of the potentials and fill-sweep arrays, one complex per array task, where the
+    # measured 2.1 h of serial Rosetta per complex is the whole tail. See the pool below.
+    score_workers: int = 1,
+    # Passed through to `evaluate`. Off by default; it changes what the skipped rows
+    # carry, so it is the caller's decision and is recorded on every row.
+    skip_invalid_relax: bool = False,
+    # Buy the fold depth from one invocation's `diffusion_samples` instead of from
+    # `len(seeds)` invocations -- README_CPSEQ_FOLD_PIPELINE_STANDARD sec. 2. The trunk
+    # is deterministic at inference, so the seeds were recomputing a bit-identical
+    # template/MSA/pairformer pass `depth` times and perturbing only the diffusion noise.
+    # Off by default, and it must be: it is a NEW-RUN lever, not a resume one. An
+    # existing complex's rows are per-seed and a collapsed run keys apart from them
+    # (`Journal._key`), so turning it on mid-corpus does not corrupt anything -- it
+    # re-folds that complex from scratch at its own key, which is a cost, not an error.
+    collapse_seeds: bool = False,
 ) -> dict:
     """One parent's draws, each folded at every seed, in prefix-safe order."""
     journal = Journal(out_dir, parent_id)
+    # The depth has to come from somewhere, and collapsed it comes from the predictor's
+    # sample count. A mismatch here is the quiet failure the whole lever has to avoid:
+    # the plan would ask for one entry per sequence while the prediction returned fewer
+    # structures than the cohort's depth, and every rung would report at a depth it never
+    # reached. Checked before any GPU time is spent rather than discovered in the report.
+    if collapse_seeds and protocol.diffusion_samples != len(seeds):
+        raise ValueError(
+            f"collapse_seeds needs diffusion_samples == len(seeds): got "
+            f"diffusion_samples={protocol.diffusion_samples} against {len(seeds)} seed(s). "
+            f"The collapsed run buys its depth from the sample count, so the two are the "
+            f"same number by construction."
+        )
+    # The chunk count is a remainder, not a quotient, so raising `diffusion_samples`
+    # without the correction hands the denoiser a batch nobody chose -- at depth 10 with
+    # potentials on, one chunk of 30 instead of two of 15. See `boltz_chunkfix`.
+    if collapse_seeds and protocol.diffusion_samples > 4 and not protocol.chunk_fix:
+        raise ValueError(
+            f"collapse_seeds at diffusion_samples={protocol.diffusion_samples} needs "
+            f"chunk_fix: upstream computes the chunk count as "
+            f"`multiplicity % max_parallel_samples + 1`, so the batch size at this depth "
+            f"is an accident of the remainder. Pass --chunk-fix."
+        )
+
+    def _outstanding(seq_: str, seed_: int, arm_: str) -> bool:
+        """Does this plan entry still owe work?
+
+        One predicate for every "is this done?" in the function -- the prefetch grouping,
+        the predict-only count, the worker pool's queue and the writer loop -- because a
+        plan entry means one fold uncollapsed and `depth` folds collapsed, and a reader
+        that checked only the first fold would call a half-written sequence finished.
+        """
+        if collapse_seeds:
+            return not all(
+                journal.has(seq_, seed_, STAGE_LADDER, arm_, k) for k in range(len(seeds))
+            )
+        return not journal.has(seq_, seed_, STAGE_LADDER, arm_)
     original = target.reference_sequence
     alpha = default_alphabet(allow_cys=protocol.allow_cys)
     summary = {
@@ -1591,9 +1813,15 @@ def run_parent_ladder(
             "generator": None, "edit_mask": None, "draw_index": idx,
         })
 
-    plan = ladder_plan(plan_seqs, seeds, budgets)
+    plan = ladder_plan(plan_seqs, seeds, budgets, collapse_seeds=collapse_seeds)
     print(f"  [{parent_id}] {len(props)} draws + reference, L={len(original)}, "
           f"budget={budget_for(len(original))}, {len(plan)} evaluations planned")
+    if collapse_seeds:
+        summary["collapse_seeds"] = True
+        summary["collapsed_depth"] = len(seeds)
+        print(f"  [{parent_id}] collapsed trunk: {len(plan)} prediction(s) at "
+              f"diffusion_samples={protocol.diffusion_samples} supply "
+              f"{len(plan) * len(seeds)} fold(s)")
 
     # Predict a whole seed's worth of sequences in one boltz invocation.
     #
@@ -1612,12 +1840,30 @@ def run_parent_ladder(
         by_seed: dict[int, list[str]] = defaultdict(list)
         for _rung, _rank, s_, sd_ in plan:
             arm_ = by_seq[s_][1]
-            if not journal.has(s_, sd_, STAGE_LADDER, arm_):
+            if _outstanding(s_, sd_, arm_):
                 by_seed[sd_].append(s_)
-        def _prefetch_seed(sd_: int) -> None:
-            group = by_seed.get(sd_) or []
-            if len(group) < 2:
-                return          # nothing to amortise over
+        # How many inputs may share one invocation.
+        #
+        # Uncollapsed this is the whole group, as it has always been. Collapsed, each
+        # input costs `K + depth*s` instead of `K + s` -- about 139 s at depth 10 against
+        # 45 s -- so the group that comfortably fitted the 7200 s timeout no longer does:
+        # 65 inputs x 139 s is ~9000 s, and the timeout does not degrade gracefully. It
+        # would burn two GPU-hours, return NOTHING, and leave the loop below to predict
+        # all 65 one at a time -- throwing away the whole saving the collapse exists for.
+        #
+        # So a collapsed group is split into invocations sized to half the timeout, on
+        # the measured per-sample cost. Splitting costs one `F` per extra invocation
+        # (~34.6 s against a ~2900 s batch, about 1%) and buys a failure mode that loses
+        # one sub-batch instead of the lot. Half rather than all of the timeout because
+        # the per-input cost is a single-input measurement and the queue's cards are not
+        # all A6000s.
+        per_input_s = collapsed_input_cost_s(protocol.diffusion_samples)
+        batch_cap = (
+            prefetch_batch_cap(protocol.diffusion_samples, protocol.timeout_s)
+            if collapse_seeds else 0
+        )
+
+        def _prefetch_group(sd_: int, group: list[str], tag: str) -> None:
             t0 = time.time()
             try:
                 res = prefetch_predictions(
@@ -1630,13 +1876,13 @@ def run_parent_ladder(
                 # each fold itself, exactly as every run before 2026-10-25 did.
                 res = {"status": f"batch_error: {type(e).__name__}: {e}"[:200],
                        "requested": len(group), "produced": 0}
-                print(f"  [{parent_id}] batch seed={sd_} failed ({res['status']}); "
+                print(f"  [{parent_id}] batch seed={sd_}{tag} failed ({res['status']}); "
                       f"falling back to one prediction per fold")
             summary.setdefault("batches", []).append(
                 {"seed": sd_, **{k: v for k, v in res.items() if k != "status"},
                  "status": res.get("status")}
             )
-            print(f"  [{parent_id}] batch seed={sd_}: {res.get('produced')}"
+            print(f"  [{parent_id}] batch seed={sd_}{tag}: {res.get('produced')}"
                   f"/{res.get('requested')} structure(s) in one invocation, "
                   f"{time.time() - t0:.0f}s")
             if res.get("produced", 0) < res.get("requested", 0):
@@ -1644,7 +1890,31 @@ def run_parent_ladder(
                 for line in tail[-4:]:
                     print(f"      boltz: {line[:200]}")
 
-        if not prefetch_ahead:
+        def _prefetch_seed(sd_: int) -> None:
+            group = by_seed.get(sd_) or []
+            if len(group) < 2:
+                return          # nothing to amortise over
+            if not batch_cap or len(group) <= batch_cap:
+                _prefetch_group(sd_, group, "")
+                return
+            chunks = [group[i:i + batch_cap] for i in range(0, len(group), batch_cap)]
+            print(f"  [{parent_id}] seed={sd_}: {len(group)} input(s) at "
+                  f"ds={protocol.diffusion_samples} (~{per_input_s:.0f}s each) split "
+                  f"into {len(chunks)} invocation(s) of <={batch_cap}, to stay inside "
+                  f"the {protocol.timeout_s}s timeout")
+            for i, chunk in enumerate(chunks):
+                _prefetch_group(sd_, chunk, f" [{i + 1}/{len(chunks)}]")
+
+        # A predict-only pass must prefetch in THIS thread. The overlap below hands the
+        # prefetch to a daemon thread and relies on the scoring loop to wait on it seed
+        # by seed -- but predict-only returns before that loop, so the thread is
+        # abandoned at process exit and the pass prints "predictions cached" having
+        # predicted almost nothing. That is what emptied the fill-sweep's collapse
+        # cohort: every task finished in ~30 s, 8 of 10 score tasks then hit the
+        # no-predictions gate, and the 2 that ran tried to predict on a CPU node and
+        # died with "No supported gpu backend found!". There is also nothing to overlap
+        # with in this mode, so sequential costs nothing.
+        if not prefetch_ahead or predict_only:
             for sd_ in seeds:
                 _prefetch_seed(sd_)
         else:
@@ -1698,13 +1968,101 @@ def run_parent_ladder(
         # otherwise would be a fold that never happened.
         n_pending = sum(
             1 for _r, _k, s_, sd_ in plan
-            if not journal.has(s_, sd_, STAGE_LADDER, by_seq[s_][1])
+            if _outstanding(s_, sd_, by_seq[s_][1])
         )
         summary["predict_only"] = True
         summary["folds_left_to_score"] = n_pending
         print(f"  [{parent_id}] predict-only: predictions cached, {n_pending} fold(s) "
               f"left for the scoring pass (re-run without --predict-only)")
         return summary
+
+    # --- score-ahead pool -------------------------------------------------------------
+    #
+    # Why a pool and not more shards: the shard axis is the PARENT list, so a task that
+    # was handed one complex cannot be split further that way, and the potentials and
+    # fill-sweep arrays are one complex per task by design -- the journal is per complex
+    # and two processes appending to it would interleave rows that cost a GPU-hour to
+    # replace. Measured on this cluster: concurrent O_APPEND to one file NUL-corrupts
+    # rows. So the workers SCORE and the parent WRITES, and that division is the whole
+    # point: the records come back over a pipe and the journal keeps its single writer.
+    #
+    # The parent still consumes in plan order, so the prefix-safe ordering the ladder
+    # depends on is unchanged, and so are `limit`, the rung printing and the consecutive-
+    # failure abort. A pooled fold is simply one whose record was already computed by the
+    # time the writer reached it.
+    #
+    # Only folds whose prediction is ALREADY on disk are handed out. `GPU_LOCK` is a lock
+    # within one process and cannot serialise N of them, so a pool that met a missing
+    # prediction would put several boltz invocations on one card at once. Those folds get
+    # a `None` sentinel and the writer predicts them itself, serially, as before. This is
+    # therefore a scoring-pass accelerator: pair it with a `--predict-only` pass.
+    scored_ahead: dict[tuple[str, int], dict | None] = {}
+    scored_lock = threading.Lock()
+    stop_pool = threading.Event()
+    pool_thread = None
+    if score_workers > 1 and not dry_run and not predict_only:
+        pending = [
+            (seq, seed) for _r, _k, seq, seed in plan
+            if _outstanding(seq, seed, by_seq[seq][1])
+        ]
+        # Never hold more finished records ahead of the writer than this. They are small,
+        # but running arbitrarily far ahead of a writer that may stop at `limit` would
+        # pay for folds nobody asked for.
+        window = max(2 * score_workers, 16)
+
+        def _pool_worker() -> None:
+            try:
+                with ProcessPoolExecutor(max_workers=score_workers) as ex:
+                    for start in range(0, len(pending), score_workers):
+                        if stop_pool.is_set():
+                            return
+                        while not stop_pool.is_set():
+                            with scored_lock:
+                                if len(scored_ahead) < window:
+                                    break
+                            time.sleep(0.5)
+                        futs = {}
+                        for seq_, seed_ in pending[start:start + score_workers]:
+                            if not prediction_cached(
+                                candidate_sequence=seq_, target=target,
+                                prediction_seed=seed_, protocol=protocol, store=store,
+                            ):
+                                # The writer will predict this one itself.
+                                with scored_lock:
+                                    scored_ahead[(seq_, seed_)] = None
+                                continue
+                            futs[ex.submit(_score_one, (
+                                original, seq_, seed_, target, protocol, store,
+                                skip_invalid_relax,
+                            ))] = (seq_, seed_)
+                        for fut, key in futs.items():
+                            try:
+                                rec = fut.result()
+                            except Exception as exc:  # noqa: BLE001
+                                # A worker that died owes the writer an answer, or the
+                                # writer waits on a key nobody will ever set and the task
+                                # hangs until Slurm kills it. `None` means "score it
+                                # yourself", which is correct and merely slower.
+                                print(f"  [{parent_id}] score worker failed on "
+                                      f"{key[0]} seed={key[1]}: "
+                                      f"{type(exc).__name__}: {exc}; "
+                                      f"the writer will score it")
+                                rec = None
+                            with scored_lock:
+                                scored_ahead[key] = rec
+            finally:
+                # Every pending fold owes an answer, for the same reason as above.
+                with scored_lock:
+                    for key in pending:
+                        scored_ahead.setdefault(key, None)
+
+        pool_thread = threading.Thread(
+            target=_pool_worker, name=f"score-{parent_id}", daemon=True
+        )
+        pool_thread.start()
+        summary["score_workers"] = score_workers
+        print(f"  [{parent_id}] scoring in {score_workers} worker process(es) "
+              f"({len(pending)} fold(s) pending)")
 
     done_rung = 0
     consecutive_failures = 0
@@ -1714,7 +2072,11 @@ def run_parent_ladder(
             done_rung = rung
             print(f"  [{parent_id}] --- ladder rung B={rung} "
                   f"(draws up to {rung}, {len(seeds)} folds each) ---")
-        if journal.has(seq, seed, STAGE_LADDER, arm):
+        # Collapsed, one plan entry owes `depth` folds, so "done" is all of them. A
+        # partially written sequence -- a task killed between the prediction and the
+        # last row -- re-enters here, hits the prediction cache and writes only the
+        # rows it is missing.
+        if not _outstanding(seq, seed, arm):
             continue
         if dry_run:
             print(f"    [dry] draw={draw_index} seed={seed} (rank {rank}) {seq}")
@@ -1744,41 +2106,78 @@ def run_parent_ladder(
                     summary.get("prefetch_wait_s", 0.0) + time.time() - t_wait, 1
                 )
 
-        rec = evaluate(
-            original_sequence=original, candidate_sequence=seq, target=target,
-            prediction_seed=seed, protocol=protocol, store=store,
-        )
-        row = outcome_row(
-            rec=rec, proposal=proposal, parent_id=parent_id, arm=arm,
-            stage=STAGE_LADDER,
-            extra={
-                # The report truncates BOTH axes to a prefix, so each row has to say
-                # where it sits on each: which draw of the stream it is, and which fold
-                # of that draw. Recovering either by looking a seed up in a constant
-                # would silently mis-order any row written under a different seed list.
-                "draw_index": draw_index,
-                "seed_rank": rank,
-                # The rung this fold was paid for under. Not a property of the fold --
-                # the same fold belongs to every rung above it too -- but it records
-                # the order the run bought them in, which is what makes a cut-off run
-                # legible.
-                "budget_rung": rung,
-                "n_draws_planned": n_draws,
-                "shared_evaluation_with_arms": journal.arms_with_input_hash(
-                    rec.get("input_hash"), arm
-                ),
-            },
-        )
-        journal.add_outcome(row)
-        summary["evaluations"] += 1
-        if row.get("cache_prediction") == "hit":
-            summary["cache_hits"] += 1
-        print(
-            f"    draw={draw_index:>3} seed={seed} r{rank:<2} n_mut={row['n_mutations']} "
-            f"{seq} -> {'VALID' if row['valid'] else row['status']} "
-            f"dG={row.get('best_valid_dG_separated')} "
-            f"viol={row.get('min_violation')} {row.get('wall_time_s')}s"
-        )
+        # Take the pool's record for this fold if there is one. The wait is bounded by
+        # the pool always answering for every pending fold -- with a record or with the
+        # `None` that means "score it yourself" -- so this cannot park on a key that
+        # never arrives.
+        rec = None
+        if pool_thread is not None:
+            while True:
+                with scored_lock:
+                    if (seq, seed) in scored_ahead:
+                        rec = scored_ahead.pop((seq, seed))
+                        break
+                if not pool_thread.is_alive():
+                    break
+                time.sleep(0.2)
+        if rec is None:
+            rec = evaluate(
+                original_sequence=original, candidate_sequence=seq, target=target,
+                prediction_seed=seed, protocol=protocol, store=store,
+                skip_invalid_relax=skip_invalid_relax,
+            )
+        # One evaluation, one row -- except collapsed, where one evaluation IS the depth
+        # and each of its samples is a fold of its own. `single_fold_views` is what keeps
+        # the row axis per-fold; see its docstring for why the ladder's statistics
+        # require that and not an aggregate row.
+        views = single_fold_views(rec) if collapse_seeds else [rec]
+        row = None
+        for view in views:
+            fold_index = view.get("fold_index")
+            if collapse_seeds and fold_index is not None:
+                if journal.has(seq, seed, STAGE_LADDER, arm, fold_index):
+                    continue
+            row = outcome_row(
+                rec=view, proposal=proposal, parent_id=parent_id, arm=arm,
+                stage=STAGE_LADDER,
+                extra={
+                    # The report truncates BOTH axes to a prefix, so each row has to say
+                    # where it sits on each: which draw of the stream it is, and which fold
+                    # of that draw. Recovering either by looking a seed up in a constant
+                    # would silently mis-order any row written under a different seed list.
+                    "draw_index": draw_index,
+                    # The fold axis, and the one field that lets every existing reader --
+                    # `cpseq_ladder_report.py`'s `by_rank`, its `k`-of-`n` reliability
+                    # rule, its held-out half, and the completeness count below -- read a
+                    # collapsed run with no change at all. Uncollapsed it is the seed's
+                    # rank in the cohort's seed list; collapsed it is the sample's index
+                    # within the one prediction. Both are "which fold of this draw",
+                    # which is the only thing any of those readers asks of it.
+                    "seed_rank": rank if fold_index is None else fold_index,
+                    # The rung this fold was paid for under. Not a property of the fold --
+                    # the same fold belongs to every rung above it too -- but it records
+                    # the order the run bought them in, which is what makes a cut-off run
+                    # legible.
+                    "budget_rung": rung,
+                    "n_draws_planned": n_draws,
+                    "shared_evaluation_with_arms": journal.arms_with_input_hash(
+                        view.get("input_hash"), arm
+                    ),
+                },
+            )
+            journal.add_outcome(row)
+            summary["evaluations"] += 1
+            if row.get("cache_prediction") == "hit":
+                summary["cache_hits"] += 1
+            print(
+                f"    draw={draw_index:>3} seed={seed} "
+                f"r{row.get('seed_rank'):<2} n_mut={row['n_mutations']} "
+                f"{seq} -> {'VALID' if row['valid'] else row['status']} "
+                f"dG={row.get('best_valid_dG_separated')} "
+                f"viol={row.get('min_violation')} {row.get('wall_time_s')}s"
+            )
+        if row is None:
+            continue
 
         # Stop on a run of technical failures instead of marching through the plan.
         #
@@ -1803,6 +2202,14 @@ def run_parent_ladder(
                 break
         else:
             consecutive_failures = 0
+
+    # The writer is done, so anything the pool is still working on is work nobody will
+    # record. Signalled on every exit from the loop -- the normal end, `limit`, and the
+    # failure abort alike -- because a daemon thread left running inside a
+    # ProcessPoolExecutor keeps N PyRosetta processes alive and the task does not end.
+    if pool_thread is not None:
+        stop_pool.set()
+        pool_thread.join(timeout=60)
 
     # How far this parent actually got, per depth, so a partial night is legible from the
     # log without rerunning the report.
@@ -1876,9 +2283,46 @@ def cmd_ladder(args) -> int:
             return 1
     gate = recorded or gate_sha256(tol_path)
 
+    # All three from the cohort, for the reason the `use_potentials` comment below gives.
+    collapse_seeds = bool(cohort.get("collapse_seeds", False))
+    chunk_fix = bool(cohort.get("chunk_fix", False))
+    max_parallel_samples = cohort.get("max_parallel_samples")
+
+    # Collapsed, the sample count IS the fold depth, so it comes from the cohort's seed
+    # list and `--samples` has nothing left to say. Refuse rather than silently override:
+    # a shard asked for depth 4 while its cohort says 10 is a shard that would report
+    # rungs at a depth they never reached, and that is worth stopping for.
+    diffusion_samples = args.samples
+    if collapse_seeds:
+        if args.samples not in (1, len(seeds)):
+            print(f"[ladder] REFUSING: this cohort is collapsed, so its fold depth is "
+                  f"its sample count ({len(seeds)}), but --samples {args.samples} was "
+                  f"passed. Drop --samples, or pass --samples {len(seeds)}.")
+            return 1
+        diffusion_samples = len(seeds)
+
+    chunk_fix_root = None
+    if chunk_fix:
+        # Built here, once per task, before any fold: a shadow that failed to build must
+        # stop the shard rather than let it predict unpatched under a key that claims
+        # otherwise. `ensure_patched_boltz` reuses a verified build, so the 47 MB copy is
+        # paid once per node-filesystem and not once per complex.
+        try:
+            rec = ensure_patched_boltz(
+                python_exec=args.boltz_python,
+                cache_root=Path(args.chunk_fix_cache or (out_dir / "_chunkfix")),
+            )
+        except Exception as exc:  # noqa: BLE001
+            print(f"[ladder] REFUSING: chunk_fix is on for this cohort but the patched "
+                  f"copy could not be built: {type(exc).__name__}: {exc}")
+            return 1
+        chunk_fix_root = rec["root"]
+        print(f"[ladder] chunk_fix: {rec['sha_before']} -> {rec['sha_after']} at "
+              f"{chunk_fix_root} ({'built' if rec['built'] else 'reused'})")
+
     protocol = Protocol(
         chemistry=args.chemistry,
-        diffusion_samples=args.samples,
+        diffusion_samples=diffusion_samples,
         boltz_python=args.boltz_python,
         boltz_cache=args.boltz_cache,
         allow_cys=bool(cohort.get("allow_cys", False)),
@@ -1887,6 +2331,9 @@ def cmd_ladder(args) -> int:
         # and nothing downstream would notice.
         use_potentials=bool(cohort.get("use_potentials", False)),
         scoring_version=cohort_scoring_version(cohort),
+        max_parallel_samples=max_parallel_samples,
+        chunk_fix=chunk_fix,
+        chunk_fix_root=chunk_fix_root,
     )
     sources = cohort["parent_sources"]
     store = Store(
@@ -1922,6 +2369,11 @@ def cmd_ladder(args) -> int:
     print(f"[ladder] {len(parents)} parent(s) shard {args.shard_index}/{args.shard_count}")
     print(f"[ladder] arm={arm_label}, {n_draws} draws x {len(seeds)} folds, "
           f"ladder rungs B={list(budgets)}")
+    if collapse_seeds:
+        print(f"[ladder] COLLAPSED trunk: each draw is ONE invocation at "
+              f"diffusion_samples={diffusion_samples}, whose samples are written as "
+              f"{len(seeds)} fold rows (seed_rank = sample index). Depth, the k-of-n "
+              f"rule and the held-out half are unchanged.")
     if llm_round:
         print(f"[ladder] folding LLM proposals from rounds 1..{llm_round} under "
               f"{out_dir / 'llm_proposals'}; the random draw stream is not used")
@@ -1965,6 +2417,9 @@ def cmd_ladder(args) -> int:
             proposal_arm=(mask_arm or None),
             proposal_kind=(KIND_MASK_FILL if mask_round else None),
             predict_only=getattr(args, "predict_only", False),
+            score_workers=int(getattr(args, "score_workers", 1) or 1),
+            skip_invalid_relax=getattr(args, "skip_invalid_relax", False),
+            collapse_seeds=collapse_seeds,
         )
         summaries.append(s)
         if s.get("predict_only"):
@@ -2264,6 +2719,41 @@ def main() -> int:
                          "structures themselves, so such a run needs its own --out-dir: "
                          "the journal key carries no inference settings and would treat "
                          "the other setting's folds as already paid for.")
+    lc.add_argument("--collapse-seeds", action="store_true",
+                    help="buy this cohort's fold depth from ONE invocation's diffusion "
+                         "samples instead of from --seed-depth separate invocations. The "
+                         "trunk (template, MSA, pairformer) is deterministic at "
+                         "inference, so folding at N seeds recomputes a bit-identical "
+                         "trunk N times and perturbs only the diffusion noise; measured "
+                         "on an A6000 at nine inputs, 64%% of a per-seed fold is startup "
+                         "plus trunk (14.1 s of 22.1 s), and collapsing depth 10 cost "
+                         "1990 s -> 850 s, a 2.34x speedup (job 95978, whose positional "
+                         "control reproduced its baseline to 0.01%%). Do not quote the "
+                         "earlier 77%%/3.2x pair: both came from single-input arms on a "
+                         "cold GPU, and the saving falls with batch size because the "
+                         "per-invocation cost is paid once while the trunk is per input "
+                         "-- 2.18x at the 38-input prefetch cap, asymptote 2.13x. "
+                         "Each sample becomes a fold row of its own, "
+                         "so the ladder's depth, its k-of-n reliability rule and its "
+                         "held-out half are unchanged. Needs --chunk-fix at a depth "
+                         "above 4. A COHORT setting: a collapsed and an uncollapsed run "
+                         "key apart in the journal, so they need separate --out-dirs.")
+    lc.add_argument("--chunk-fix", action="store_true",
+                    help="shadow the denoiser chunk-count correction in front of the "
+                         "installed boltz. Upstream computes the chunk count as "
+                         "`multiplicity %% max_parallel_samples + 1` where it means "
+                         "ceil(/), so the batch size is an accident of the remainder: at "
+                         "ds=1 with potentials on it is three chunks of ONE, and at ds=40 "
+                         "one chunk of 120. Worth ~10%% on its own at ds=1; it is what "
+                         "makes raising the sample count possible at all. Hashed into "
+                         "the prediction key, because a different batch size is the same "
+                         "computation but not bitwise identical.")
+    lc.add_argument("--max-parallel-samples", type=int, default=None,
+                    help="denoiser batch size (boltz's own default when unset, which is "
+                         "what every fold before 2026-11-03 used). Set it high enough "
+                         "for one chunk; granularity was worth only 6%% at ds=10, so "
+                         "this is a memory-footprint choice rather than a speed one. "
+                         "Hashed into the prediction key.")
     lc.set_defaults(func=cmd_ladder_cohort)
 
     lr = sub.add_parser(
@@ -2306,6 +2796,30 @@ def main() -> int:
                          "key the same caches the same way. Prefer this over "
                          "--prefetch-ahead, which only overlaps the two phases inside "
                          "one GPU job rather than letting them be scheduled apart.")
+    lr.add_argument("--score-workers", type=int, default=1,
+                    help="score this complex's folds in N worker processes. The shard "
+                         "axis is the PARENT list, so a task holding ONE complex -- the "
+                         "shape of the potentials and fill-sweep arrays -- gets no "
+                         "parallelism from sharding, and its Rosetta phase is strictly "
+                         "serial. Measured on llm_ladder: 29.6 s median per fold scored "
+                         "against 37.8 s predicted, so scoring is 54%% of that run's "
+                         "327 job-hours. The workers score and the PARENT writes, so the "
+                         "per-complex journal keeps its single writer. Only folds whose "
+                         "prediction is already on disk are handed out, because GPU_LOCK "
+                         "cannot serialise separate processes -- so pair this with a "
+                         "--predict-only pass rather than running it on a GPU job.")
+    lr.add_argument("--skip-invalid-relax", action="store_true",
+                    help="under a prerelax-gated protocol (v3), skip both FastRelax runs "
+                         "on folds the pre-relax verdict has already failed. Measured on "
+                         "llm_ladder: 60.9%% of folds are invalid and 58.2%% of scoring "
+                         "hours went to relaxing them, and the refined energy of an "
+                         "invalid fold can never reach the gate or "
+                         "best_valid_dG_separated. NOT free: a skipped row has no "
+                         "refined energy, no deformation proxy and no prerelax-to-"
+                         "postrelax gap, so it cannot be rescored to v4/v5. The score "
+                         "record marks itself `relax_skipped`, and a later pass without "
+                         "this flag treats such a record as a MISS and relaxes it "
+                         "properly rather than reading it as done.")
     lr.add_argument("--prefetch-ahead", action="store_true",
                     help="fold the next seed on a background thread while this one is "
                          "being scored. A task currently folds every seed and only then "
@@ -2332,6 +2846,11 @@ def main() -> int:
                          "later round extends the prefix rather than renumbering it. "
                          "Everything else -- fold depth, gate, evaluator, report -- is "
                          "unchanged, which is what makes the two arms comparable.")
+    lr.add_argument("--chunk-fix-cache", default=None,
+                    help="where to build the chunk-fix shadow package, for a cohort "
+                         "that asked for it. Defaults to `<out-dir>/_chunkfix`. Point it "
+                         "at node-local scratch if the shared filesystem is the "
+                         "bottleneck; the build is ~47 MB, verified by sha and reused.")
     lr.set_defaults(func=cmd_ladder)
 
     r = sub.add_parser("report")

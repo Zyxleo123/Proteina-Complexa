@@ -1,15 +1,13 @@
 #!/usr/bin/env bash
 #SBATCH --job-name=cpseq_ladder
-#SBATCH --partition=preempt
-#SBATCH --account=bapoczos
-#SBATCH --qos=preempt_qos
-#SBATCH --gres=gpu:1
+#SBATCH --partition=general
+#SBATCH --gres=gpu:a6000:1
 #SBATCH --cpus-per-task=2
 #SBATCH --mem=32G
 #SBATCH --time=8:00:00
 #SBATCH --requeue
 #SBATCH --open-mode=append
-#SBATCH --output=/home/yixiz/slurm_logs/cpseq_ladder_%x_%A_%a.out
+#SBATCH --output=/zfsauton/scratch/yixiz/cpseq_af3/logs/cpseq_ladder_%x_%A_%a.out
 #
 # The seed ladder: every random draw, and the unchanged cyclized peptide, folded at the
 # SAME ten seeds.
@@ -69,7 +67,7 @@ for arg in "$@"; do
 done
 if [ -f "$REPO/.env" ]; then set -a; source "$REPO/.env"; set +a; fi
 
-OUT_DIR="${OUT_DIR:-/data/user_data/yixiz/cpseq/seed_ladder}"
+OUT_DIR="${OUT_DIR:-/zfsauton/scratch/yixiz/cpseq/seed_ladder}"
 SHARD_COUNT="${SHARD_COUNT:-1}"
 # An array task id wins when present; otherwise an explicit SHARD_INDEX lets a single
 # non-array job take a specific shard. Without the fallback every non-array submission
@@ -77,8 +75,37 @@ SHARD_COUNT="${SHARD_COUNT:-1}"
 SHARD_INDEX="${SLURM_ARRAY_TASK_ID:-${SHARD_INDEX:-0}}"
 LIMIT="${LIMIT:-0}"
 SAMPLES="${SAMPLES:-1}"
+# Where the chunk-fix shadow package is built, for a cohort whose `chunk_fix` is set.
+# Defaults to the out-dir, which is already on scratch; the build is ~47 MB, verified by
+# sha and shared between tasks, so every shard after the first reuses it.
+# A cohort without `chunk_fix` never reads this.
+CHUNK_FIX_CACHE="${CHUNK_FIX_CACHE:-}"
 CHEMISTRY="${CHEMISTRY:-mainchain}"
 PARENTS="${PARENTS:-}"
+# A file of parent ids, one per line, from which THIS array task takes exactly one (its
+# line). Default empty, so every existing submission keeps the stride-sharding below and
+# nothing about the certified fold path changes.
+#
+# It exists because a stride shard is the wrong unit when the complex set is a chosen
+# SUBSET rather than the whole cohort: `cpseq_search.py ladder` reads
+# `cohort[shard_index::shard_count]`, so asking for "the 10 complexes that have a
+# baseline" by stride is not expressible, while `--parents` (which overrides the stride
+# entirely) takes one name. One task per complex is also the only safe unit -- two
+# processes appending to one complex's journal interleave rows.
+PARENTS_FILE="${PARENTS_FILE:-}"
+if [ -z "$PARENTS" ] && [ -n "$PARENTS_FILE" ]; then
+  [ -f "$PARENTS_FILE" ] || { echo "FATAL: no PARENTS_FILE at $PARENTS_FILE" >&2; exit 1; }
+  # Blank lines and # comments skipped, so the file can carry its own provenance.
+  _LINE=$(grep -v '^[[:space:]]*#' "$PARENTS_FILE" | grep -v '^[[:space:]]*$' \
+          | sed -n "$(( ${SLURM_ARRAY_TASK_ID:-0} + 1 ))p")
+  if [ -z "$_LINE" ]; then
+    echo "=== cpseq_ladder: array task ${SLURM_ARRAY_TASK_ID:-0} is past the end of"
+    echo "    $PARENTS_FILE -- nothing to fold. Exiting 0 so that an array sized larger"
+    echo "    than the parent list does not strand its dependents."
+    exit 0
+  fi
+  PARENTS="$_LINE"
+fi
 # Ten folds per draw is ten times the structures. `rescorable` keeps the gzipped raw
 # complex, so a scoring-protocol change can still re-score without re-folding -- the one
 # property worth paying storage for -- at ~50 KB per fold instead of ~1.31 MB.
@@ -106,14 +133,15 @@ PREFETCH_AHEAD="${PREFETCH_AHEAD:-0}"
 # three quarters of this GPU job's wall time is Rosetta with the card idle.
 PREDICT_ONLY="${PREDICT_ONLY:-0}"
 PY="${PYTHON_EXEC:-$REPO/.venv/bin/python}"
-BOLTZ_PY="${BOLTZ_PYTHON:-/data/user_data/yixiz/envs/boltz2/.venv/bin/python}"
-BOLTZ_CACHE="${BOLTZ_CACHE:-/data/user_data/yixiz/boltz_cache}"
+BOLTZ_PY="${BOLTZ_PYTHON:-/zfsauton/scratch/yixiz/envs/boltz2/.venv/bin/python}"
+BOLTZ_CACHE="${BOLTZ_CACHE:-/zfsauton/scratch/yixiz/boltz_cache}"
 
 echo "=== cpseq_ladder ==="
 echo "node:      $(hostname)"
 echo "job:       ${SLURM_JOB_ID:-local}  array_task=${SLURM_ARRAY_TASK_ID:-none}"
 echo "request:   cpus=${SLURM_CPUS_PER_TASK:-?} mem=${SLURM_MEM_PER_NODE:-?}M gpu=${CUDA_VISIBLE_DEVICES:-none}"
 echo "shard:     ${SHARD_INDEX}/${SHARD_COUNT}  retention=$RETENTION  limit=$LIMIT"
+[ -n "$PARENTS" ] && echo "parents:   $PARENTS${PARENTS_FILE:+  (line $(( ${SLURM_ARRAY_TASK_ID:-0} + 1 )) of $PARENTS_FILE)}"
 echo "mode:      $([ "$PREDICT_ONLY" = "0" ] && echo 'predict+score' || echo 'PREDICT ONLY (score separately on CPU)')"
 echo "prefetch:  $([ "$PREFETCH_AHEAD" = "0" ] && echo 'sequential (fold all, then score)' || echo 'ahead (fold next seed while scoring)')"
 if [ -n "$MASK_ARM" ] && [ "$MASK_ROUND" != "0" ]; then
@@ -147,6 +175,7 @@ srun "$PY" -u script_utils/cpseq_search.py ladder \
   --limit "$LIMIT" \
   --boltz-python "$BOLTZ_PY" \
   --boltz-cache "$BOLTZ_CACHE" \
+  ${CHUNK_FIX_CACHE:+--chunk-fix-cache "$CHUNK_FIX_CACHE"} \
   "${EXTRA[@]}"
 
 echo "=== cpseq_ladder OK (shard ${SHARD_INDEX}) ==="

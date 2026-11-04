@@ -76,6 +76,12 @@ CHEMISTRY="${CHEMISTRY:-mainchain}"
 PARENTS="${PARENTS:-}"
 RETENTION="${RETENTION:-full}"
 LLM_ROUND="${LLM_ROUND:-0}"
+# Arms E/F/G, mirroring cpseq_ladder.sbatch: MASK_ARM names which arm's folds to score
+# and MASK_ROUND how many proposal rounds, read from the same OUT_DIR the predict pass
+# used. Mutually exclusive with LLM_ROUND (cpseq_search.py enforces). Without these the
+# score pass could only score the llm_search / random arms, never a mask arm's folds.
+MASK_ARM="${MASK_ARM:-}"
+MASK_ROUND="${MASK_ROUND:-0}"
 PY="${PYTHON_EXEC:-$REPO/.venv/bin/python}"
 # Still passed, and still unused: with every prediction a cache hit, the adapter is
 # never invoked. Kept so the two passes are configured identically and a missing
@@ -88,13 +94,21 @@ echo "node:      $(hostname)"
 echo "job:       ${SLURM_JOB_ID:-local}  array_task=${SLURM_ARRAY_TASK_ID:-none}"
 echo "request:   cpus=${SLURM_CPUS_PER_TASK:-?} mem=${SLURM_MEM_PER_NODE:-?}M gpu=none"
 echo "shard:     ${SHARD_INDEX}/${SHARD_COUNT}  retention=$RETENTION  limit=$LIMIT"
-echo "arm:       $([ "$LLM_ROUND" = "0" ] && echo 'random_control (draw stream)' || echo "llm_search (proposal rounds 1..$LLM_ROUND)")"
+if [ -n "$MASK_ARM" ] && [ "$MASK_ROUND" != "0" ]; then
+  echo "arm:       $MASK_ARM (mask proposal rounds 1..$MASK_ROUND)"
+elif [ "$LLM_ROUND" != "0" ]; then
+  echo "arm:       llm_search (proposal rounds 1..$LLM_ROUND)"
+else
+  echo "arm:       random_control (draw stream)"
+fi
 echo "out_dir:   $OUT_DIR"
 echo "====================================="
 
 EXTRA=()
 [ -n "$PARENTS" ] && EXTRA+=(--parents "$PARENTS")
 [ "$LLM_ROUND" != "0" ] && EXTRA+=(--llm-round "$LLM_ROUND")
+[ -n "$MASK_ARM" ] && EXTRA+=(--mask-arm "$MASK_ARM")
+[ "$MASK_ROUND" != "0" ] && EXTRA+=(--mask-round "$MASK_ROUND")
 
 # No --predict-only and no --prefetch-ahead: this pass scores, and there is nothing to
 # overlap with when every prediction is already on disk.

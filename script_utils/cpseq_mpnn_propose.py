@@ -52,6 +52,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -67,7 +68,15 @@ from proteinfoundation.cpseq import tolerances as tolmod  # noqa: E402
 from proteinfoundation.cpseq.candidates import ONE_TO_THREE  # noqa: E402
 from proteinfoundation.cpseq.search import budget_for, proposal_seed  # noqa: E402
 
-MPNN_DIR = Path("/home/yixiz/Proteina-Complexa/community_models/ProteinMPNN")
+# Resolved from this file's own location, not hardcoded: the checkout lives at a
+# different absolute path on each cluster this project runs on (/home/yixiz/... on babel,
+# /zfsauton2/home/yixiz/... on autonlab), and an absolute path baked in here fails on
+# whichever one it was not written for. `CPSEQ_MPNN_DIR` overrides it for a checkout that
+# keeps the weights elsewhere.
+MPNN_DIR = Path(
+    os.environ.get("CPSEQ_MPNN_DIR")
+    or Path(__file__).resolve().parents[1] / "community_models" / "ProteinMPNN"
+)
 PEPTIDE_CHAIN = "B"
 
 # Backbone admission is NOT the final validity gate, and conflating them would kill this
